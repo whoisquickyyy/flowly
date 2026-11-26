@@ -1,0 +1,51 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Flowly",
+  "version": "0.1.0",
+  "identifier": "com.flowly.music",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Flowly",
+        "width": 1280,
+        "height": 840,
+        "minWidth": 1060,
+        "minHeight": 740,
+        "decorations": false,
+        "transparent": false,
+        "visible": false,
+        "backgroundColor": "#0b0b0e",
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEY0MUM5QzAyRkVFQUI5MEEKUldRS3VlcitBcHdjOU81bmU2Zm9JOEhqdnA4WW5jVVc2L3htWWZYSmxYUkJRYm5GZlpTS0lCUGwK",
+      "endpoints": [
+        "https://github.com/whoisquickyyy/flowly/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}

@@ -1,0 +1,35 @@
+[package]
+name = "aura-music"
+version = "0.1.0"
+description = "Modern Analog — Multi-Streaming Music Player"
+authors = ["Aura Team"]
+edition = "2021"
+
+[lib]
+name = "aura_music_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time", "macros", "rt-multi-thread", "net", "io-util", "process", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "rustls-tls"] }
+async-trait = "0.1"
+thiserror = "2"
+md-5 = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+url = "2"
+discord-rich-presence = "1.1.0"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+active-win-pos-rs = "0.8"
+rfd = "0.15"
+lofty = "0.21"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"

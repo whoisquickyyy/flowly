@@ -1,0 +1,12 @@
+name = "flowly-jam-relay"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[durable_objects]
+bindings = [
+  { name = "JAM_ROOM", class_name = "JamRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["JamRoom"]
