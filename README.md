@@ -34,25 +34,8 @@
 ---
 
 <p align="center">
-  <img src="readme-assets/hero-poster.jpg" width="100%" alt="Flowly — Мультистриминговый плеер нового поколения" />
+  <img src="readme-assets/poster-ru.png" width="100%" alt="Flowly — Мультистриминговый плеер нового поколения" />
 </p>
-
----
-
-## Посмотри вживую
-
-### Главная сцена и Моя Волна
-<img src="readme-assets/screen-player.png" width="100%" alt="Главная сцена Flowly" />
-
-### 10-полосный эквалайзер, Auto-Mix и DJ-переходы
-<img src="readme-assets/dj-mix-banner.jpg" width="100%" alt="DJ Auto-Mix и 10-полосный эквалайзер" />
-<br><br>
-<img src="readme-assets/screen-eq.png" width="100%" alt="Эквалайзер и настройки переходов в Flowly" />
-
-### Живая погода, магазин CSS-тем и редактор
-<img src="readme-assets/themes-atmosphere.jpg" width="100%" alt="Динамическая атмосфера и CSS-темы" />
-<br><br>
-<img src="readme-assets/screen-themes.png" width="100%" alt="Магазин CSS-тем и встроенный редактор" />
 
 ---
 
