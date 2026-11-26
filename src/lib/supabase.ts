@@ -84,6 +84,22 @@ export function getCachedProfile(): FlowlyProfile | null {
   }
 }
 
+export function signInAsGuest(username: string): FlowlyProfile {
+  const cleanName = username.trim() || 'Слушатель';
+  const id =
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? `guest-${crypto.randomUUID()}`
+      : `guest-${Date.now()}`;
+  const profile: FlowlyProfile = {
+    id,
+    username: cleanName,
+    tag: randomTag(),
+    avatar_url: '',
+  };
+  saveSession(null, profile);
+  return profile;
+}
+
 export async function fetchProfile(userId: string, accessToken: string): Promise<FlowlyProfile | null> {
   if (!isSupabaseConfigured()) return null;
   const resp = await fetch(
@@ -116,7 +132,11 @@ export async function signUp(
   });
   const data = await resp.json();
   if (!resp.ok) {
-    throw new Error(data.error_description || data.msg || data.message || 'Ошибка регистрации');
+    const rawMsg = String(data.error_description || data.msg || data.message || 'Ошибка регистрации');
+    if (resp.status === 429 || /rate.?limit/i.test(rawMsg)) {
+      throw new Error('Лимит регистраций по email временно исчерпан. Используйте «Быстрый вход без email» ниже!');
+    }
+    throw new Error(rawMsg);
   }
 
   if (!data.access_token || !data.user?.id) {
@@ -270,4 +290,53 @@ export async function updateProfile(
 
 export function signOut() {
   saveSession(null, null);
+}
+
+export interface CloudAccountSettings {
+  layoutStyle?: string;
+  bgMode?: string;
+  activeCssThemeId?: string;
+  customThemeCss?: string;
+  ramSaverEnabled?: boolean;
+  effects?: unknown;
+  mixConfig?: unknown;
+  radioConfig?: unknown;
+  activityConfig?: unknown;
+  waveConfig?: unknown;
+  enabledSources?: string[];
+  dynamicThemeEnabled?: boolean;
+  weatherCity?: string;
+  updatedAt?: number;
+}
+
+export async function saveCloudSettings(
+  session: SupabaseSession,
+  settings: CloudAccountSettings
+): Promise<void> {
+  if (!isSupabaseConfigured()) return;
+  const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    method: 'PUT',
+    headers: baseHeaders(session.access_token),
+    body: JSON.stringify({
+      data: {
+        flowly_settings: { ...settings, updatedAt: Date.now() },
+      },
+    }),
+  });
+  if (!resp.ok) {
+    throw new Error('Не удалось сохранить настройки в аккаунт');
+  }
+}
+
+export async function loadCloudSettings(
+  session: SupabaseSession
+): Promise<CloudAccountSettings | null> {
+  if (!isSupabaseConfigured()) return null;
+  const resp = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: baseHeaders(session.access_token),
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  const meta = data?.user_metadata ?? data?.user?.user_metadata;
+  return (meta?.flowly_settings as CloudAccountSettings | undefined) ?? null;
 }

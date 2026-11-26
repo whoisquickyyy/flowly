@@ -1,6 +1,6 @@
 [package]
 name = "aura-music"
-version = "0.1.0"
+version = "0.1.1"
 description = "Modern Analog — Multi-Streaming Music Player"
 authors = ["Aura Team"]
 edition = "2021"

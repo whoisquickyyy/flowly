@@ -1456,7 +1456,17 @@ pub async fn get_track_lyrics(
             Some(resolved_spicy),
         )
     };
-    Ok(fetch_lyrics(&client, ym_token.as_deref(), spicy_key.as_deref(), &track).await)
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        fetch_lyrics(&client, ym_token.as_deref(), spicy_key.as_deref(), &track),
+    )
+    .await
+    .unwrap_or(LyricsResponse {
+        synced: false,
+        source: "Таймаут".into(),
+        lines: Vec::new(),
+    });
+    Ok(res)
 }
 
 #[tauri::command]

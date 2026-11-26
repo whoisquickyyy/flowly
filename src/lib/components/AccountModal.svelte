@@ -9,9 +9,10 @@
     profile: FlowlyProfile | null;
     onClose: () => void;
     onAuthChange: (session: SupabaseSession | null, profile: FlowlyProfile | null) => void;
+    onSyncCloudSettings?: () => Promise<void>;
   }
 
-  let { open, session, profile, onClose, onAuthChange }: Props = $props();
+  let { open, session, profile, onClose, onAuthChange, onSyncCloudSettings }: Props = $props();
 
   let mode = $state<'login' | 'register'>('login');
   let email = $state('');
@@ -150,6 +151,12 @@
     }
   }
 
+  function handleGuestLogin() {
+    const prof = sb.signInAsGuest(username || 'Слушатель');
+    onAuthChange(null, prof);
+    onClose();
+  }
+
   function handleLogout() {
     sb.signOut();
     onAuthChange(null, null);
@@ -268,6 +275,28 @@
             <Save size={14} />
             <span>{busy ? 'Сохранение...' : 'Сохранить'}</span>
           </button>
+          {#if onSyncCloudSettings}
+            <button
+              type="button"
+              class="btn-sm"
+              disabled={busy}
+              onclick={async () => {
+                busy = true;
+                error = '';
+                info = '';
+                try {
+                  await onSyncCloudSettings();
+                  info = 'Настройки сохранены в облако аккаунта';
+                } catch (e) {
+                  error = e instanceof Error ? e.message : String(e);
+                } finally {
+                  busy = false;
+                }
+              }}
+            >
+              <span>Сохранить настройки в облако</span>
+            </button>
+          {/if}
           <button type="button" class="btn-danger" onclick={handleLogout}>
             <LogOut size={14} />
             <span>Выйти</span>
@@ -310,6 +339,16 @@
           onclick={mode === 'login' ? handleLogin : handleRegister}
         >
           <span>{busy ? 'Подождите...' : mode === 'login' ? 'Войти' : 'Создать аккаунт'}</span>
+        </button>
+
+        <button
+          type="button"
+          class="btn-sm full"
+          disabled={busy}
+          onclick={handleGuestLogin}
+          style="justify-content: center; margin-top: 2px;"
+        >
+          <span>Быстрый вход без email (для Jam-комнат)</span>
         </button>
       {/if}
     </div>

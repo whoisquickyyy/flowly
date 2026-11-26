@@ -52,8 +52,14 @@
     let cancelled = false;
     loading = true;
     lyrics = null;
-    api
-      .getTrackLyrics(current)
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<LyricsResponse>((resolve) => {
+      timeoutId = setTimeout(
+        () => resolve({ synced: false, source: 'Таймаут', lines: [] }),
+        9000
+      );
+    });
+    Promise.race([api.getTrackLyrics(current), timeoutPromise])
       .then((res) => {
         if (!cancelled) lyrics = res;
       })
@@ -61,6 +67,7 @@
         if (!cancelled) lyrics = { synced: false, source: 'Ошибка', lines: [] };
       })
       .finally(() => {
+        if (timeoutId) clearTimeout(timeoutId);
         if (!cancelled) loading = false;
       });
     return () => {

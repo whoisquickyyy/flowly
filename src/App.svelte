@@ -226,7 +226,7 @@
   }
 
   function setMusicDucking(ducked: boolean) {
-    const targetVol = (ducked ? 0.26 : 1.0) * toAudioVolume(player.volume);
+    const targetVol = (ducked ? 0.58 : 1.0) * toAudioVolume(player.volume);
     const cur = getActiveAudio();
     if (cur) cur.volume = Math.max(0, Math.min(1, targetVol));
   }
@@ -249,15 +249,17 @@
       }
 
       setMusicDucking(true);
+      const voiceVol = Math.max(0.05, Math.min(1, toAudioVolume(player.volume) * 1.18));
       if (res.audioDataUrl && radioAudioEl) {
         radioAudioEl.src = res.audioDataUrl;
-        radioAudioEl.volume = 1.0;
+        radioAudioEl.volume = voiceVol;
         radioAudioEl.onended = () => setMusicDucking(false);
         radioAudioEl.onerror = () => setMusicDucking(false);
         await radioAudioEl.play().catch(() => setMusicDucking(false));
       } else if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
         const utter = new SpeechSynthesisUtterance(res.text);
         utter.lang = 'ru-RU';
+        utter.volume = voiceVol;
         utter.onend = () => setMusicDucking(false);
         utter.onerror = () => setMusicDucking(false);
         window.speechSynthesis.speak(utter);
@@ -614,6 +616,93 @@
   const authStatuses = $derived(sources.map((s) => s.auth));
   const localPlaylists = $derived(playlists.filter((p) => p.isLocal));
 
+  let cloudHydrating = false;
+  let cloudSyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function buildCloudSettingsPayload(): sb.CloudAccountSettings {
+    return {
+      layoutStyle,
+      bgMode,
+      activeCssThemeId,
+      customThemeCss,
+      ramSaverEnabled,
+      effects,
+      mixConfig,
+      radioConfig,
+      activityConfig,
+      waveConfig,
+      enabledSources,
+      dynamicThemeEnabled,
+      weatherCity,
+    };
+  }
+
+  async function applyCloudSettings(data: sb.CloudAccountSettings | null) {
+    if (!data) return;
+    cloudHydrating = true;
+    try {
+      if (data.layoutStyle) selectLayoutStyle(data.layoutStyle as LayoutStyle);
+      if (data.bgMode) selectBgMode(data.bgMode as BackgroundMode);
+      if (typeof data.customThemeCss === 'string') {
+        applyCssTheme(data.activeCssThemeId || 'default', data.customThemeCss);
+      }
+      if (typeof data.ramSaverEnabled === 'boolean') {
+        updateRamSaver(data.ramSaverEnabled);
+      }
+      if (data.effects && typeof data.effects === 'object') {
+        await saveEffects(data.effects as AudioEffectsConfig);
+      }
+      if (data.mixConfig && typeof data.mixConfig === 'object') {
+        updateMixConfig(data.mixConfig as MixConfig);
+      }
+      if (data.radioConfig && typeof data.radioConfig === 'object') {
+        updateRadioConfig(data.radioConfig as RadioHostConfig);
+      }
+      if (data.activityConfig && typeof data.activityConfig === 'object') {
+        updateActivityConfig(data.activityConfig as ActivityConfig);
+      }
+      if (data.waveConfig && typeof data.waveConfig === 'object') {
+        updateWaveConfig(data.waveConfig as WaveConfig);
+      }
+      if (Array.isArray(data.enabledSources) && data.enabledSources.length > 0) {
+        updateEnabledSources(data.enabledSources as import('./lib/types').SourceKind[]);
+      }
+      if (typeof data.dynamicThemeEnabled === 'boolean' || typeof data.weatherCity === 'string') {
+        refreshAtmosphere(
+          typeof data.dynamicThemeEnabled === 'boolean' ? data.dynamicThemeEnabled : dynamicThemeEnabled,
+          typeof data.weatherCity === 'string' ? data.weatherCity : weatherCity
+        );
+      }
+    } finally {
+      setTimeout(() => {
+        cloudHydrating = false;
+      }, 500);
+    }
+  }
+
+  $effect(() => {
+    const sess = sbSession;
+    void layoutStyle;
+    void bgMode;
+    void activeCssThemeId;
+    void customThemeCss;
+    void ramSaverEnabled;
+    void effects;
+    void mixConfig;
+    void radioConfig;
+    void activityConfig;
+    void waveConfig;
+    void enabledSources;
+    void dynamicThemeEnabled;
+    void weatherCity;
+
+    if (!sess || cloudHydrating) return;
+    if (cloudSyncTimer) clearTimeout(cloudSyncTimer);
+    cloudSyncTimer = setTimeout(() => {
+      sb.saveCloudSettings(sess, buildCloudSettingsPayload()).catch(() => {});
+    }, 2000);
+  });
+
   onMount(async () => {
     if (api.isTauri()) {
       getCurrentWindow().show().catch(() => {});
@@ -646,9 +735,13 @@
     }
 
     sb.restoreSession()
-      .then(({ session, profile }) => {
+      .then(async ({ session, profile }) => {
         sbSession = session;
         sbProfile = profile;
+        if (session) {
+          const cloud = await sb.loadCloudSettings(session).catch(() => null);
+          await applyCloudSettings(cloud);
+        }
       })
       .catch(() => {});
 
@@ -1546,6 +1639,9 @@
     player.volume = clamped;
     if (audioA) audioA.volume = audioVol;
     if (audioB) audioB.volume = audioVol;
+    if (radioAudioEl && !radioAudioEl.paused) {
+      radioAudioEl.volume = Math.max(0.05, Math.min(1, audioVol * 1.18));
+    }
     audioEngine.resume();
 
     if (volumeSaveTimer) clearTimeout(volumeSaveTimer);
@@ -2087,9 +2183,18 @@
     session={sbSession}
     profile={sbProfile}
     onClose={() => (showAccountModal = false)}
-    onAuthChange={(s, p) => {
+    onAuthChange={async (s, p) => {
       sbSession = s;
       sbProfile = p;
+      if (s) {
+        const cloud = await sb.loadCloudSettings(s).catch(() => null);
+        await applyCloudSettings(cloud);
+      }
+    }}
+    onSyncCloudSettings={async () => {
+      if (sbSession) {
+        await sb.saveCloudSettings(sbSession, buildCloudSettingsPayload());
+      }
     }}
   />
 

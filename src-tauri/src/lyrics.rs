@@ -180,7 +180,8 @@ pub async fn fetch_lyrics(
     track: &Track,
 ) -> LyricsResponse {
     let lrc_client = Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_millis(2500))
+        .timeout(std::time::Duration::from_secs(4))
         .user_agent("FlowlyMusicPlayer/0.1.0 (https://github.com/flowly)")
         .build()
         .unwrap_or_else(|_| Client::new());
