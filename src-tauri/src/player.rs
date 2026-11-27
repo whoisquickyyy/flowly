@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use crate::auth::SecretStore;
 use crate::discord_rpc::DiscordRpcHandle;
 use crate::models::{AudioEffectsConfig, PlayerState, SourceKind, Track};
-use crate::providers::{demo_spotify_tracks, ProviderRegistry};
+use crate::providers::ProviderRegistry;
 use crate::radio_host::CachedWeather;
 use crate::recap::RecapStore;
 
@@ -23,11 +23,14 @@ pub struct AppState {
     pub play_history: RwLock<Vec<Track>>,
     pub forward_history: RwLock<Vec<Track>>,
     pub shuffle_bag: RwLock<Vec<String>>,
+    pub wave_weights: RwLock<std::collections::HashMap<String, f32>>,
     pub discord_rpc: DiscordRpcHandle,
+    pub track_cache: crate::track_cache::TrackCache,
 }
 
 impl AppState {
     pub fn new(app_data_dir: PathBuf, audio_proxy_port: u16) -> Self {
+        let track_cache = crate::track_cache::TrackCache::new(&app_data_dir);
         let store = SecretStore::load(app_data_dir.clone());
         let recap_store = RecapStore::load(app_data_dir.clone());
         crate::network::doh::set_doh_config(
@@ -50,10 +53,10 @@ impl AppState {
             player.repeat = rp;
         }
         if let Some(last) = store.data.last_track.clone() {
-            player.current_track = Some(last);
+            player.current_track = Some(last.clone());
             player.queue = if store.data.last_queue.is_empty() {
                 if store.data.liked_tracks.is_empty() {
-                    demo_spotify_tracks()
+                    vec![last]
                 } else {
                     store.data.liked_tracks.clone()
                 }
@@ -64,12 +67,9 @@ impl AppState {
             } else {
                 store.data.last_queue.clone()
             };
-        } else {
-            let initial_tracks = demo_spotify_tracks();
-            if let Some(first) = initial_tracks.first().cloned() {
-                player.current_track = Some(first);
-                player.queue = initial_tracks;
-            }
+        } else if !store.data.liked_tracks.is_empty() {
+            player.current_track = Some(store.data.liked_tracks[0].clone());
+            player.queue = store.data.liked_tracks.clone();
         }
 
         let mut init_bag = Vec::new();
@@ -103,7 +103,9 @@ impl AppState {
             play_history: RwLock::new(Vec::new()),
             forward_history: RwLock::new(Vec::new()),
             shuffle_bag: RwLock::new(init_bag),
+            wave_weights: RwLock::new(std::collections::HashMap::new()),
             discord_rpc,
+            track_cache,
         }
     }
 }

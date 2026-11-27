@@ -2,10 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::models::{AudioEffectsConfig, Playlist, ProxyConfig, RepeatMode, SourceKind, Track};
 
@@ -13,10 +10,6 @@ use crate::models::{AudioEffectsConfig, Playlist, ProxyConfig, RepeatMode, Sourc
 pub struct StoredSecrets {
     pub yandex_token: Option<String>,
     pub yandex_account: Option<String>,
-    pub spotify_client_id: Option<String>,
-    pub spotify_access_token: Option<String>,
-    pub spotify_refresh_token: Option<String>,
-    pub spotify_account: Option<String>,
     pub soundcloud_token: Option<String>,
     pub soundcloud_client_id: Option<String>,
     pub soundcloud_account: Option<String>,
@@ -96,14 +89,4 @@ impl SecretStore {
         let json = serde_json::to_string_pretty(&self.data).map_err(|e| e.to_string())?;
         fs::write(&self.path, json).map_err(|e| e.to_string())
     }
-}
-
-pub fn generate_pkce_pair() -> (String, String) {
-    let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    let verifier = URL_SAFE_NO_PAD.encode(bytes);
-    let mut hasher = Sha256::new();
-    hasher.update(verifier.as_bytes());
-    let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
-    (verifier, challenge)
 }

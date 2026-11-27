@@ -14,6 +14,8 @@ pub struct SoundCloudProvider {
     oauth_token: Option<String>,
     client_id: Option<String>,
     account_name: Option<String>,
+    auto_client_id: std::sync::Arc<tokio::sync::RwLock<Option<String>>>,
+    auto_fail_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SoundCloudProvider {
@@ -30,7 +32,92 @@ impl SoundCloudProvider {
             oauth_token,
             client_id,
             account_name,
+            auto_client_id: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+            auto_fail_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    async fn resolve_public_client_id(&self) -> Option<String> {
+        if let Some(ref cid) = self.client_id {
+            return Some(cid.clone());
+        }
+        if let Some(ref cached) = *self.auto_client_id.read().await {
+            return Some(cached.clone());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if self.auto_fail_until.load(std::sync::atomic::Ordering::Relaxed) > now {
+            return None;
+        }
+
+        let html = tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            async {
+                self.client
+                    .get("https://soundcloud.com")
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
+                    .send()
+                    .await
+                    .ok()?
+                    .text()
+                    .await
+                    .ok()
+            },
+        )
+        .await
+        .ok()
+        .flatten();
+
+        let Some(html) = html else {
+            self.auto_fail_until.store(now + 180, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        };
+
+        let mut script_urls = Vec::new();
+        let mut rest = html.as_str();
+        while let Some(pos) = rest.find("https://a-v2.sndcdn.com/assets/") {
+            let sub = &rest[pos..];
+            if let Some(end) = sub.find('"') {
+                let candidate = &sub[..end];
+                if candidate.ends_with(".js") {
+                    script_urls.push(candidate.to_string());
+                }
+                rest = &sub[end..];
+            } else {
+                break;
+            }
+        }
+
+        for js_url in script_urls.into_iter().rev().take(4) {
+            let Ok(Ok(resp)) = tokio::time::timeout(
+                std::time::Duration::from_secs(4),
+                self.client.get(&js_url).send(),
+            )
+            .await
+            else {
+                continue;
+            };
+            let Ok(js) = resp.text().await else {
+                continue;
+            };
+            for needle in ["client_id:\"", "client_id=\""] {
+                if let Some(idx) = js.find(needle) {
+                    let after = &js[idx + needle.len()..];
+                    if let Some(q) = after.find('"') {
+                        let cid = after[..q].trim();
+                        if cid.len() >= 20 && cid.len() <= 48 && cid.chars().all(|c| c.is_ascii_alphanumeric()) {
+                            *self.auto_client_id.write().await = Some(cid.to_string());
+                            return Some(cid.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        self.auto_fail_until.store(now + 180, std::sync::atomic::Ordering::Relaxed);
+        None
     }
 
     pub fn set_credentials(
@@ -242,12 +329,32 @@ impl SoundCloudProvider {
     }
 
     pub async fn fetch_wave_tracks(&self) -> Result<Vec<Track>, ProviderError> {
+        use rand::seq::SliceRandom;
+
         let mut base = self.fetch_liked_tracks().await.unwrap_or_default();
-        if let Some(first_id) = base.first().map(|t| t.id.trim_start_matches("sc:").to_string()) {
+        if let Ok(recent) = self.fetch_recently_played().await {
+            for t in recent {
+                if !base.iter().any(|x| x.id == t.id) {
+                    base.push(t);
+                }
+            }
+        }
+        {
+            let mut rng = rand::thread_rng();
+            base.shuffle(&mut rng);
+        }
+
+        let seed_ids: Vec<String> = base
+            .iter()
+            .take(3)
+            .map(|t| t.id.trim_start_matches("sc:").to_string())
+            .collect();
+
+        for seed_id in seed_ids {
             let mut req = self
                 .client
-                .get(format!("https://api-v2.soundcloud.com/tracks/{}/related", first_id))
-                .query(&[("limit", "20")]);
+                .get(format!("https://api-v2.soundcloud.com/tracks/{}/related", seed_id))
+                .query(&[("limit", "25")]);
             if let Some(ref cid) = self.client_id {
                 req = req.query(&[("client_id", cid.as_str())]);
             }
@@ -268,6 +375,10 @@ impl SoundCloudProvider {
                     }
                 }
             }
+        }
+        {
+            let mut rng = rand::thread_rng();
+            base.shuffle(&mut rng);
         }
         Ok(base)
     }
@@ -414,17 +525,18 @@ impl MusicProvider for SoundCloudProvider {
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Track>, ProviderError> {
+        let eff_cid = self.resolve_public_client_id().await;
         let mut req = self
             .client
             .get("https://api-v2.soundcloud.com/search/tracks")
             .query(&[("q", query), ("limit", "20")]);
 
-        if let Some(ref cid) = self.client_id {
+        if let Some(ref cid) = eff_cid {
             req = req.query(&[("client_id", cid.as_str())]);
         }
         if let Some(ref tok) = self.oauth_token {
             req = req.header("Authorization", format!("OAuth {}", tok));
-        } else if self.client_id.is_none() {
+        } else if eff_cid.is_none() {
             return Err(ProviderError::Unauthorized);
         }
 
@@ -437,17 +549,18 @@ impl MusicProvider for SoundCloudProvider {
     }
 
     async fn resolve_playback_url(&self, track_id: &str) -> Result<Option<String>, ProviderError> {
+        let eff_cid = self.resolve_public_client_id().await;
         let raw_id = track_id.strip_prefix("sc:").unwrap_or(track_id);
         let mut req = self
             .client
             .get(format!("https://api-v2.soundcloud.com/tracks/{}", raw_id));
 
-        if let Some(ref cid) = self.client_id {
+        if let Some(ref cid) = eff_cid {
             req = req.query(&[("client_id", cid.as_str())]);
         }
         if let Some(ref tok) = self.oauth_token {
             req = req.header("Authorization", format!("OAuth {}", tok));
-        } else if self.client_id.is_none() {
+        } else if eff_cid.is_none() {
             return Err(ProviderError::Unauthorized);
         }
 
@@ -463,7 +576,7 @@ impl MusicProvider for SoundCloudProvider {
             .ok_or_else(|| ProviderError::Api("Нет доступного аудиопотока".into()))?;
 
         let mut stream_req = self.client.get(transcoding_url);
-        if let Some(ref cid) = self.client_id {
+        if let Some(ref cid) = eff_cid {
             stream_req = stream_req.query(&[("client_id", cid.as_str())]);
         }
         if let Some(ref tok) = self.oauth_token {

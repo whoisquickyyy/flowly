@@ -12,9 +12,12 @@
     Sparkles,
     Users,
     Vote,
+    MessageCircle,
+    Send,
+    Wifi,
   } from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
-  import type { JamRoomState } from '../jamRoom';
+  import { pickDiverseSample, type JamRoomState } from '../jamRoom';
   import { ROLE_BADGES } from '../supabase';
   import type { Playlist, Track } from '../types';
   import * as api from '../api';
@@ -38,6 +41,7 @@
     onTogglePlay: () => void;
     onSkip: () => void;
     onRebuildBlend: () => void;
+    onSendChat?: (text: string) => void;
   }
 
   let {
@@ -53,7 +57,10 @@
     onTogglePlay,
     onSkip,
     onRebuildBlend,
+    onSendChat = () => {},
   }: Props = $props();
+
+  let chatInput = $state('');
 
   let displayName = $state('');
   let joinCode = $state('');
@@ -83,21 +90,21 @@
     loadingTaste = true;
     try {
       if (tasteSource === 'liked') {
-        return { label: 'Мне нравится', tracks: likedTracks.slice(0, 80) };
+        return { label: 'Мне нравится', tracks: pickDiverseSample(likedTracks, 160) };
       }
       if (tasteSource === 'recap') {
         const recap = await api.getListeningRecap('month');
         const tracks = recap.topTracks.map((t) => t.track);
         return {
           label: 'Топ из Итогов',
-          tracks: tracks.length > 0 ? tracks : likedTracks.slice(0, 60),
+          tracks: tracks.length > 0 ? tracks : pickDiverseSample(likedTracks, 100),
         };
       }
       const pl = playlists.find((p) => p.id === tasteSource);
       if (pl) {
-        return { label: pl.title, tracks: pl.tracks.slice(0, 80) };
+        return { label: pl.title, tracks: pickDiverseSample(pl.tracks, 160) };
       }
-      return { label: 'Мне нравится', tracks: likedTracks.slice(0, 80) };
+      return { label: 'Мне нравится', tracks: pickDiverseSample(likedTracks, 160) };
     } finally {
       loadingTaste = false;
     }
@@ -261,9 +268,25 @@
           {#if room.isHost}
             <Crown size={12} /> Хост (мгновенный скип)
           {:else}
-            <Users size={12} /> Общий пульт
+            <Users size={12} /> Гость (синхронно с хостом)
           {/if}
         </span>
+        {#if !room.isHost}
+          <span
+            class="sync-badge"
+            class:catching={room.syncStatus === 'catching-up'}
+            class:away={room.syncStatus === 'host-away'}
+          >
+            <Wifi size={11} />
+            <span>
+              {room.syncStatus === 'catching-up'
+                ? 'Догоняем...'
+                : room.syncStatus === 'host-away'
+                  ? 'Хост отошёл'
+                  : 'Синхронизировано'}
+            </span>
+          </span>
+        {/if}
       </div>
 
       <div class="taste-switch">
@@ -384,6 +407,44 @@
           {/each}
         </div>
       {/if}
+    </div>
+
+    <!-- Чат комнаты -->
+    <div class="chat-card">
+      <div class="q-head">
+        <span style="display:inline-flex;align-items:center;gap:6px;"><MessageCircle size={14} /> Чат комнаты</span>
+      </div>
+      <div class="chat-list">
+        {#if !room.chat || room.chat.length === 0}
+          <div class="chat-empty">Напишите что-нибудь участникам комнаты...</div>
+        {:else}
+          {#each room.chat as msg (msg.id)}
+            <div class="chat-msg" class:mine={msg.senderId === room.myId}>
+              <span class="chat-author">{msg.senderName}:</span>
+              <span class="chat-text">{msg.text}</span>
+            </div>
+          {/each}
+        {/if}
+      </div>
+      <form
+        class="chat-form"
+        onsubmit={(e) => {
+          e.preventDefault();
+          if (!chatInput.trim()) return;
+          onSendChat(chatInput);
+          chatInput = '';
+        }}
+      >
+        <input
+          type="text"
+          bind:value={chatInput}
+          placeholder="Сообщение в комнату..."
+          maxlength="240"
+        />
+        <button type="submit" class="btn-sm" aria-label="Отправить">
+          <Send size={13} />
+        </button>
+      </form>
     </div>
   {/if}
 </section>
@@ -898,5 +959,88 @@
     text-align: center;
     font-size: 13px;
     color: var(--text-secondary);
+  }
+
+  .sync-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(16, 185, 129, 0.14);
+    color: #34d399;
+    border: 1px solid rgba(16, 185, 129, 0.35);
+    width: fit-content;
+  }
+
+  .sync-badge.catching {
+    background: rgba(99, 102, 241, 0.16);
+    color: #a5b4fc;
+    border-color: rgba(99, 102, 241, 0.35);
+  }
+
+  .sync-badge.away {
+    background: rgba(245, 158, 11, 0.16);
+    color: #fbbf24;
+    border-color: rgba(245, 158, 11, 0.35);
+  }
+
+  .chat-card {
+    padding: 14px 16px;
+    border-radius: 16px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .chat-list {
+    max-height: 170px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .chat-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 8px 0;
+  }
+
+  .chat-msg {
+    font-size: 12.5px;
+    line-height: 1.4;
+    color: var(--text-primary);
+  }
+
+  .chat-author {
+    font-weight: 700;
+    color: var(--accent);
+    margin-right: 5px;
+  }
+
+  .chat-msg.mine .chat-author {
+    color: #34d399;
+  }
+
+  .chat-form {
+    display: flex;
+    gap: 8px;
+  }
+
+  .chat-form input {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border-subtle);
+    background: rgba(10, 10, 14, 0.7);
+    color: var(--text-primary);
+    font-size: 12.5px;
+    outline: none;
   }
 </style>

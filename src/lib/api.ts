@@ -116,9 +116,6 @@ export async function connectSoundCloud(
   return invoke<SourceStatus[]>('connect_soundcloud', { oauthToken, clientId });
 }
 
-export async function startSpotifyOAuth(clientId: string): Promise<SourceStatus[]> {
-  return invoke<SourceStatus[]>('start_spotify_oauth', { clientId });
-}
 
 export async function disconnectSource(source: SourceKind): Promise<SourceStatus[]> {
   return invoke<SourceStatus[]>('disconnect_source', { source });
@@ -193,6 +190,11 @@ export async function resetWaveToLibrary(sourceFilter: SourceKind | null): Promi
 export async function getArtistYandexInfo(artistName: string): Promise<ArtistYandexInfo | null> {
   if (!isTauri()) return null;
   return invoke<ArtistYandexInfo | null>('get_artist_yandex_info', { artistName });
+}
+
+export async function getArtistPreviewTrack(artistId: string, artistName: string): Promise<Track | null> {
+  if (!isTauri()) return null;
+  return invoke<Track | null>('get_artist_preview_track', { artistId, artistName });
 }
 
 export async function getYandexAlbumTracks(albumId: string): Promise<Track[]> {
@@ -274,4 +276,27 @@ export async function removeLocalFolder(path: string): Promise<string[]> {
 export async function scanLocalTracks(): Promise<Track[]> {
   if (!isTauri()) return [];
   return invoke<Track[]>('scan_local_tracks');
+}
+
+export async function updateSmtcState(params: {
+  title: string;
+  artist: string;
+  album: string;
+  coverUrl: string | null;
+  durationSec: number;
+  playing: boolean;
+  positionSec: number;
+}): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('update_smtc_state', params).catch(() => {});
+}
+
+export async function setTrackCacheEnabled(enabled: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('set_track_cache_enabled', { enabled }).catch(() => {});
+}
+
+export async function reportWaveFeedback(track: Track, positive: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('report_wave_feedback', { track, positive }).catch(() => {});
 }

@@ -10,6 +10,11 @@
     RefreshCw,
     Sparkles,
     Users,
+    Flame,
+    Compass,
+    Share2,
+    Check,
+    Radio,
   } from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
   import * as api from '../api';
@@ -28,6 +33,7 @@
   let period = $state<RecapPeriod>('day');
   let recap = $state<ListeningRecap | null>(null);
   let loading = $state(true);
+  let posterCopied = $state(false);
 
   const periods: { id: RecapPeriod; label: string }[] = [
     { id: 'day', label: 'Сегодня' },
@@ -71,6 +77,113 @@
     if (!recap || recap.topTracks.length === 0) return;
     const list = recap.topTracks.map((t) => t.track);
     onPlayTrack(list[0], list);
+  }
+
+  function startRecapWave() {
+    if (!recap || recap.topTracks.length === 0) return;
+    const list = [...recap.topTracks.map((t) => t.track)];
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    onPlayTrack(list[0], list);
+  }
+
+  async function sharePoster() {
+    if (!recap) return;
+    const w = 900;
+    const h = 920;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const accent = recap.summary.accentColor || '#6366f1';
+    const bg = ctx.createLinearGradient(0, 0, w, h);
+    bg.addColorStop(0, '#0f1018');
+    bg.addColorStop(1, '#181424');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+
+    const glow = ctx.createRadialGradient(w * 0.25, h * 0.2, 20, w * 0.25, h * 0.2, 420);
+    glow.addColorStop(0, accent + '44');
+    glow.addColorStop(1, 'transparent');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.fillStyle = accent;
+    ctx.font = '700 22px Inter, Segoe UI, Arial, sans-serif';
+    ctx.fillText(`FLOWLY · ${recap.summary.badge.toUpperCase()}`, 56, 78);
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 40px Inter, Segoe UI, Arial, sans-serif';
+    ctx.fillText(recap.summary.headline.slice(0, 44), 56, 140);
+
+    // Metrics
+    const metrics = [
+      ['Время', formatTotalTime(recap.totalSec)],
+      ['Треков', `${recap.totalPlays}`],
+      ['Артистов', `${recap.uniqueArtists}`],
+      ['Серия', `${recap.streakDays ?? 0} дн.`],
+    ];
+    metrics.forEach(([lbl, val], idx) => {
+      const x = 56 + idx * 200;
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.fillRect(x, 185, 184, 102);
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.font = '600 18px Inter, Segoe UI, Arial, sans-serif';
+      ctx.fillText(lbl, x + 18, 222);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 28px Inter, Segoe UI, Arial, sans-serif';
+      ctx.fillText(val, x + 18, 264);
+    });
+
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font = '700 20px Inter, Segoe UI, Arial, sans-serif';
+    ctx.fillText('ТОП АРТИСТОВ', 56, 355);
+    recap.topArtists.slice(0, 4).forEach((art, idx) => {
+      const y = 398 + idx * 52;
+      ctx.fillStyle = accent;
+      ctx.font = '700 22px Inter, Segoe UI, Arial, sans-serif';
+      ctx.fillText(`#${idx + 1}`, 56, y);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '700 24px Inter, Segoe UI, Arial, sans-serif';
+      ctx.fillText(art.name.slice(0, 32), 110, y);
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.font = '500 20px Inter, Segoe UI, Arial, sans-serif';
+      ctx.fillText(`${art.plays} просл.`, 660, y);
+    });
+
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font = '700 20px Inter, Segoe UI, Arial, sans-serif';
+    ctx.fillText('ТОП ТРЕКОВ', 56, 635);
+    recap.topTracks.slice(0, 4).forEach((item, idx) => {
+      const y = 678 + idx * 52;
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '700 22px Inter, Segoe UI, Arial, sans-serif';
+      ctx.fillText(`${idx + 1}. ${item.track.title.slice(0, 28)} — ${item.track.artist.slice(0, 20)}`, 56, y);
+    });
+
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.font = '500 18px Inter, Segoe UI, Arial, sans-serif';
+    ctx.fillText('Flowly Music Player', 56, 882);
+
+    canvas.toBlob(async (blob) => {
+      if (!blob) return;
+      try {
+        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        posterCopied = true;
+        setTimeout(() => (posterCopied = false), 2000);
+      } catch {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `flowly-recap-${period}.png`;
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+    }, 'image/png');
   }
 </script>
 
@@ -122,12 +235,27 @@
           <Sparkles size={13} />
           <span>{recap.summary.badge}</span>
         </span>
-        {#if recap.topTracks.length > 0}
-          <button type="button" class="play-top-btn" onclick={playTopTracks}>
-            <Play size={14} fill="currentColor" />
-            <span>Запустить топ периода</span>
+        <div class="vibe-actions">
+          <button type="button" class="share-btn" onclick={sharePoster} title="Скопировать постер итогов">
+            {#if posterCopied}
+              <Check size={13} />
+              <span>Скопировано!</span>
+            {:else}
+              <Share2 size={13} />
+              <span>Постер PNG</span>
+            {/if}
           </button>
-        {/if}
+          {#if recap.topTracks.length > 0}
+            <button type="button" class="share-btn" onclick={startRecapWave} title="Перемешать и запустить волну по итогам">
+              <Radio size={13} />
+              <span>Волна по итогам</span>
+            </button>
+            <button type="button" class="play-top-btn" onclick={playTopTracks}>
+              <Play size={14} fill="currentColor" />
+              <span>Запустить топ периода</span>
+            </button>
+          {/if}
+        </div>
       </div>
 
       <h3>{recap.summary.headline}</h3>
@@ -155,7 +283,66 @@
         <div class="stat-lbl"><Music2 size={13} /> <span>Главный жанр</span></div>
         <div class="stat-val genre-val">{recap.topGenre ?? '—'}</div>
       </div>
+      <div class="stat-card">
+        <div class="stat-lbl"><Flame size={13} /> <span>Серия дней</span></div>
+        <div class="stat-val">{recap.streakDays ?? 0} <span class="stat-sub">дн. подряд</span></div>
+      </div>
     </div>
+
+    {#if recap.hourlyPlays && recap.hourlyPlays.some((c) => c > 0)}
+      {@const maxHourVal = Math.max(1, ...recap.hourlyPlays)}
+      <div class="block-card">
+        <div class="block-head-row">
+          <span class="block-head">Активность по часам</span>
+          {#if recap.peakHour !== null && recap.peakHour !== undefined}
+            <span class="peak-badge">Пиковый час: {String(recap.peakHour).padStart(2, '0')}:00</span>
+          {/if}
+        </div>
+        <div class="hourly-chart">
+          {#each recap.hourlyPlays as count, hr (hr)}
+            <div class="hr-col" title={`${String(hr).padStart(2, '0')}:00 — ${count} просл.`}>
+              <div class="hr-bar-wrap">
+                <div
+                  class="hr-bar"
+                  class:peak={recap.peakHour === hr}
+                  style={`height: ${count > 0 ? Math.max(10, Math.round((count / maxHourVal) * 100)) : 4}%`}
+                ></div>
+              </div>
+              {#if hr % 3 === 0}
+                <span class="hr-lbl">{String(hr).padStart(2, '0')}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    {#if recap.discovery}
+      {@const disc = recap.discovery}
+      <div class="block-card discovery-card">
+        <div class="block-head-row">
+          <span class="block-head"><Compass size={14} /> Открытие периода</span>
+          <span class="peak-badge">Новый артист в истории</span>
+        </div>
+        <div class="discovery-row">
+          <img src={disc.track.artwork} alt={disc.track.title} />
+          <div class="disc-meta">
+            <button type="button" class="disc-artist" onclick={() => onOpenArtist(disc.artist)}>
+              {disc.artist}
+            </button>
+            <div class="disc-track">{disc.track.title}</div>
+          </div>
+          <button
+            type="button"
+            class="play-top-btn"
+            onclick={() => onPlayTrack(disc.track, [disc.track])}
+          >
+            <Play size={13} fill="currentColor" />
+            <span>Слушать</span>
+          </button>
+        </div>
+      </div>
+    {/if}
 
     {#if recap.genres.length > 0}
       <div class="block-card">
@@ -659,5 +846,128 @@
     text-align: center;
     font-size: 13px;
     color: var(--text-secondary);
+  }
+
+  .vibe-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .share-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .share-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  .block-head-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .peak-badge {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    padding: 3px 9px;
+    border-radius: 999px;
+  }
+
+  .hourly-chart {
+    display: grid;
+    grid-template-columns: repeat(24, minmax(0, 1fr));
+    gap: 4px;
+    height: 82px;
+    align-items: end;
+    padding-top: 8px;
+  }
+
+  .hr-col {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+  }
+
+  .hr-bar-wrap {
+    flex: 1;
+    width: 100%;
+    display: flex;
+    align-items: flex-end;
+  }
+
+  .hr-bar {
+    width: 100%;
+    border-radius: 4px 4px 2px 2px;
+    background: rgba(255, 255, 255, 0.14);
+    transition: height 200ms ease;
+  }
+
+  .hr-bar.peak {
+    background: var(--accent);
+  }
+
+  .hr-lbl {
+    font-size: 9px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .discovery-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .discovery-row img {
+    width: 48px;
+    height: 48px;
+    border-radius: 10px;
+    object-fit: cover;
+  }
+
+  .disc-meta {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .disc-artist {
+    border: none;
+    background: transparent;
+    padding: 0;
+    color: var(--text-primary);
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+
+  .disc-artist:hover {
+    color: var(--accent);
+  }
+
+  .disc-track {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 </style>

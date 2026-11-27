@@ -1,11 +1,7 @@
 use std::process::Command;
 
-use serde_json::Value;
-use tauri::{AppHandle, Emitter, State};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tauri::State;
 
-use crate::auth::generate_pkce_pair;
 use crate::lyrics::{fetch_lyrics, LyricsResponse};
 use crate::models::{
     AudioEffectsConfig, GroupedSearchResult, LibrarySection, PlayerState, Playlist, ProxyConfig,
@@ -25,9 +21,27 @@ pub async fn get_library_section(
         registry.fetch_library(section, source_filter).await
     };
 
-    if matches!(section, LibrarySection::LikedSongs | LibrarySection::AllTracks) {
+    if section == LibrarySection::RecentlyPlayed {
+        let hist: Vec<Track> = state
+            .play_history
+            .read()
+            .await
+            .iter()
+            .rev()
+            .filter(|t| source_filter.is_none() || source_filter == Some(t.source))
+            .cloned()
+            .collect();
+        let mut merged = Vec::with_capacity(hist.len() + remote.len());
+        let mut seen = std::collections::HashSet::<String>::new();
+        for t in hist.into_iter().chain(remote.into_iter()) {
+            if seen.insert(t.id.clone()) {
+                merged.push(t);
+            }
+        }
+        remote = merged;
+    } else if matches!(section, LibrarySection::LikedSongs | LibrarySection::AllTracks) {
         let vault = state.vault.read().await;
-        let local_liked: Vec<Track> = vault
+        let mut combined: Vec<Track> = vault
             .data
             .liked_tracks
             .iter()
@@ -35,10 +49,22 @@ pub async fn get_library_section(
             .cloned()
             .collect();
 
-        if !local_liked.is_empty() {
-            let mut merged = Vec::with_capacity(local_liked.len() + remote.len());
+        // Для раздела «Все треки» добавляем также историю прослушиваний и локальные файлы,
+        // чтобы «Все треки» отличались от «Любимых»
+        if section == LibrarySection::AllTracks {
+            drop(vault);
+            let hist = state.play_history.read().await.clone();
+            for t in hist.into_iter().rev() {
+                if source_filter.is_none() || source_filter == Some(t.source) {
+                    combined.push(t);
+                }
+            }
+        }
+
+        if !combined.is_empty() || section == LibrarySection::AllTracks {
+            let mut merged = Vec::with_capacity(combined.len() + remote.len());
             let mut seen = std::collections::HashSet::<String>::new();
-            for t in local_liked.into_iter().chain(remote.into_iter()) {
+            for t in combined.into_iter().chain(remote.into_iter()) {
                 if seen.insert(t.id.clone()) {
                     merged.push(t);
                 }
@@ -226,14 +252,7 @@ async fn play_track_inner(
     if clear_forward {
         state.forward_history.write().await.clear();
     }
-    if track.source == SourceKind::Spotify {
-        if track.playback_url.is_none() {
-            let registry = state.registry.read().await;
-            if registry.spotify.auth_status().connected {
-                let _ = registry.spotify.connect_play(&track.id).await;
-            }
-        }
-    } else if track.source != SourceKind::Local {
+    if track.source != SourceKind::Local {
         let registry = state.registry.read().await;
         if let Ok(Some(url)) = registry.resolve_playback_url(track.source, &track.id).await {
             track.playback_url = Some(url);
@@ -281,15 +300,8 @@ async fn play_track_inner(
 #[tauri::command]
 pub async fn toggle_playback(state: State<'_, AppState>) -> Result<PlayerState, String> {
     let mut player = state.player.write().await;
-    if let Some(source) = player.current_track.as_ref().map(|t| t.source) {
+    if player.current_track.is_some() {
         player.is_playing = !player.is_playing;
-        if source == SourceKind::Spotify {
-            let registry = state.registry.read().await;
-            if registry.spotify.auth_status().connected {
-                let endpoint = if player.is_playing { "play" } else { "pause" };
-                let _ = registry.spotify.connect_command("PUT", endpoint).await;
-            }
-        }
     }
     let snapshot = player.clone();
     state.discord_rpc.update_from_player(&snapshot);
@@ -346,12 +358,36 @@ pub async fn next_track(state: State<'_, AppState>) -> Result<PlayerState, Strin
             exclude_ids.extend(vault.data.disliked_ids.iter().cloned());
         }
         let wave_src = *state.wave_source.read().await;
-        let more = {
+        let mut more = {
             let mut registry = state.registry.write().await;
             registry
                 .generate_wave_queue_excluding(wave_src, &exclude_ids, ym_seed.as_deref())
                 .await
         };
+        if more.is_empty() {
+            // Если строгий фильтр (вся очередь + вся история) отсеял все треки,
+            // ослабляем исключение до дизлайков, текущего трека и последних 5 треков истории,
+            // чтобы волна никогда не зацикливалась на 2 треках.
+            let mut relaxed = {
+                let vault = state.vault.read().await;
+                vault.data.disliked_ids.clone()
+            };
+            {
+                let player = state.player.read().await;
+                if let Some(curr) = player.current_track.as_ref() {
+                    relaxed.insert(curr.id.clone());
+                }
+            }
+            for h in state.play_history.read().await.iter().rev().take(5) {
+                relaxed.insert(h.id.clone());
+            }
+            let mut registry = state.registry.write().await;
+            more = registry
+                .generate_wave_queue_excluding(wave_src, &relaxed, ym_seed.as_deref())
+                .await;
+            // Разрешаем добавлять такие треки в хвост очереди, если не совпадают с текущим/недавними
+            exclude_ids = relaxed;
+        }
         let mut player = state.player.write().await;
         let existing: std::collections::HashSet<String> =
             player.queue.iter().map(|t| t.id.clone()).collect();
@@ -362,10 +398,11 @@ pub async fn next_track(state: State<'_, AppState>) -> Result<PlayerState, Strin
                 player.queue.push(t);
             }
         }
-        if player.shuffle && !added_ids.is_empty() {
-            let mut bag = state.shuffle_bag.write().await;
-            bag.splice(0..0, added_ids);
-            player.shuffle_order = bag.iter().rev().cloned().collect();
+        // В режиме «Моя волна» шафл отключён — треки идут строго в порядке потока
+        if player.shuffle {
+            player.shuffle = false;
+            player.shuffle_order.clear();
+            state.shuffle_bag.write().await.clear();
         }
         // Ограничим размер очереди сверху, удаляя старые пройденные треки в начале
         if player.queue.len() > 120 {
@@ -417,17 +454,74 @@ pub async fn next_track(state: State<'_, AppState>) -> Result<PlayerState, Strin
                 .and_then(|pid| player.queue.iter().find(|t| t.id == pid).cloned())
                 .unwrap_or_else(|| player.queue[0].clone())
         } else {
-            let next_idx = match curr_idx {
-                Some(i) => {
-                    if player.repeat == RepeatMode::Off && i + 1 >= player.queue.len() {
-                        player.is_playing = false;
-                        return Ok(player.clone());
-                    }
-                    (i + 1) % player.queue.len()
-                }
-                None => 0,
+            let need_autopilot = match curr_idx {
+                Some(i) => player.repeat == RepeatMode::Off && i + 1 >= player.queue.len(),
+                None => false,
             };
-            player.queue[next_idx].clone()
+
+            if need_autopilot {
+                let ym_seed = player
+                    .current_track
+                    .as_ref()
+                    .filter(|t| t.source == SourceKind::Yandex)
+                    .map(|t| t.id.clone())
+                    .or_else(|| {
+                        player
+                            .queue
+                            .iter()
+                            .rev()
+                            .find(|t| t.source == SourceKind::Yandex)
+                            .map(|t| t.id.clone())
+                    });
+                let mut ex: std::collections::HashSet<String> =
+                    player.queue.iter().map(|t| t.id.clone()).collect();
+                for h in state.play_history.read().await.iter() {
+                    ex.insert(h.id.clone());
+                }
+                {
+                    let vault = state.vault.read().await;
+                    ex.extend(vault.data.disliked_ids.iter().cloned());
+                }
+                drop(player);
+                let mut more = {
+                    let mut registry = state.registry.write().await;
+                    registry
+                        .generate_wave_queue_excluding(None, &ex, ym_seed.as_deref())
+                        .await
+                };
+                {
+                    let weights = state.wave_weights.read().await;
+                    if !weights.is_empty() {
+                        more.sort_by(|a, b| {
+                            wave_track_score(b, &weights)
+                                .partial_cmp(&wave_track_score(a, &weights))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+                }
+                let mut player = state.player.write().await;
+                let mut added: Vec<Track> = Vec::new();
+                for t in more {
+                    if !ex.contains(&t.id) {
+                        ex.insert(t.id.clone());
+                        added.push(t.clone());
+                        player.queue.push(t);
+                    }
+                }
+                if let Some(first_new) = added.into_iter().next() {
+                    *state.wave_active.write().await = true;
+                    first_new
+                } else {
+                    player.is_playing = false;
+                    return Ok(player.clone());
+                }
+            } else {
+                let next_idx = match curr_idx {
+                    Some(i) => (i + 1) % player.queue.len(),
+                    None => 0,
+                };
+                player.queue[next_idx].clone()
+            }
         }
     };
     play_track_inner(&state, next_item, None, false).await
@@ -477,18 +571,8 @@ pub async fn prev_track(state: State<'_, AppState>) -> Result<PlayerState, Strin
 #[tauri::command]
 pub async fn seek_to(state: State<'_, AppState>, position_sec: u32) -> Result<PlayerState, String> {
     let mut player = state.player.write().await;
-    if let Some((duration, source)) = player.current_track.as_ref().map(|t| (t.duration, t.source)) {
+    if let Some(duration) = player.current_track.as_ref().map(|t| t.duration) {
         player.position_sec = position_sec.min(duration);
-        if source == SourceKind::Spotify {
-            let registry = state.registry.read().await;
-            if registry.spotify.auth_status().connected {
-                let ms = player.position_sec * 1000;
-                let _ = registry
-                    .spotify
-                    .connect_command("PUT", &format!("seek?position_ms={}", ms))
-                    .await;
-            }
-        }
     }
     let snapshot = player.clone();
     state.discord_rpc.update_from_player(&snapshot);
@@ -498,39 +582,34 @@ pub async fn seek_to(state: State<'_, AppState>, position_sec: u32) -> Result<Pl
 #[tauri::command]
 pub async fn set_volume(state: State<'_, AppState>, volume: u8) -> Result<PlayerState, String> {
     let clamped = volume.min(100);
-    let (snapshot, is_spotify) = {
+    let snapshot = {
         let mut player = state.player.write().await;
         player.volume = clamped;
-        let sp = player
-            .current_track
-            .as_ref()
-            .is_some_and(|t| t.source == SourceKind::Spotify);
-        (player.clone(), sp)
+        player.clone()
     };
     {
         let mut vault = state.vault.write().await;
         vault.data.volume = Some(clamped);
         let _ = vault.save();
     }
-    if is_spotify {
-        let registry = state.registry.read().await;
-        if registry.spotify.auth_status().connected {
-            let _ = registry
-                .spotify
-                .connect_command("PUT", &format!("volume?volume_percent={}", clamped))
-                .await;
-        }
-    }
     Ok(snapshot)
 }
 
 #[tauri::command]
 pub async fn toggle_shuffle(state: State<'_, AppState>) -> Result<PlayerState, String> {
+    let wave_on = *state.wave_active.read().await;
+    if wave_on {
+        // В режиме «Моя волна» перемешивание отключено
+        let mut player = state.player.write().await;
+        player.shuffle = false;
+        player.shuffle_order.clear();
+        state.shuffle_bag.write().await.clear();
+        return Ok(player.clone());
+    }
     let snapshot = {
         let mut player = state.player.write().await;
         player.shuffle = !player.shuffle;
-        let wave_on = *state.wave_active.read().await;
-        if player.shuffle && !wave_on && player.queue.len() > 1 {
+        if player.shuffle && player.queue.len() > 1 {
             let hist = state.play_history.read().await.clone();
             let fresh = build_shuffle_bag(
                 &player.queue,
@@ -706,170 +785,6 @@ pub async fn connect_soundcloud(
 }
 
 #[tauri::command]
-pub async fn start_spotify_oauth(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    client_id: String,
-) -> Result<Vec<SourceStatus>, String> {
-    let cid = client_id.trim().to_string();
-    if cid.is_empty() {
-        return Err("Укажите Spotify Client ID из Developer Dashboard".into());
-    }
-
-    let (verifier, challenge) = generate_pkce_pair();
-    let redirect_uri = "http://127.0.0.1:8888/callback";
-    let scope = "user-read-private user-library-read user-read-recently-played playlist-read-private user-modify-playback-state user-read-playback-state";
-
-    let mut auth_url = url::Url::parse("https://accounts.spotify.com/authorize").unwrap();
-    auth_url
-        .query_pairs_mut()
-        .append_pair("client_id", &cid)
-        .append_pair("response_type", "code")
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("code_challenge", &challenge)
-        .append_pair("scope", scope);
-
-    let listener = TcpListener::bind("127.0.0.1:8888")
-        .await
-        .map_err(|e| format!("Порт 8888 занят: {}", e))?;
-
-    open_in_browser(auth_url.as_str())?;
-
-    let auth_code = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        loop {
-            let (mut socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
-            let mut buf = [0u8; 4096];
-            let n = socket.read(&mut buf).await.map_err(|e| e.to_string())?;
-            if n == 0 {
-                continue;
-            }
-            let req_str = String::from_utf8_lossy(&buf[..n]);
-            let first_line = req_str.lines().next().unwrap_or("");
-            let path_part = first_line.split_whitespace().nth(1).unwrap_or("/");
-
-            if !path_part.starts_with("/callback") {
-                let _ = socket
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                    .await;
-                continue;
-            }
-
-            let parsed = url::Url::parse(&format!("http://127.0.0.1:8888{}", path_part))
-                .map_err(|e| e.to_string())?;
-
-            let code = parsed
-                .query_pairs()
-                .find(|(k, _)| k == "code")
-                .map(|(_, v)| v.to_string());
-            let err_param = parsed
-                .query_pairs()
-                .find(|(k, _)| k == "error")
-                .map(|(_, v)| v.to_string());
-
-            let html = if code.is_some() {
-                "<html><body style='background:#111215;color:#f4f4f7;font-family:sans-serif;display:grid;place-items:center;height:100vh'><div><h2>Spotify подключен</h2><p>Можете закрыть эту вкладку и вернуться в Flowly.</p></div></body></html>".to_string()
-            } else {
-                let reason = err_param.clone().unwrap_or_else(|| "Код доступа не получен".into());
-                format!(
-                    "<html><body style='background:#111215;color:#fb7185;font-family:sans-serif;display:grid;place-items:center;height:100vh'><div><h2>Ошибка авторизации Spotify</h2><p>{}</p></div></body></html>",
-                    reason
-                )
-            };
-
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                html.len(),
-                html
-            );
-            let _ = socket.write_all(response.as_bytes()).await;
-
-            if let Some(c) = code {
-                return Ok::<String, String>(c);
-            }
-            return Err(format!(
-                "Spotify отклонил авторизацию: {}",
-                err_param.unwrap_or_else(|| "отменено пользователем".into())
-            ));
-        }
-    })
-    .await
-    .map_err(|_| "Время ожидания авторизации Spotify истекло (120 сек)".to_string())??;
-
-    let client = {
-        let registry = state.registry.read().await;
-        crate::providers::MusicProvider::client(&registry.spotify).clone()
-    };
-
-    let token_resp = client
-        .post("https://accounts.spotify.com/api/token")
-        .form(&[
-            ("client_id", cid.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code", auth_code.as_str()),
-            ("redirect_uri", redirect_uri),
-            ("code_verifier", verifier.as_str()),
-        ])
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "Не удалось связаться с accounts.spotify.com ({}). Проверьте прокси в блоке «Сеть» (если у вас системный VPN/TUN — выберите Direct, если локальный прокси — проверьте порт).",
-                e
-            )
-        })?;
-
-    if !token_resp.status().is_success() {
-        let status = token_resp.status();
-        let body = token_resp.text().await.unwrap_or_default();
-        return Err(format!("Ошибка обмена токена Spotify ({}): {}", status, body));
-    }
-
-    let token_json: Value = token_resp.json().await.map_err(|e| e.to_string())?;
-    let access_token = token_json["access_token"]
-        .as_str()
-        .ok_or_else(|| "Не получен access_token Spotify".to_string())?
-        .to_string();
-    let refresh_token = token_json["refresh_token"].as_str().map(String::from);
-
-    let account = {
-        let mut registry = state.registry.write().await;
-        match registry.spotify.verify_and_fetch_account(&access_token).await {
-            Ok(name) => name,
-            Err(_) => {
-                // Повторная попытка при временном сетевом сбое
-                match registry.spotify.verify_and_fetch_account(&access_token).await {
-                    Ok(name) => name,
-                    Err(_) => {
-                        let fallback_name = "Spotify User".to_string();
-                        registry
-                            .spotify
-                            .set_credentials(Some(access_token.clone()), Some(fallback_name.clone()));
-                        fallback_name
-                    }
-                }
-            }
-        }
-    };
-
-    {
-        let mut vault = state.vault.write().await;
-        vault.data.spotify_client_id = Some(cid);
-        vault.data.spotify_access_token = Some(access_token);
-        vault.data.spotify_refresh_token = refresh_token;
-        vault.data.spotify_account = Some(account);
-        vault.save()?;
-    }
-
-    let statuses = {
-        let registry = state.registry.read().await;
-        registry.all_statuses()
-    };
-    let _ = app.emit("auth-updated", &statuses);
-    Ok(statuses)
-}
-
-#[tauri::command]
 pub async fn disconnect_source(
     state: State<'_, AppState>,
     source: SourceKind,
@@ -880,11 +795,6 @@ pub async fn disconnect_source(
             SourceKind::Yandex => {
                 vault.data.yandex_token = None;
                 vault.data.yandex_account = None;
-            }
-            SourceKind::Spotify => {
-                vault.data.spotify_access_token = None;
-                vault.data.spotify_refresh_token = None;
-                vault.data.spotify_account = None;
             }
             SourceKind::SoundCloud => {
                 vault.data.soundcloud_token = None;
@@ -899,7 +809,6 @@ pub async fn disconnect_source(
     let mut registry = state.registry.write().await;
     match source {
         SourceKind::Yandex => registry.yandex.set_credentials(None, None, None),
-        SourceKind::Spotify => registry.spotify.set_credentials(None, None),
         SourceKind::SoundCloud => registry.soundcloud.set_credentials(None, None, None),
         SourceKind::Local => {}
     }
@@ -1043,11 +952,6 @@ pub async fn toggle_like_track(
                     let _ = registry.yandex.set_track_like(&track.id, liked).await;
                 }
             }
-            SourceKind::Spotify => {
-                if registry.spotify.auth_status().connected {
-                    let _ = registry.spotify.set_track_like(&track.id, liked).await;
-                }
-            }
             SourceKind::SoundCloud => {
                 if registry.soundcloud.auth_status().connected {
                     let _ = registry.soundcloud.set_track_like(&track.id, liked).await;
@@ -1140,7 +1044,15 @@ pub async fn start_my_wave(
     let Some(first) = wave_tracks.first().cloned() else {
         return Err("Не удалось подобрать треки для волны — подключите хотя бы один сервис".into());
     };
-    let res = play_track_inner(&state, first, Some(wave_tracks), true).await?;
+    {
+        let mut player = state.player.write().await;
+        player.shuffle = false;
+        player.shuffle_order.clear();
+    }
+    state.shuffle_bag.write().await.clear();
+    let mut res = play_track_inner(&state, first, Some(wave_tracks), true).await?;
+    res.shuffle = false;
+    res.shuffle_order.clear();
     {
         let mut w = state.wave_active.write().await;
         *w = true;
@@ -1270,6 +1182,19 @@ pub async fn get_artist_yandex_info(
 }
 
 #[tauri::command]
+pub async fn get_artist_preview_track(
+    state: State<'_, AppState>,
+    artist_id: String,
+    artist_name: String,
+) -> Result<Option<Track>, String> {
+    let reg = state.registry.read().await;
+    reg.yandex
+        .fetch_artist_preview_track(&artist_id, &artist_name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub async fn get_yandex_album_tracks(
     state: State<'_, AppState>,
     album_id: String,
@@ -1333,7 +1258,7 @@ pub async fn preload_next_track(state: State<'_, AppState>) -> Result<Option<Tra
     let Some(mut track) = candidate else {
         return Ok(None);
     };
-    if track.source != SourceKind::Spotify && track.source != SourceKind::Local {
+    if track.source != SourceKind::Local {
         let registry = state.registry.read().await;
         if let Ok(Some(url)) = registry.resolve_playback_url(track.source, &track.id).await {
             track.playback_url = Some(url);
@@ -1556,4 +1481,100 @@ pub async fn scan_local_tracks(state: State<'_, AppState>) -> Result<Vec<Track>,
     tokio::task::spawn_blocking(move || crate::local_library::scan_local_folders(&folders))
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn update_smtc_state(
+    smtc: State<'_, crate::media_controls::SmtcHandle>,
+    title: String,
+    artist: String,
+    album: String,
+    cover_url: Option<String>,
+    duration_sec: u32,
+    playing: bool,
+    position_sec: u32,
+) {
+    smtc.send(crate::media_controls::SmtcCommand::Metadata {
+        title,
+        artist,
+        album,
+        cover_url,
+        duration_sec,
+    });
+    smtc.send(crate::media_controls::SmtcCommand::Playback {
+        playing,
+        position_sec,
+    });
+}
+
+fn wave_track_score(t: &Track, weights: &std::collections::HashMap<String, f32>) -> f32 {
+    let art = t
+        .artist
+        .split(&[',', '&'][..])
+        .next()
+        .unwrap_or(&t.artist)
+        .trim()
+        .to_lowercase();
+    let mut score = *weights.get(&format!("a:{}", art)).unwrap_or(&0.0);
+    if let Some(ref g) = t.genre {
+        let gl = g.trim().to_lowercase();
+        if !gl.is_empty() {
+            score += *weights.get(&format!("g:{}", gl)).unwrap_or(&0.0);
+        }
+    }
+    score
+}
+
+#[tauri::command]
+pub async fn report_wave_feedback(
+    state: State<'_, AppState>,
+    track: Track,
+    positive: bool,
+) -> Result<(), String> {
+    let art = track
+        .artist
+        .split(&[',', '&'][..])
+        .next()
+        .unwrap_or(&track.artist)
+        .trim()
+        .to_lowercase();
+    let mut weights = state.wave_weights.write().await;
+    if !art.is_empty() {
+        let k = format!("a:{}", art);
+        let cur = *weights.get(&k).unwrap_or(&0.0);
+        let delta = if positive { 1.5 } else { -2.5 };
+        weights.insert(k, (cur + delta).clamp(-6.0, 6.0));
+    }
+    if let Some(ref g) = track.genre {
+        let gl = g.trim().to_lowercase();
+        if !gl.is_empty() {
+            let k = format!("g:{}", gl);
+            let cur = *weights.get(&k).unwrap_or(&0.0);
+            let delta = if positive { 1.0 } else { -1.0 };
+            weights.insert(k, (cur + delta).clamp(-4.0, 4.0));
+        }
+    }
+    let snapshot_weights = weights.clone();
+    drop(weights);
+
+    if *state.wave_active.read().await {
+        let mut player = state.player.write().await;
+        if let Some(curr_id) = player.current_track.as_ref().map(|c| c.id.clone()) {
+            if let Some(pos) = player.queue.iter().position(|t| t.id == curr_id) {
+                if pos + 2 < player.queue.len() {
+                    player.queue[pos + 1..].sort_by(|a, b| {
+                        wave_track_score(b, &snapshot_weights)
+                            .partial_cmp(&wave_track_score(a, &snapshot_weights))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_track_cache_enabled(state: State<'_, AppState>, enabled: bool) {
+    state.track_cache.set_enabled(enabled);
 }

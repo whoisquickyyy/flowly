@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
     Yandex,
-    Spotify,
     SoundCloud,
     Local,
 }
@@ -12,8 +11,7 @@ pub enum SourceKind {
 impl SourceKind {
     pub fn display_name(&self) -> &'static str {
         match self {
-            SourceKind::Yandex => "Yandex Music",
-            SourceKind::Spotify => "Spotify",
+            SourceKind::Yandex => "Яндекс Музыка",
             SourceKind::SoundCloud => "SoundCloud",
             SourceKind::Local => "Локальные файлы",
         }
@@ -155,6 +153,8 @@ pub struct AudioEffectsConfig {
     pub eq_enabled: bool,
     pub preset: String,
     pub bands: [f32; 10],
+    #[serde(default)]
+    pub preamp_db: f32,
     pub crossfade_sec: u8,
     pub normalize_volume: bool,
     pub bass_boost: u8,
@@ -167,6 +167,7 @@ impl Default for AudioEffectsConfig {
             eq_enabled: true,
             preset: "Flat".to_string(),
             bands: [0.0; 10],
+            preamp_db: 0.0,
             crossfade_sec: 4,
             normalize_volume: true,
             bass_boost: 0,
@@ -229,6 +230,14 @@ pub struct ArtistRelease {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SimilarArtist {
+    pub id: String,
+    pub name: String,
+    pub artwork: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArtistYandexInfo {
     pub id: String,
     pub name: String,
@@ -236,4 +245,6 @@ pub struct ArtistYandexInfo {
     pub monthly_listeners: Option<u64>,
     pub latest_release: Option<ArtistRelease>,
     pub external_url: String,
+    #[serde(default)]
+    pub similar_artists: Vec<SimilarArtist>,
 }

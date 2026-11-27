@@ -8,7 +8,7 @@ use crate::network::doh::DohResolver;
 
 static SHARED_DOH: OnceLock<Arc<DohResolver>> = OnceLock::new();
 
-fn shared_doh() -> Arc<DohResolver> {
+pub fn shared_doh() -> Arc<DohResolver> {
     Arc::clone(SHARED_DOH.get_or_init(|| Arc::new(DohResolver::new())))
 }
 
@@ -22,7 +22,7 @@ pub enum NetworkError {
 
 /// Собирает изолированный HTTP-клиент для конкретного музыкального источника.
 /// Для каждого провайдера используется свой экземпляр, что обеспечивает split-tunneling:
-/// например, Яндекс Музыка ходит напрямую (Direct), а Spotify/SoundCloud — через SOCKS5.
+/// Например, Яндекс Музыка ходит напрямую (Direct), а SoundCloud — через SOCKS5.
 pub fn build_client(config: &ProxyConfig) -> Result<Client, NetworkError> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(20))

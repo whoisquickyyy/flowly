@@ -1,4 +1,4 @@
-export type SourceKind = 'yandex' | 'spotify' | 'soundcloud' | 'local';
+export type SourceKind = 'yandex' | 'soundcloud' | 'local';
 export type ProxyMode = 'direct' | 'socks5' | 'http';
 export type RepeatMode = 'off' | 'all' | 'one';
 export type BackgroundMode =
@@ -121,6 +121,7 @@ export interface AudioEffectsConfig {
   eq_enabled: boolean;
   preset: string;
   bands: number[];
+  preamp_db?: number;
   crossfade_sec: number;
   normalize_volume: boolean;
   bass_boost: number;
@@ -187,6 +188,12 @@ export interface ArtistRelease {
   externalUrl: string;
 }
 
+export interface SimilarArtist {
+  id: string;
+  name: string;
+  artwork: string | null;
+}
+
 export interface ArtistYandexInfo {
   id: string;
   name: string;
@@ -194,6 +201,7 @@ export interface ArtistYandexInfo {
   monthlyListeners: number | null;
   latestRelease: ArtistRelease | null;
   externalUrl: string;
+  similarArtists?: SimilarArtist[];
 }
 
 export type RecapPeriod = 'day' | 'week' | 'month' | 'all';
@@ -224,6 +232,11 @@ export interface RecapSummary {
   accentColor: string;
 }
 
+export interface RecapDiscovery {
+  artist: string;
+  track: Track;
+}
+
 export interface ListeningRecap {
   period: RecapPeriod;
   totalPlays: number;
@@ -235,6 +248,10 @@ export interface ListeningRecap {
   topArtists: RecapArtistStat[];
   topTracks: RecapTrackStat[];
   summary: RecapSummary;
+  hourlyPlays?: number[];
+  peakHour?: number | null;
+  streakDays?: number;
+  discovery?: RecapDiscovery | null;
 }
 
 export interface TrackSample {

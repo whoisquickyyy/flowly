@@ -20,6 +20,14 @@ export interface BlendedTrack {
   score: number;
 }
 
+export interface JamChatMessage {
+  id: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  ts: number;
+}
+
 export interface JamRoomState {
   roomCode: string;
   myId: string;
@@ -33,6 +41,18 @@ export interface JamRoomState {
   positionSec: number;
   skipVotes: string[];
   statusText: string;
+  syncStatus?: 'synced' | 'catching-up' | 'host-away';
+  chat?: JamChatMessage[];
+}
+
+export function pickDiverseSample(tracks: Track[], count: number): Track[] {
+  if (tracks.length <= count) return [...tracks];
+  const copy = [...tracks];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, count);
 }
 
 function primaryArtist(artist: string): string {
@@ -58,7 +78,11 @@ export function trackMatchKey(t: Track): string {
  * 2) Общие артисты (>= 2 участников)
  * 3) Общие жанры + честный Round-Robin между всеми участниками
  */
-export function buildBlendedQueue(members: JamMember[], maxTracks = 60): BlendedTrack[] {
+export function buildBlendedQueue(
+  members: JamMember[],
+  maxTracks = 120,
+  excludeKeys?: Set<string>
+): BlendedTrack[] {
   if (members.length === 0) return [];
 
   const trackOwners = new Map<string, { track: Track; owners: Set<string>; ownerNames: string[] }>();
@@ -169,7 +193,7 @@ export function buildBlendedQueue(members: JamMember[], maxTracks = 60): Blended
   const seen = new Set<string>();
   for (const item of combined) {
     const key = trackMatchKey(item.track);
-    if (seen.has(key)) continue;
+    if (seen.has(key) || excludeKeys?.has(key)) continue;
     seen.add(key);
     deduped.push(item);
     if (deduped.length >= maxTracks) break;

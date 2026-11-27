@@ -44,8 +44,7 @@
     justify-content: space-between;
     padding: 0 12px 0 16px;
     border-bottom: 1px solid var(--border-subtle);
-    background: rgba(12, 12, 18, 0.78);
-    backdrop-filter: blur(18px);
+    background: rgba(12, 12, 18, 0.92);
     position: relative;
     z-index: 30;
   }

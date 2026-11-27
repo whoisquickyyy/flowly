@@ -14,6 +14,7 @@
     Sparkles,
     X,
   } from 'lucide-svelte';
+  import RadixDialog from './ui/RadixDialog.svelte';
 
   interface Props {
     open: boolean;
@@ -47,15 +48,7 @@
   }
 </script>
 
-{#if open}
-  <div
-    class="ob-backdrop"
-    role="presentation"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) finish();
-    }}
-  >
-    <div class="ob-modal">
+<RadixDialog {open} onOpenChange={(v) => { if (!v) finish(); }} maxWidth="540px">
       <div class="ob-top">
         <span class="ob-step-pill">Шаг {step + 1} из {totalSteps}</span>
         <button type="button" class="ob-skip" onclick={finish}>
@@ -74,7 +67,7 @@
             </div>
             <div class="mock-meta">
               <div class="mock-title">Flowly Player</div>
-              <div class="mock-sub">Yandex Music · Spotify · SoundCloud</div>
+              <div class="mock-sub">Яндекс Музыка · SoundCloud</div>
             </div>
             <div class="mock-bar">
               <Heart size={13} fill="#ff3b5c" color="#ff3b5c" />
@@ -90,7 +83,6 @@
             </div>
             <div class="mock-pills">
               <span class="mp ok">Яндекс Музыка · Подключено</span>
-              <span class="mp ok">Spotify · Подключено</span>
               <span class="mp">SoundCloud · Прокси / Direct</span>
             </div>
             <div class="mock-hint-box">
@@ -165,7 +157,7 @@
         {#if step === 0}
           <h3>Добро пожаловать во Flowly</h3>
           <p>
-            Единый плеер для Яндекс Музыки, Spotify и SoundCloud с красивыми фонами, DJ-кроссфейдами,
+            Единый плеер для Яндекс Музыки и SoundCloud с красивыми фонами, DJ-кроссфейдами,
             Discord RPC и совместным прослушиванием с друзьями.
           </p>
         {:else if step === 1}
@@ -235,35 +227,9 @@
           </button>
         </div>
       </div>
-    </div>
-  </div>
-{/if}
+</RadixDialog>
 
 <style>
-  .ob-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 300;
-    background: rgba(5, 5, 9, 0.78);
-    backdrop-filter: blur(14px);
-    display: grid;
-    place-items: center;
-    padding: 20px;
-  }
-
-  .ob-modal {
-    width: 100%;
-    max-width: 540px;
-    padding: 22px 24px;
-    border-radius: 22px;
-    background: linear-gradient(160deg, rgba(24, 24, 34, 0.98), rgba(14, 14, 20, 0.98));
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    box-shadow: 0 28px 70px rgba(0, 0, 0, 0.75);
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
-  }
-
   .ob-top {
     display: flex;
     align-items: center;

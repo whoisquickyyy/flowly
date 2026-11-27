@@ -29,6 +29,7 @@
     Radio,
     Maximize2,
     Minimize2,
+    User,
   } from 'lucide-svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import SourceBadge from './SourceBadge.svelte';
@@ -36,6 +37,7 @@
   import ProgressBarMD3 from './ProgressBarMD3.svelte';
   import * as api from '../api';
   import type {
+    ArtistYandexInfo,
     AudioEffectsConfig,
     AuthStatus,
     LayoutStyle,
@@ -91,6 +93,8 @@
     onToggleEq: () => void;
     onOpenEqTab: () => void;
     onGoSettings: () => void;
+    audioProxyPort?: number;
+    onDuckMainAudio?: (duck: boolean) => void;
   }
 
   let {
@@ -100,14 +104,14 @@
     waveActive = false,
     waveTracks = [],
     waveConfig = { sourceFilter: null, mood: 'mix' },
-    enabledSources = ['yandex', 'spotify', 'soundcloud'],
+    enabledSources = ['yandex', 'soundcloud'],
     mix = { enabled: true, mode: 'auto', preset: 'dj-vocal', durationSec: 6, eqSweep: true },
     activeDjPreset = 'dj-vocal',
     likedTracks = [],
     recentTracks = [],
     localPlaylists = [],
     likedIds = new Set(),
-    layoutStyle = 'wave-dock',
+    layoutStyle = 'modern-analog',
     tvWeatherLabel = '',
     isPlaying,
     positionSec,
@@ -135,6 +139,8 @@
     onToggleEq,
     onOpenEqTab,
     onGoSettings,
+    audioProxyPort = 0,
+    onDuckMainAudio = () => {},
   }: Props = $props();
 
   let prevVolume = $state(80);
@@ -165,12 +171,26 @@
   }
 
   async function toggleTvFullscreen() {
-    if (!api.isTauri()) return;
+    if (api.isTauri()) {
+      try {
+        const win = getCurrentWindow();
+        const cur = await win.isFullscreen().catch(() => tvFullscreen);
+        const next = !cur;
+        await win.setFullscreen(next);
+        tvFullscreen = next;
+        return;
+      } catch (e) {
+        console.warn('Tauri setFullscreen failed, trying DOM fullscreen:', e);
+      }
+    }
     try {
-      const win = getCurrentWindow();
-      const next = !tvFullscreen;
-      await win.setFullscreen(next);
-      tvFullscreen = next;
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+        tvFullscreen = true;
+      } else {
+        await document.exitFullscreen();
+        tvFullscreen = false;
+      }
     } catch {
       // ignore
     }
@@ -316,6 +336,132 @@
       waveBusy = false;
     }
   }
+
+  let artistInfo = $state<ArtistYandexInfo | null>(null);
+  let artistLoading = $state(false);
+  const artistCache = new Map<string, ArtistYandexInfo | null>();
+
+  const primaryArtistName = $derived.by(() => {
+    if (!track?.artist) return '';
+    return track.artist.split(/[,&]/)[0]?.trim() || track.artist;
+  });
+
+  $effect(() => {
+    const name = primaryArtistName;
+    if (!name) {
+      artistInfo = null;
+      return;
+    }
+    if (artistCache.has(name)) {
+      artistInfo = artistCache.get(name) ?? null;
+      artistLoading = false;
+      return;
+    }
+    let cancelled = false;
+    artistLoading = true;
+    api
+      .getArtistYandexInfo(name)
+      .then((res) => {
+        if (cancelled) return;
+        artistCache.set(name, res);
+        artistInfo = res;
+      })
+      .catch(() => {
+        if (!cancelled) artistInfo = null;
+      })
+      .finally(() => {
+        if (!cancelled) artistLoading = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
+
+  function formatListeners(n: number): string {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} млн слушателей/мес`;
+    if (n >= 1_000) return `${Math.round(n / 1_000)} тыс. слушателей/мес`;
+    return `${n} слушателей/мес`;
+  }
+
+  // Hover-превью похожих артистов (задержка 350 мс + ducking основного трека)
+  let previewArtistId = $state<string | null>(null);
+  let previewProgress = $state(0);
+  let previewStartSec = 0;
+  let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+  let previewAudioEl = $state<HTMLAudioElement | undefined>(undefined);
+  const previewTrackCache = new Map<string, Track | null>();
+  const PREVIEW_MAX_SEC = 24;
+
+  function stopArtistPreview() {
+    if (hoverTimer) {
+      clearTimeout(hoverTimer);
+      hoverTimer = null;
+    }
+    if (previewAudioEl) {
+      previewAudioEl.pause();
+      previewAudioEl.removeAttribute('src');
+    }
+    if (previewArtistId !== null) {
+      previewArtistId = null;
+      previewProgress = 0;
+      onDuckMainAudio(false);
+    }
+  }
+
+  function handleSimilarEnter(artistId: string, artistName: string) {
+    if (hoverTimer) clearTimeout(hoverTimer);
+    hoverTimer = setTimeout(async () => {
+      hoverTimer = null;
+      previewArtistId = artistId;
+      previewProgress = 0;
+      let tr: Track | null = null;
+      if (previewTrackCache.has(artistId)) {
+        tr = previewTrackCache.get(artistId) ?? null;
+      } else {
+        tr = await api.getArtistPreviewTrack(artistId, artistName).catch(() => null);
+        previewTrackCache.set(artistId, tr);
+      }
+      if (previewArtistId !== artistId || !tr?.playbackUrl || !previewAudioEl) {
+        if (previewArtistId === artistId) stopArtistPreview();
+        return;
+      }
+      const rawUrl = tr.playbackUrl;
+      const proxied =
+        audioProxyPort > 0 && rawUrl.startsWith('http')
+          ? `http://127.0.0.1:${audioProxyPort}/proxy?source=${tr.source}&url=${encodeURIComponent(rawUrl)}`
+          : rawUrl;
+      const startAt = tr.duration > 40 ? Math.min(45, Math.floor(tr.duration * 0.3)) : 0;
+      previewStartSec = startAt;
+      previewAudioEl.src = proxied;
+      previewAudioEl.volume = Math.max(0.08, Math.min(0.85, (volume / 100) * 0.72));
+      const startPlay = () => {
+        if (!previewAudioEl || previewArtistId !== artistId) return;
+        if (startAt > 0 && Number.isFinite(previewAudioEl.duration) && previewAudioEl.duration > startAt + 5) {
+          previewAudioEl.currentTime = startAt;
+        }
+        onDuckMainAudio(true);
+        previewAudioEl.play().catch(() => stopArtistPreview());
+      };
+      previewAudioEl.onloadedmetadata = startPlay;
+      previewAudioEl.load();
+    }, 350);
+  }
+
+  function handlePreviewTimeUpdate() {
+    if (!previewAudioEl || !previewArtistId) return;
+    const elapsed = Math.max(0, previewAudioEl.currentTime - previewStartSec);
+    previewProgress = Math.min(1, elapsed / PREVIEW_MAX_SEC);
+    if (elapsed >= PREVIEW_MAX_SEC) {
+      stopArtistPreview();
+    }
+  }
+
+  $effect(() => {
+    void track?.id;
+    return () => {
+      stopArtistPreview();
+    };
+  });
 
   function formatDuration(sec: number): string {
     const m = Math.floor(sec / 60);
@@ -489,15 +635,6 @@
                     ЯМ
                   </button>
                 {/if}
-                {#if enabledSources.includes('spotify')}
-                  <button
-                    type="button"
-                    class:active={waveConfig.sourceFilter === 'spotify'}
-                    onclick={() => onWaveConfigChange({ ...waveConfig, sourceFilter: 'spotify' })}
-                  >
-                    Spotify
-                  </button>
-                {/if}
                 {#if enabledSources.includes('soundcloud')}
                   <button
                     type="button"
@@ -553,15 +690,6 @@
                     onclick={() => onWaveConfigChange({ ...waveConfig, sourceFilter: 'yandex' })}
                   >
                     ЯМ
-                  </button>
-                {/if}
-                {#if enabledSources.includes('spotify')}
-                  <button
-                    type="button"
-                    class:active={waveConfig.sourceFilter === 'spotify'}
-                    onclick={() => onWaveConfigChange({ ...waveConfig, sourceFilter: 'spotify' })}
-                  >
-                    Spotify
                   </button>
                 {/if}
                 {#if enabledSources.includes('soundcloud')}
@@ -967,8 +1095,103 @@
           </button>
         </div>
       </div>
+
+      {#if track && primaryArtistName}
+        <div class="artist-info-box">
+          <div class="artist-info-head">
+            <span>Об исполнителе</span>
+            <button type="button" class="artist-open-link" onclick={() => onOpenArtist(primaryArtistName)}>
+              Профиль →
+            </button>
+          </div>
+          <button type="button" class="artist-info-card" onclick={() => onOpenArtist(primaryArtistName)}>
+            {#if artistInfo?.artwork || track.artwork}
+              <img class="artist-info-avatar" src={artistInfo?.artwork || track.artwork} alt={primaryArtistName} />
+            {:else}
+              <div class="artist-info-avatar placeholder"><User size={16} /></div>
+            {/if}
+            <div class="artist-info-meta">
+              <div class="artist-info-name">{artistInfo?.name || primaryArtistName}</div>
+              <div class="artist-info-sub">
+                {#if artistLoading}
+                  Загрузка...
+                {:else if artistInfo?.monthlyListeners}
+                  {formatListeners(artistInfo.monthlyListeners)}
+                {:else if track.genre}
+                  {track.genre}
+                {:else}
+                  Исполнитель
+                {/if}
+              </div>
+            </div>
+          </button>
+          {#if artistInfo?.latestRelease}
+            <div class="artist-latest-release">
+              <span>Последний релиз:</span>
+              <b>{artistInfo.latestRelease.title}{artistInfo.latestRelease.year ? ` (${artistInfo.latestRelease.year})` : ''}</b>
+            </div>
+          {/if}
+
+          {#if artistInfo?.similarArtists && artistInfo.similarArtists.length > 0}
+            <div class="similar-artists-block">
+              <div class="similar-head">
+                <span>Похожие артисты</span>
+                <span class="similar-hint">Наведите для превью</span>
+              </div>
+              <div class="similar-row">
+                {#each artistInfo.similarArtists.slice(0, 5) as sa (sa.id)}
+                  {@const isPrev = previewArtistId === sa.id}
+                  <button
+                    type="button"
+                    class="similar-chip"
+                    class:previewing={isPrev}
+                    title={sa.name}
+                    onpointerenter={() => handleSimilarEnter(sa.id, sa.name)}
+                    onpointerleave={stopArtistPreview}
+                    onclick={() => {
+                      stopArtistPreview();
+                      onOpenArtist(sa.name);
+                    }}
+                  >
+                    <div class="similar-ring-wrap">
+                      {#if sa.artwork}
+                        <img src={sa.artwork} alt={sa.name} />
+                      {:else}
+                        <span class="similar-fallback">{sa.name.slice(0, 1).toUpperCase()}</span>
+                      {/if}
+                      {#if isPrev}
+                        <svg class="similar-ring" viewBox="0 0 46 46">
+                          <circle
+                            cx="23"
+                            cy="23"
+                            r="21"
+                            fill="none"
+                            stroke="var(--accent)"
+                            stroke-width="2.5"
+                            stroke-dasharray={131.95}
+                            stroke-dashoffset={131.95 * (1 - previewProgress)}
+                            transform="rotate(-90 23 23)"
+                          />
+                        </svg>
+                      {/if}
+                    </div>
+                    <span class="similar-name">{sa.name}</span>
+                  </button>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </div>
+      {/if}
     </aside>
   </section>
+
+  <audio
+    bind:this={previewAudioEl}
+    ontimeupdate={handlePreviewTimeUpdate}
+    onended={stopArtistPreview}
+    onerror={stopArtistPreview}
+  ></audio>
 
   <!-- Нижняя полка Wave Dock -->
   {#if layoutStyle === 'wave-dock'}
@@ -1211,6 +1434,209 @@
     display: flex;
     flex-direction: column;
     gap: 9px;
+  }
+
+  .artist-info-box {
+    padding: 12px;
+    border-radius: 12px;
+    background: rgba(19, 19, 24, 0.72);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .artist-info-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .artist-open-link {
+    border: none;
+    background: transparent;
+    color: var(--accent);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .artist-open-link:hover {
+    text-decoration: underline;
+  }
+
+  .artist-info-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px;
+    border-radius: 10px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.14s ease;
+  }
+
+  .artist-info-card:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+
+  .artist-info-avatar {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    object-fit: cover;
+    flex-shrink: 0;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+
+  .artist-info-avatar.placeholder {
+    display: grid;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text-secondary);
+  }
+
+  .artist-info-meta {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .artist-info-name {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .artist-info-sub {
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .artist-latest-release {
+    font-size: 11px;
+    color: var(--text-secondary);
+    padding-top: 6px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .artist-latest-release b {
+    color: var(--text-primary);
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .similar-artists-block {
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .similar-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: var(--text-secondary);
+    font-weight: 600;
+  }
+
+  .similar-hint {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 400;
+  }
+
+  .similar-row {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  .similar-chip {
+    border: none;
+    background: transparent;
+    padding: 2px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    color: var(--text-secondary);
+    transition: transform 130ms ease, color 130ms ease;
+  }
+
+  .similar-chip:hover,
+  .similar-chip.previewing {
+    transform: translateY(-2px);
+    color: var(--text-primary);
+  }
+
+  .similar-ring-wrap {
+    position: relative;
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+  }
+
+  .similar-ring-wrap img,
+  .similar-fallback {
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    object-fit: cover;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+  }
+
+  .similar-fallback {
+    display: grid;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.08);
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .similar-ring {
+    position: absolute;
+    inset: -2px;
+    width: 46px;
+    height: 46px;
+    pointer-events: none;
+  }
+
+  .similar-name {
+    width: 100%;
+    font-size: 10px;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .side-panel.analog-right .track-stack {

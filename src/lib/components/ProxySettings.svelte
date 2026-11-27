@@ -54,7 +54,6 @@
 
   function sourceAccent(source: SourceKind) {
     if (source === 'yandex') return '#f59e0b';
-    if (source === 'spotify') return '#10b981';
     return '#f97316';
   }
 </script>
@@ -68,7 +67,7 @@
       <h2>Split-Tunneling и обход ограничений</h2>
       <p>
         Настрой маршрутизацию отдельно для каждого сервиса: Яндекс Музыка работает напрямую без VPN,
-        а Spotify и SoundCloud можно пустить через локальный SOCKS5/HTTP прокси (Xray, NekoBox, Amnezia).
+        а SoundCloud можно пустить через локальный SOCKS5/HTTP прокси (Xray, NekoBox, Amnezia).
       </p>
     </div>
   </div>
@@ -219,7 +218,6 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
-    backdrop-filter: blur(12px);
   }
 
   .card-top {

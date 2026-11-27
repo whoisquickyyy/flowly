@@ -45,44 +45,43 @@
   let wordTimers: ReturnType<typeof setTimeout>[] = [];
 
   const ALL_FONTS = [
-    '"Unbounded", sans-serif',
-    '"Playfair Display", serif',
-    '"Oswald", sans-serif',
-    '"Russo One", sans-serif',
-    '"JetBrains Mono", monospace',
-    '"Caveat", cursive',
+    '"SF Pro Display", -apple-system, "Segoe UI", "Arial", sans-serif',
+    '"Inter", "SF Pro Display", "Segoe UI", "Arial", sans-serif',
+    '"Arial", "Helvetica Neue", "Segoe UI", sans-serif',
+    '"Bahnschrift", "Roboto", "Segoe UI", "Arial", sans-serif',
+    '"Manrope", "Segoe UI", "Arial", sans-serif',
+    '"IBM Plex Sans", "Segoe UI", "Arial", sans-serif',
   ];
 
   function pickGenreFonts(genre?: string | null): string[] {
     const g = (genre ?? '').toLowerCase();
     if (/rap|hip|trap|drill|phonk|cloud/.test(g)) {
       return [
-        '"Unbounded", sans-serif',
-        '"Russo One", sans-serif',
-        '"Oswald", sans-serif',
-        '"JetBrains Mono", monospace',
+        '"Bahnschrift", "Inter", "Arial", sans-serif',
+        '"Arial", "Helvetica Neue", "Segoe UI", sans-serif',
+        '"SF Pro Display", -apple-system, "Segoe UI", sans-serif',
+        '"JetBrains Mono", "Consolas", monospace',
       ];
     }
     if (/rock|alt|punk|metal|emo|grunge/.test(g)) {
       return [
-        '"Oswald", sans-serif',
-        '"Russo One", sans-serif',
-        '"Caveat", cursive',
-        '"Playfair Display", serif',
+        '"Bahnschrift", "Arial", sans-serif',
+        '"IBM Plex Sans", "Segoe UI", "Arial", sans-serif',
+        '"Arial", "Helvetica Neue", sans-serif',
       ];
     }
     if (/electr|house|techno|edm|dnb|synth|trance|dance/.test(g)) {
       return [
-        '"Unbounded", sans-serif',
-        '"JetBrains Mono", monospace',
-        '"Oswald", sans-serif',
+        '"Inter", "SF Pro Display", "Segoe UI", "Arial", sans-serif',
+        '"JetBrains Mono", "Consolas", monospace',
+        '"Manrope", "Segoe UI", "Arial", sans-serif',
       ];
     }
     if (/pop|indie|rnb|soul|jazz|chill|lo-?fi|acoustic/.test(g)) {
       return [
-        '"Playfair Display", serif',
-        '"Caveat", cursive',
-        '"Unbounded", sans-serif',
+        '"SF Pro Display", -apple-system, "Segoe UI", "Arial", sans-serif',
+        '"Manrope", "Segoe UI", "Arial", sans-serif',
+        '"Inter", "Arial", sans-serif',
       ];
     }
     return ALL_FONTS;
@@ -283,7 +282,7 @@
       mouseX = (e.clientX / Math.max(1, window.innerWidth) - 0.5) * 2;
       mouseY = (e.clientY / Math.max(1, window.innerHeight) - 0.5) * 2;
     };
-    window.addEventListener('pointermove', onPointer);
+    window.addEventListener('pointermove', onPointer, { passive: true });
 
     // Инициализация частиц для дождя и космоса
     const drops = Array.from({ length: 85 }, () => ({
@@ -302,7 +301,14 @@
       color: starCols[i % starCols.length],
     }));
 
-    const render = () => {
+    let lastRender = 0;
+
+    const render = (now: number = performance.now()) => {
+      if (document.hidden || now - lastRender < 33) {
+        rafId = requestAnimationFrame(render);
+        return;
+      }
+      lastRender = now;
       const w = canvas.width;
       const h = canvas.height;
       const bass = readBassEnergy();

@@ -16,6 +16,7 @@ pub struct YandexMusicProvider {
     token: Option<String>,
     account_name: Option<String>,
     uid: Option<u64>,
+    liked_cache: Option<(std::time::Instant, Vec<Track>)>,
 }
 
 impl YandexMusicProvider {
@@ -27,6 +28,7 @@ impl YandexMusicProvider {
             token,
             account_name,
             uid: None,
+            liked_cache: None,
         }
     }
 
@@ -34,6 +36,7 @@ impl YandexMusicProvider {
         self.token = token;
         self.account_name = account_name;
         self.uid = uid;
+        self.liked_cache = None;
     }
 
     pub async fn verify_and_fetch_account(&mut self, token: &str) -> Result<(String, u64), ProviderError> {
@@ -125,6 +128,11 @@ impl YandexMusicProvider {
     }
 
     pub async fn fetch_liked_tracks(&mut self) -> Result<Vec<Track>, ProviderError> {
+        if let Some((ts, ref cached)) = self.liked_cache {
+            if ts.elapsed() < std::time::Duration::from_secs(120) && !cached.is_empty() {
+                return Ok(cached.clone());
+            }
+        }
         let token = self.token.clone().ok_or(ProviderError::Unauthorized)?;
         let uid = self.ensure_uid().await?;
 
@@ -239,8 +247,15 @@ impl YandexMusicProvider {
                     .error_for_status()
                     .ok()?;
                 let a_json: Value = r.json().await.ok()?;
+                let res = &a_json["result"];
+                let is_podcast = res["type"].as_str() == Some("podcast")
+                    || res["metaType"].as_str() == Some("podcast")
+                    || res["genre"].as_str() == Some("podcasts");
+                if is_podcast {
+                    return None;
+                }
                 let mut tracks = Vec::new();
-                if let Some(volumes) = a_json["result"]["volumes"].as_array() {
+                if let Some(volumes) = res["volumes"].as_array() {
                     for vol in volumes {
                         if let Some(arr) = vol.as_array() {
                             for t in arr {
@@ -262,7 +277,11 @@ impl YandexMusicProvider {
             }
         }
         batches.sort_by_key(|(idx, _)| *idx);
-        Ok(batches.into_iter().flat_map(|(_, t)| t).collect())
+        let result: Vec<Track> = batches.into_iter().flat_map(|(_, t)| t).collect();
+        if !result.is_empty() {
+            self.liked_cache = Some((std::time::Instant::now(), result.clone()));
+        }
+        Ok(result)
     }
 
     pub async fn fetch_wave_tracks_excluding(
@@ -270,13 +289,17 @@ impl YandexMusicProvider {
         exclude_ids: &std::collections::HashSet<String>,
         seed_track_id: Option<&str>,
     ) -> Result<Vec<Track>, ProviderError> {
+        use rand::seq::SliceRandom;
+
         let token = self.token.clone().ok_or(ProviderError::Unauthorized)?;
         let mut collected: Vec<Track> = Vec::new();
         let mut seen = exclude_ids.clone();
+        let mut used_seeds: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut queue_seed: Option<String> = seed_track_id
             .map(|s| s.trim_start_matches("ym:").to_string());
+        let mut sent_radio_started = false;
 
-        for _ in 0..5 {
+        for _ in 0..6 {
             let mut req = self
                 .client
                 .get("https://api.music.yandex.net/rotor/station/user:onyourwave/tracks")
@@ -285,6 +308,7 @@ impl YandexMusicProvider {
                 .header("User-Agent", "Yandex-Music-API")
                 .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621");
             if let Some(ref seed) = queue_seed {
+                used_seeds.insert(seed.clone());
                 req = req.query(&[("queue", seed.as_str())]);
             }
 
@@ -292,6 +316,7 @@ impl YandexMusicProvider {
             let Ok(ok_r) = r.error_for_status() else { break };
             let Ok(json) = ok_r.json::<Value>().await else { break };
 
+            let batch_id = json["result"]["batchId"].as_str().map(|s| s.to_string());
             let batch: Vec<Track> = json["result"]["sequence"]
                 .as_array()
                 .map(|arr| {
@@ -304,27 +329,107 @@ impl YandexMusicProvider {
             if batch.is_empty() {
                 break;
             }
-            if let Some(last) = batch.last() {
-                queue_seed = Some(last.id.trim_start_matches("ym:").to_string());
+
+            if !sent_radio_started {
+                sent_radio_started = true;
+                let mut fb = serde_json::json!({
+                    "type": "radioStarted",
+                    "from": "flowly-wave"
+                });
+                if let Some(ref bid) = batch_id {
+                    fb["batchId"] = serde_json::json!(bid);
+                }
+                let _ = self
+                    .client
+                    .post("https://api.music.yandex.net/rotor/station/user:onyourwave/feedback")
+                    .header("Authorization", format!("OAuth {}", token))
+                    .header("User-Agent", "Yandex-Music-API")
+                    .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621")
+                    .json(&fb)
+                    .send()
+                    .await;
             }
-            for t in batch {
+
+            let before_len = collected.len();
+            let mut next_seed: Option<String> = None;
+            for t in &batch {
+                let raw = t.id.trim_start_matches("ym:").to_string();
+                if !used_seeds.contains(&raw) {
+                    next_seed = Some(raw.clone());
+                }
                 if seen.insert(t.id.clone()) {
-                    collected.push(t);
+                    collected.push(t.clone());
                 }
             }
-            if collected.len() >= 18 {
+
+            if collected.len() >= 20 {
                 break;
+            }
+            if collected.len() == before_len && next_seed.is_none() {
+                // Ротор перестал отдавать новые треки — выходим из цикла
+                break;
+            }
+            if let Some(ns) = next_seed {
+                queue_seed = Some(ns);
+            } else if let Some(last) = batch.last() {
+                let raw = last.id.trim_start_matches("ym:").to_string();
+                if used_seeds.contains(&raw) {
+                    break;
+                }
+                queue_seed = Some(raw);
             }
         }
 
-        if !collected.is_empty() {
-            return Ok(collected);
+        // Если ротор вернул мало треков — добираем похожие треки и перемешанные лайки
+        if collected.len() < 12 {
+            let sim_seed = seed_track_id
+                .map(|s| s.trim_start_matches("ym:").to_string())
+                .or_else(|| collected.first().map(|t| t.id.trim_start_matches("ym:").to_string()));
+            if let Some(raw_seed) = sim_seed {
+                let sim_url = format!("https://api.music.yandex.net/tracks/{}/similar", raw_seed);
+                if let Ok(resp) = self
+                    .client
+                    .get(&sim_url)
+                    .header("Authorization", format!("OAuth {}", token))
+                    .header("User-Agent", "Yandex-Music-API")
+                    .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621")
+                    .send()
+                    .await
+                {
+                    if let Ok(ok_r) = resp.error_for_status() {
+                        if let Ok(json) = ok_r.json::<Value>().await {
+                            if let Some(arr) = json["result"]["similarTracks"].as_array() {
+                                for item in arr {
+                                    if let Some(t) = Self::parse_track(item) {
+                                        if seen.insert(t.id.clone()) {
+                                            collected.push(t);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // Fallback на любимые треки (исключая уже виденные)
-        let mut liked = self.fetch_liked_tracks().await.unwrap_or_default();
-        liked.retain(|t| !exclude_ids.contains(&t.id));
-        Ok(liked)
+        if collected.len() < 12 {
+            let mut liked = self.fetch_liked_tracks().await.unwrap_or_default();
+            {
+                let mut rng = rand::thread_rng();
+                liked.shuffle(&mut rng);
+            }
+            for t in liked {
+                if seen.insert(t.id.clone()) {
+                    collected.push(t);
+                    if collected.len() >= 24 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(collected)
     }
 
     #[allow(dead_code)]
@@ -616,6 +721,7 @@ impl YandexMusicProvider {
 
         let mut monthly_listeners: Option<u64> = None;
         let mut latest_release: Option<ArtistRelease> = None;
+        let mut similar_artists: Vec<crate::models::SimilarArtist> = Vec::new();
 
         if let Ok(resp) = req.send().await {
             if let Ok(ok_r) = resp.error_for_status() {
@@ -665,6 +771,29 @@ impl YandexMusicProvider {
                             });
                         }
                     }
+
+                    if let Some(sim_arr) = res["similarArtists"].as_array() {
+                        for sa in sim_arr.iter().take(6) {
+                            let sid = sa["id"]
+                                .as_u64()
+                                .map(|n| n.to_string())
+                                .or_else(|| sa["id"].as_str().map(String::from));
+                            let Some(sid) = sid else { continue };
+                            let sname = sa["name"].as_str().unwrap_or("").trim().to_string();
+                            if sname.is_empty() {
+                                continue;
+                            }
+                            let scover = sa["cover"]["uri"]
+                                .as_str()
+                                .filter(|u| !u.is_empty())
+                                .map(|u| format!("https://{}", u.replace("%%", "200x200")));
+                            similar_artists.push(crate::models::SimilarArtist {
+                                id: sid,
+                                name: sname,
+                                artwork: scover,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -697,7 +826,51 @@ impl YandexMusicProvider {
             artwork,
             monthly_listeners,
             latest_release,
+            similar_artists,
         }))
+    }
+
+    pub async fn fetch_artist_preview_track(
+        &self,
+        artist_id: &str,
+        artist_name: &str,
+    ) -> Result<Option<Track>, ProviderError> {
+        let mut picked: Option<Track> = None;
+        if !artist_id.trim().is_empty() {
+            let mut req = self
+                .client
+                .get(format!(
+                    "https://api.music.yandex.net/artists/{}/tracks",
+                    artist_id.trim()
+                ))
+                .query(&[("page", "0"), ("page-size", "3")])
+                .header("User-Agent", "Yandex-Music-API")
+                .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621");
+            if let Some(ref token) = self.token {
+                req = req.header("Authorization", format!("OAuth {}", token));
+            }
+            if let Ok(resp) = req.send().await {
+                if let Ok(ok_r) = resp.error_for_status() {
+                    if let Ok(json) = ok_r.json::<Value>().await {
+                        picked = json["result"]["tracks"]
+                            .as_array()
+                            .and_then(|arr| arr.iter().find_map(Self::parse_track));
+                    }
+                }
+            }
+        }
+        if picked.is_none() && !artist_name.trim().is_empty() {
+            if let Ok(list) = self.search(artist_name.trim()).await {
+                picked = list.into_iter().next();
+            }
+        }
+        if let Some(mut t) = picked {
+            if let Ok(Some(url)) = self.resolve_playback_url(&t.id).await {
+                t.playback_url = Some(url);
+            }
+            return Ok(Some(t));
+        }
+        Ok(None)
     }
 
     pub async fn fetch_album_tracks(&self, album_id: &str) -> Result<Vec<Track>, ProviderError> {

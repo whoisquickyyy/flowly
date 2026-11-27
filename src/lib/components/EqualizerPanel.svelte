@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { Sliders, RotateCcw, Sparkles, Waves, Volume2, Disc, Plus, Trash2 } from 'lucide-svelte';
+  import { Sliders, RotateCcw, Sparkles, Waves, Volume2, Disc, Plus, Trash2, Download, Upload, Copy, Check } from 'lucide-svelte';
   import SpectrumVisualizer from './SpectrumVisualizer.svelte';
+  import RadixSlider from './ui/RadixSlider.svelte';
+  import RadixSwitch from './ui/RadixSwitch.svelte';
   import type {
     AudioEffectsConfig,
     ManualTransitionStyle,
@@ -48,18 +50,140 @@
     { id: 'fade', label: 'Fade', desc: 'Плавный громкостной переход' },
   ];
 
+  const bandFreqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
   const bandLabels = ['32', '64', '125', '250', '500', '1k', '2k', '4k', '8k', '16k'];
 
   const builtInPresets: Record<string, number[]> = {
     Flat: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     'Bass Boost': [7.5, 6.5, 5.0, 2.5, 0.5, 0, 0.5, 1.5, 2.0, 2.0],
+    'Bass Destroyer': [12, 12, 10, 7, 3, 0, -2, -4, -4, -5],
+    'Treble Boost': [0, 0, 0, 0, 0, 0, 2, 4, 5, 6],
     Electronic: [5.5, 4.5, 2.0, 0, -1.5, 1.5, 3.0, 4.5, 5.5, 6.0],
     'Lo-Fi': [4.0, 3.5, 2.0, 1.0, 0.5, -1.0, -2.5, -4.0, -5.5, -6.5],
     Vocal: [-2.0, -1.5, -0.5, 2.0, 4.5, 5.5, 4.5, 2.5, 0.5, -1.0],
     Rock: [5.0, 3.5, 1.5, -1.0, -1.5, 0.5, 3.0, 4.5, 5.0, 4.5],
+    Classical: [0, 0, 0, 0, 0, 0, -2, -3, -3, -4],
+    Loudness: [5, 4, 1, 0, -1, 0, -1, 0, 3, 4],
+    'V-Shape': [5, 3, 1, -1, -3, -3, -1, 1, 3, 5],
     Gaming: [2.5, 3.0, 0.5, -2.0, -1.5, 1.0, 3.5, 4.5, 3.0, 1.5],
     'Late Night': [3.0, 2.0, 0.5, -1.0, -1.0, 0, 1.0, 1.5, 0.5, -1.0],
   };
+
+  let transferMode = $state<'import' | 'export' | null>(null);
+  let transferText = $state('');
+  let transferMsg = $state('');
+  let copiedApo = $state(false);
+  let draggingBand = $state<number | null>(null);
+  let curveSvgEl = $state<SVGSVGElement | undefined>(undefined);
+
+  function exportApoText(): string {
+    const preamp = (effects.preamp_db ?? 0).toFixed(1);
+    const lines = [`Preamp: ${preamp} dB`];
+    effects.bands.forEach((db, i) => {
+      lines.push(`Filter ${i + 1}: ON PK Fc ${bandFreqs[i]} Hz Gain ${db.toFixed(1)} dB Q 1.41`);
+    });
+    return lines.join('\n');
+  }
+
+  function openExport() {
+    if (transferMode === 'export') {
+      transferMode = null;
+      return;
+    }
+    transferText = exportApoText();
+    transferMsg = '';
+    transferMode = 'export';
+  }
+
+  function openImport() {
+    if (transferMode === 'import') {
+      transferMode = null;
+      return;
+    }
+    transferText = '';
+    transferMsg = '';
+    transferMode = 'import';
+  }
+
+  async function copyExport() {
+    try {
+      await navigator.clipboard.writeText(transferText);
+      copiedApo = true;
+      setTimeout(() => (copiedApo = false), 1500);
+    } catch {
+      // ignore
+    }
+  }
+
+  function applyImportedApo() {
+    const raw = transferText.trim();
+    if (!raw) return;
+    const nextBands = [...effects.bands];
+    let nextPreamp = effects.preamp_db ?? 0;
+    let matched = 0;
+
+    const preampMatch = raw.match(/Preamp:\s*(-?\d+(?:\.\d+)?)\s*dB/i);
+    if (preampMatch) {
+      nextPreamp = Math.max(-24, Math.min(6, Math.round(Number(preampMatch[1]) * 2) / 2));
+    }
+
+    // Equalizer APO Filter lines: Filter N: ON PK Fc 1000 Hz Gain 3.5 dB ...
+    const filterRe = /Fc\s+(\d+(?:\.\d+)?)\s*Hz.*?Gain\s+(-?\d+(?:\.\d+)?)\s*dB/gi;
+    let m: RegExpExecArray | null;
+    while ((m = filterRe.exec(raw)) !== null) {
+      const freq = Number(m[1]);
+      const gain = Math.max(-12, Math.min(12, Math.round(Number(m[2]) * 2) / 2));
+      let bestIdx = 0;
+      let bestDiff = Infinity;
+      bandFreqs.forEach((bf, idx) => {
+        const d = Math.abs(Math.log2(freq / bf));
+        if (d < bestDiff) {
+          bestDiff = d;
+          bestIdx = idx;
+        }
+      });
+      nextBands[bestIdx] = gain;
+      matched++;
+    }
+
+    // GraphicEQ fallback: GraphicEQ: 32 -2; 64 1.5; ...
+    if (matched === 0) {
+      const pairRe = /(\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/g;
+      while ((m = pairRe.exec(raw)) !== null) {
+        const freq = Number(m[1]);
+        const gain = Math.max(-12, Math.min(12, Math.round(Number(m[2]) * 2) / 2));
+        let bestIdx = 0;
+        let bestDiff = Infinity;
+        bandFreqs.forEach((bf, idx) => {
+          const d = Math.abs(Math.log2(freq / bf));
+          if (d < bestDiff) {
+            bestDiff = d;
+            bestIdx = idx;
+          }
+        });
+        nextBands[bestIdx] = gain;
+        matched++;
+      }
+    }
+
+    if (matched === 0 && !preampMatch) {
+      transferMsg = 'Не удалось распознать формат Equalizer APO или GraphicEQ.';
+      return;
+    }
+
+    update({ bands: nextBands, preamp_db: nextPreamp, preset: 'Custom', eq_enabled: true });
+    transferMode = null;
+    transferMsg = '';
+  }
+
+  function updateBandFromSvgPointer(e: PointerEvent, bandIdx: number) {
+    if (!curveSvgEl || !effects.eq_enabled) return;
+    const rect = curveSvgEl.getBoundingClientRect();
+    const relY = Math.max(12, Math.min(rect.height - 12, e.clientY - rect.top));
+    const norm = (relY - 12) / Math.max(1, rect.height - 24);
+    const db = Math.max(-12, Math.min(12, Math.round((12 - norm * 24) * 2) / 2));
+    setBand(bandIdx, db);
+  }
 
   let customPresets = $state<Record<string, number[]>>(
     (() => {
@@ -115,25 +239,30 @@
     update({ preset: name, bands: [...curve], eq_enabled: true });
   }
 
-  const svgPath = $derived.by(() => {
+  const svgPoints = $derived.by(() => {
     const w = 600;
     const h = 140;
     const step = w / 9;
-    const points = effects.bands.map((db, i) => {
+    return effects.bands.map((db, i) => {
       const x = i * step;
       const norm = (12 - db) / 24;
       const y = 12 + norm * (h - 24);
       return [x, y] as const;
     });
-    return points
+  });
+
+  const svgPath = $derived.by(() => {
+    return svgPoints
       .map(([x, y], i) => {
         if (i === 0) return `M ${x} ${y}`;
-        const [px, py] = points[i - 1];
+        const [px, py] = svgPoints[i - 1];
         const cx = (px + x) / 2;
         return `C ${cx} ${py}, ${cx} ${y}, ${x} ${y}`;
       })
       .join(' ');
   });
+
+  const svgAreaPath = $derived(`${svgPath} L 600 140 L 0 140 Z`);
 </script>
 
 <section class="eq-page">
@@ -149,6 +278,14 @@
     </div>
 
     <div class="top-actions">
+      <button type="button" class="reset-btn" class:active-apo={transferMode === 'import'} onclick={openImport}>
+        <Upload size={13} />
+        <span>Импорт APO</span>
+      </button>
+      <button type="button" class="reset-btn" class:active-apo={transferMode === 'export'} onclick={openExport}>
+        <Download size={13} />
+        <span>Экспорт APO</span>
+      </button>
       <button
         class="toggle-pill"
         class:active={effects.eq_enabled}
@@ -157,7 +294,7 @@
         <span>{effects.eq_enabled ? 'EQ Включён' : 'EQ Выключен'}</span>
       </button>
 
-      <button class="reset-btn" onclick={() => applyPreset('Flat')}>
+      <button class="reset-btn" onclick={() => update({ preset: 'Flat', bands: [...builtInPresets.Flat], preamp_db: 0, eq_enabled: true })}>
         <RotateCcw size={14} />
         <span>Сброс</span>
       </button>
@@ -224,115 +361,209 @@
     </form>
   </div>
 
-  <!-- 10-полосный эквалайзер -->
-  <div class="eq-board" class:disabled={!effects.eq_enabled}>
-    <svg class="curve-svg" viewBox="0 0 600 140" preserveAspectRatio="none">
-      <line x1="0" y1="70" x2="600" y2="70" stroke="rgba(255,255,255,0.08)" stroke-dasharray="4 4" />
-      <path d={svgPath} fill="none" stroke={accentColor} stroke-width="2.5" opacity="0.85" />
-    </svg>
+  <!-- Импорт / Экспорт Equalizer APO -->
+  {#if transferMode}
+    <div class="apo-card">
+      <div class="apo-head">
+        <span>{transferMode === 'export' ? 'Экспорт в формат Equalizer APO' : 'Импорт Equalizer APO / GraphicEQ'}</span>
+        {#if transferMode === 'export'}
+          <button type="button" class="reset-btn" onclick={copyExport}>
+            {#if copiedApo}<Check size={13} /><span>Скопировано</span>{:else}<Copy size={13} /><span>Копировать</span>{/if}
+          </button>
+        {:else}
+          <button type="button" class="save-preset-btn" onclick={applyImportedApo}>Применить</button>
+        {/if}
+      </div>
+      <textarea
+        class="apo-area"
+        rows="4"
+        readonly={transferMode === 'export'}
+        bind:value={transferText}
+        placeholder="Вставьте строки Equalizer APO (Preamp / Filter ...) или GraphicEQ..."
+      ></textarea>
+      {#if transferMsg}<div class="apo-err">{transferMsg}</div>{/if}
+    </div>
+  {/if}
 
-    <div class="sliders-grid">
-      {#each effects.bands as val, idx (idx)}
-        <div class="band-col">
-          <span class="db-val">{val > 0 ? `+${val.toFixed(1)}` : val.toFixed(1)}</span>
-          <div class="v-slider-wrap">
-            <input
-              type="range"
-              min="-12"
-              max="12"
-              step="0.5"
-              value={val}
-              disabled={!effects.eq_enabled}
-              oninput={(e) => setBand(idx, Number((e.target as HTMLInputElement).value))}
-            />
+  <!-- 10-полосный эквалайзер + Preamp + интерактивная кривая -->
+  <div class="eq-board-wrap" class:disabled={!effects.eq_enabled}>
+    <div class="preamp-col">
+      <span class="db-val">{(effects.preamp_db ?? 0) > 0 ? `+${(effects.preamp_db ?? 0).toFixed(1)}` : (effects.preamp_db ?? 0).toFixed(1)}</span>
+      <div class="v-slider-wrap">
+        <RadixSlider
+          value={effects.preamp_db ?? 0}
+          min={-24}
+          max={6}
+          step={0.5}
+          orientation="vertical"
+          disabled={!effects.eq_enabled}
+          ariaLabel="Preamp"
+          onValueChange={(v) => update({ preamp_db: v })}
+        />
+      </div>
+      <span class="freq-lbl">PRE</span>
+    </div>
+
+    <div class="eq-board">
+      <svg
+        bind:this={curveSvgEl}
+        class="curve-svg"
+        viewBox="0 0 600 140"
+        preserveAspectRatio="none"
+        role="presentation"
+        onpointermove={(e) => {
+          if (draggingBand !== null) updateBandFromSvgPointer(e, draggingBand);
+        }}
+        onpointerup={() => (draggingBand = null)}
+        onpointerleave={() => (draggingBand = null)}
+      >
+        <defs>
+          <linearGradient id="eqAreaGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color={accentColor} stop-opacity="0.24" />
+            <stop offset="100%" stop-color={accentColor} stop-opacity="0.0" />
+          </linearGradient>
+        </defs>
+        <line x1="0" y1="70" x2="600" y2="70" stroke="rgba(255,255,255,0.08)" stroke-dasharray="4 4" />
+        <path d={svgAreaPath} fill="url(#eqAreaGrad)" />
+        <path d={svgPath} fill="none" stroke={accentColor} stroke-width="2.5" opacity="0.9" />
+        {#each svgPoints as [cx, cy], idx (idx)}
+          <circle
+            cx={cx}
+            cy={cy}
+            r={draggingBand === idx ? 6 : 4.5}
+            fill="#fff"
+            stroke={accentColor}
+            stroke-width="2"
+            class="curve-dot"
+            role="slider"
+            tabindex="0"
+            aria-label={`Кривая ${bandLabels[idx]} Гц`}
+            aria-valuemin={-12}
+            aria-valuemax={12}
+            aria-valuenow={effects.bands[idx]}
+            onpointerdown={(e) => {
+              e.stopPropagation();
+              draggingBand = idx;
+              (e.currentTarget as Element).setPointerCapture(e.pointerId);
+              updateBandFromSvgPointer(e, idx);
+            }}
+          />
+        {/each}
+      </svg>
+
+      <div class="sliders-grid">
+        {#each effects.bands as val, idx (idx)}
+          <div class="band-col">
+            <span class="db-val">{val > 0 ? `+${val.toFixed(1)}` : val.toFixed(1)}</span>
+            <div class="v-slider-wrap">
+              <RadixSlider
+                value={val}
+                min={-12}
+                max={12}
+                step={0.5}
+                orientation="vertical"
+                disabled={!effects.eq_enabled}
+                ariaLabel={`Полоса ${bandLabels[idx]}`}
+                onValueChange={(v) => setBand(idx, v)}
+              />
+            </div>
+            <span class="freq-lbl">{bandLabels[idx]}</span>
           </div>
-          <span class="freq-lbl">{bandLabels[idx]}</span>
-        </div>
-      {/each}
+        {/each}
+      </div>
     </div>
   </div>
 
   <!-- Инструмент Mix (Auto-Mix / Ручной) -->
   <div class="mix-card">
     <div class="mix-head">
-      <div class="feat-title">
-        <Disc size={16} />
-        <span>Mix & Auto-Mix переходы</span>
-      </div>
-      <div class="mix-controls-top">
-        <div class="mix-mode-pills">
-          <button
-            type="button"
-            class:active={mix.mode === 'auto'}
-            onclick={() => onMixChange({ ...mix, enabled: true, mode: 'auto' })}
-          >
-            Auto
-          </button>
-          <button
-            type="button"
-            class:active={mix.mode === 'manual'}
-            onclick={() => onMixChange({ ...mix, enabled: true, mode: 'manual' })}
-          >
-            Ручной
-          </button>
+      <div class="mix-title-block">
+        <div class="feat-title">
+          <Disc size={16} />
+          <span>Mix & Auto-Mix переходы</span>
         </div>
-        <button
-          type="button"
-          class="switch-dot-btn"
-          class:on={mix.enabled}
-          onclick={() => onMixChange({ ...mix, enabled: !mix.enabled })}
-        >
-          {mix.enabled ? 'ВКЛ' : 'ВЫКЛ'}
-        </button>
+        <span class="mix-subtitle">Плавное сведение в конце трека (в «Моей волне» — простой кроссфейд без Auto-DJ)</span>
+      </div>
+      <div class="mix-switch-wrap">
+        <span class="mix-state-lbl">{mix.enabled ? 'Вкл' : 'Выкл'}</span>
+        <RadixSwitch
+          checked={mix.enabled}
+          ariaLabel="Включить Mix & Auto-Mix"
+          onCheckedChange={(v) => onMixChange({ ...mix, enabled: v })}
+        />
       </div>
     </div>
 
-    <div class="mix-presets-row">
-      {#each mixPresets as mp (mp.id)}
+    {#if mix.enabled}
+      <div class="mix-modes-grid">
         <button
           type="button"
-          class="mix-preset-btn"
-          class:active={mix.preset === mp.id}
-          onclick={() => onMixChange({ ...mix, enabled: true, preset: mp.id })}
+          class="mix-mode-card"
+          class:active={mix.mode === 'auto'}
+          onclick={() => onMixChange({ ...mix, mode: 'auto' })}
         >
-          <span class="mp-name">{mp.label}</span>
-          <span class="mp-desc">{mp.desc}</span>
+          <span class="mmc-title">Auto-DJ (Умный)</span>
+          <span class="mmc-desc">Сам выбирает эффект сведения, точку входа и подстраивает BPM</span>
         </button>
-      {/each}
-    </div>
+        <button
+          type="button"
+          class="mix-mode-card"
+          class:active={mix.mode === 'manual'}
+          onclick={() => onMixChange({ ...mix, mode: 'manual' })}
+        >
+          <span class="mmc-title">Ручной режим</span>
+          <span class="mmc-desc">Фиксированный эффект и точная длительность кроссфейда</span>
+        </button>
+      </div>
 
-    <div class="mix-bottom-row">
       {#if mix.mode === 'manual'}
+        <div class="mix-presets-row">
+          {#each mixPresets as mp (mp.id)}
+            <button
+              type="button"
+              class="mix-preset-btn"
+              class:active={mix.preset === mp.id}
+              onclick={() => onMixChange({ ...mix, preset: mp.id })}
+            >
+              <span class="mp-name">{mp.label}</span>
+              <span class="mp-desc">{mp.desc}</span>
+            </button>
+          {/each}
+        </div>
+
         <div class="mix-slider">
-          <span>Длительность: <b>{mix.durationSec} сек</b></span>
-          <input
-            type="range"
-            min="2"
-            max="12"
-            step="1"
+          <span>Длительность перехода: <b>{mix.durationSec} сек</b></span>
+          <RadixSlider
             value={mix.durationSec}
-            oninput={(e) =>
-              onMixChange({ ...mix, durationSec: Number((e.target as HTMLInputElement).value) })}
+            min={2}
+            max={12}
+            step={1}
+            ariaLabel="Длительность перехода"
+            onValueChange={(v) => onMixChange({ ...mix, durationSec: v })}
           />
         </div>
-      {:else}
-        <span class="mix-auto-note">
-          Auto-DJ сам выбирает эффект перехода (включая Beat + Vocal, Bass Swap, Rise) и точку входа.
-        </span>
       {/if}
 
-      <button
-        type="button"
-        class="preset-chip"
-        class:active={mix.eqSweep}
-        onclick={() => onMixChange({ ...mix, eqSweep: !mix.eqSweep })}
-      >
-        EQ-фильтр перехода: {mix.eqSweep ? 'Вкл' : 'Выкл'}
-      </button>
-    </div>
+      <div class="mix-setting-row">
+        <div class="mix-setting-info">
+          <span class="rg-lbl">EQ-фильтр при переходе</span>
+          <span class="mix-setting-hint">Плавно убирает низкие частоты у уходящего трека</span>
+        </div>
+        <RadixSwitch
+          checked={mix.eqSweep}
+          ariaLabel="EQ-фильтр при переходе"
+          onCheckedChange={(v) => onMixChange({ ...mix, eqSweep: v })}
+        />
+      </div>
+    {/if}
 
-    <div class="manual-skip-row">
-      <span class="rg-lbl">Переход при ручном скипе:</span>
+    <div class="mix-divider"></div>
+
+    <div class="mix-setting-row">
+      <div class="mix-setting-info">
+        <span class="rg-lbl">Эффект при ручном скипе</span>
+        <span class="mix-setting-hint">Когда нажимаете «Следующий трек» вручную</span>
+      </div>
       <div class="mix-mode-pills">
         {#each manualSkipOptions as opt (opt.id)}
           <button
@@ -346,8 +577,11 @@
       </div>
     </div>
 
-    <div class="manual-skip-row">
-      <span class="rg-lbl">Режим шафла:</span>
+    <div class="mix-setting-row">
+      <div class="mix-setting-info">
+        <span class="rg-lbl">Режим шафла (в плейлистах)</span>
+        <span class="mix-setting-hint">BPM Flow подбирает треки со схожим темпом</span>
+      </div>
       <div class="mix-mode-pills">
         <button
           type="button"
@@ -377,13 +611,13 @@
         </div>
         <span class="feat-val">{effects.bass_boost}%</span>
       </div>
-      <input
-        type="range"
-        min="0"
-        max="100"
-        step="5"
+      <RadixSlider
         value={effects.bass_boost}
-        oninput={(e) => update({ bass_boost: Number((e.target as HTMLInputElement).value) })}
+        min={0}
+        max={100}
+        step={5}
+        ariaLabel="Bass Boost"
+        onValueChange={(v) => update({ bass_boost: v })}
       />
       <p>Усиление суббаса (до 80 Гц) без искажения вокала.</p>
     </div>
@@ -400,7 +634,7 @@
         </div>
         <span class="switch-dot">{effects.normalize_volume ? 'ВКЛ' : 'ВЫКЛ'}</span>
       </div>
-      <p>Выравнивает громкость между Яндекс Музыкой, Spotify и SoundCloud.</p>
+      <p>Выравнивает громкость между Яндекс Музыкой и SoundCloud.</p>
     </button>
 
     <button
@@ -618,18 +852,87 @@
     transition: opacity 0.2s ease;
   }
 
-  .eq-board.disabled {
-    opacity: 0.45;
+  .curve-svg {
+    position: relative;
+    width: 100%;
+    height: 112px;
+    margin-bottom: 10px;
+    cursor: crosshair;
   }
 
-  .curve-svg {
-    position: absolute;
-    left: 24px;
-    right: 24px;
-    top: 38px;
-    width: calc(100% - 48px);
-    height: 140px;
+  .curve-dot {
+    cursor: grab;
+    transition: r 100ms ease;
+  }
+
+  .curve-dot:active {
+    cursor: grabbing;
+  }
+
+  .eq-board-wrap {
+    display: grid;
+    grid-template-columns: 56px 1fr;
+    gap: 12px;
+    align-items: stretch;
+  }
+
+  .eq-board-wrap.disabled {
+    opacity: 0.45;
     pointer-events: none;
+  }
+
+  .preamp-col {
+    padding: 18px 8px;
+    border-radius: 14px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .apo-card {
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .apo-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .apo-area {
+    width: 100%;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    background: rgba(10, 10, 14, 0.7);
+    color: var(--text-primary);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px;
+    resize: vertical;
+    outline: none;
+  }
+
+  .apo-err {
+    font-size: 11.5px;
+    color: #f87171;
+  }
+
+  .reset-btn.active-apo {
+    border-color: var(--accent);
+    color: var(--text-primary);
   }
 
   .sliders-grid {
@@ -660,15 +963,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    overflow: hidden;
-  }
-
-  .v-slider-wrap input[type='range'] {
-    position: absolute;
-    width: 124px;
-    height: 24px;
-    transform: rotate(-90deg);
-    cursor: pointer;
   }
 
   .mix-card {
@@ -689,10 +983,91 @@
     flex-wrap: wrap;
   }
 
-  .mix-controls-top {
+  .mix-title-block {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .mix-subtitle {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .mix-switch-wrap {
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  .mix-state-lbl {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .mix-modes-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .mix-mode-card {
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.02);
+    text-align: left;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    transition: border-color 140ms ease, background 140ms ease;
+  }
+
+  .mix-mode-card:hover {
+    background: rgba(255, 255, 255, 0.04);
+  }
+
+  .mix-mode-card.active {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 14%, var(--bg-elevated));
+  }
+
+  .mmc-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .mmc-desc {
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .mix-divider {
+    height: 1px;
+    background: var(--border-subtle);
+    margin: 2px 0;
+  }
+
+  .mix-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .mix-setting-info {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .mix-setting-hint {
+    font-size: 11px;
+    color: var(--text-muted);
   }
 
   .mix-mode-pills {
@@ -702,6 +1077,7 @@
     border-radius: 999px;
     background: var(--bg-graphite);
     border: 1px solid var(--border-subtle);
+    flex-wrap: wrap;
   }
 
   .mix-mode-pills button {
@@ -718,23 +1094,6 @@
   .mix-mode-pills button.active {
     background: var(--bg-elevated);
     color: var(--text-primary);
-  }
-
-  .switch-dot-btn {
-    font-size: 10px;
-    font-weight: 700;
-    padding: 4px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--border-subtle);
-    background: rgba(255, 255, 255, 0.06);
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
-
-  .switch-dot-btn.on {
-    background: var(--accent);
-    color: #09090d;
-    border-color: transparent;
   }
 
   .mix-presets-row {
@@ -771,34 +1130,11 @@
     color: var(--text-secondary);
   }
 
-  .mix-bottom-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    flex-wrap: wrap;
-  }
-
-  .manual-skip-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    flex-wrap: wrap;
-    padding-top: 8px;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-  }
-
   .mix-slider {
     display: flex;
     align-items: center;
     gap: 10px;
     font-size: 12px;
-    color: var(--text-secondary);
-  }
-
-  .mix-auto-note {
-    font-size: 11px;
     color: var(--text-secondary);
   }
 

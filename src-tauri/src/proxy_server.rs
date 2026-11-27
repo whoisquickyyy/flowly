@@ -18,6 +18,7 @@ pub fn bind_proxy_listener() -> std::io::Result<(std::net::TcpListener, u16)> {
 pub async fn run_proxy_server(
     std_listener: std::net::TcpListener,
     registry: Arc<RwLock<ProviderRegistry>>,
+    cache: crate::track_cache::TrackCache,
 ) {
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
@@ -39,6 +40,7 @@ pub async fn run_proxy_server(
         };
         let reg = Arc::clone(&registry);
         let fb = fallback_client.clone();
+        let cache = cache.clone();
 
         tokio::spawn(async move {
             let (reader, mut writer) = socket.split();
@@ -121,11 +123,15 @@ pub async fn run_proxy_server(
                 return;
             };
 
+            if let Some((cached_path, _mime)) = cache.get_cached(&url) {
+                serve_local_file(&cached_path.to_string_lossy(), range_header.as_deref(), &mut writer).await;
+                return;
+            }
+
             let client = {
                 let r = reg.read().await;
                 match source_str.as_deref() {
                     Some("yandex") => r.yandex.client().clone(),
-                    Some("spotify") => r.spotify.client().clone(),
                     Some("soundcloud") => r.soundcloud.client().clone(),
                     _ => fb,
                 }
@@ -157,7 +163,9 @@ pub async fn run_proxy_server(
             headers.push_str("Accept-Ranges: bytes\r\n");
             headers.push_str("Connection: close\r\n");
 
+            let mut content_type = String::from("audio/mpeg");
             if let Some(ct) = upstream.headers().get("content-type").and_then(|v| v.to_str().ok()) {
+                content_type = ct.to_string();
                 headers.push_str(&format!("Content-Type: {}\r\n", ct));
             }
             if let Some(cl) = upstream.headers().get("content-length").and_then(|v| v.to_str().ok()) {
@@ -172,10 +180,26 @@ pub async fn run_proxy_server(
                 return;
             }
 
+            let should_cache = status.as_u16() == 200 && range_header.is_none() && cache.is_enabled();
+            let mut cache_buf: Vec<u8> = if should_cache { Vec::new() } else { Vec::new() };
+            let mut cache_ok = should_cache;
+
             while let Ok(Some(chunk)) = upstream.chunk().await {
+                if cache_ok {
+                    if cache_buf.len() + chunk.len() <= 40 * 1024 * 1024 {
+                        cache_buf.extend_from_slice(&chunk);
+                    } else {
+                        cache_ok = false;
+                        cache_buf.clear();
+                    }
+                }
                 if writer.write_all(&chunk).await.is_err() {
+                    cache_ok = false;
                     break;
                 }
+            }
+            if cache_ok && !cache_buf.is_empty() {
+                cache.store_bytes(&url, &content_type, &cache_buf).await;
             }
         });
     }

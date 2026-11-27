@@ -103,11 +103,7 @@ async fn fetch_spicy_lyrics(
     track: &Track,
     primary_artist: &str,
 ) -> Option<LyricsResponse> {
-    let mut target_id = if track.source == SourceKind::Spotify && !track.id.starts_with("sp:demo") {
-        Some(track.id.trim_start_matches("sp:").to_string())
-    } else {
-        None
-    };
+    let mut target_id: Option<String> = None;
 
     if target_id.is_none() {
         let search_resp = client
@@ -179,9 +175,11 @@ pub async fn fetch_lyrics(
     spicy_key: Option<&str>,
     track: &Track,
 ) -> LyricsResponse {
+    let doh = crate::network::proxy::shared_doh();
     let lrc_client = Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(2500))
-        .timeout(std::time::Duration::from_secs(4))
+        .connect_timeout(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(6))
+        .dns_resolver(doh.clone())
         .user_agent("FlowlyMusicPlayer/0.1.0 (https://github.com/flowly)")
         .build()
         .unwrap_or_else(|_| Client::new());
@@ -197,7 +195,9 @@ pub async fn fetch_lyrics(
     // 0. Spicy Lyrics API (с коротким таймаутом 3.5с, чтобы не вешать загрузку текста)
     if let Some(key) = spicy_key.map(str::trim).filter(|k| !k.is_empty()) {
         let spicy_client = Client::builder()
-            .timeout(std::time::Duration::from_millis(3500))
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .timeout(std::time::Duration::from_secs(5))
+            .dns_resolver(doh)
             .user_agent("FlowlyMusicPlayer/0.1.0")
             .build()
             .unwrap_or_else(|_| lrc_client.clone());

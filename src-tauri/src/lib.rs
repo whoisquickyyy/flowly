@@ -4,6 +4,7 @@ mod commands;
 mod discord_rpc;
 mod local_library;
 mod lyrics;
+mod media_controls;
 mod models;
 mod network;
 mod player;
@@ -12,6 +13,7 @@ mod proxy_server;
 mod radio_host;
 mod recap;
 mod samples;
+mod track_cache;
 
 use std::sync::Arc;
 use player::AppState;
@@ -35,22 +37,9 @@ pub fn run() {
                 .expect("failed to bind local audio proxy");
             let state = AppState::new(data_dir, proxy_port);
             let registry = Arc::clone(&state.registry);
-            tauri::async_runtime::spawn(proxy_server::run_proxy_server(listener, Arc::clone(&registry)));
-
-            // Автообновление токена Spotify при запуске (если есть refresh_token)
-            let sp_refresh_info = {
-                let v = state.vault.blocking_read();
-                match (&v.data.spotify_client_id, &v.data.spotify_refresh_token) {
-                    (Some(cid), Some(rt)) => Some((cid.clone(), rt.clone())),
-                    _ => None,
-                }
-            };
-            if let Some((cid, rt)) = sp_refresh_info {
-                tauri::async_runtime::spawn(async move {
-                    let mut reg = registry.write().await;
-                    let _ = reg.spotify.refresh_access_token(&cid, &rt).await;
-                });
-            }
+            let track_cache = state.track_cache.clone();
+            tauri::async_runtime::spawn(proxy_server::run_proxy_server(listener, Arc::clone(&registry), track_cache));
+            app.manage(media_controls::SmtcHandle::spawn(app.handle()));
 
             app.manage(state);
 
@@ -135,7 +124,6 @@ pub fn run() {
             commands::test_source_connection,
             commands::connect_yandex,
             commands::connect_soundcloud,
-            commands::start_spotify_oauth,
             commands::disconnect_source,
             commands::get_all_playlists,
             commands::create_local_playlist,
@@ -148,6 +136,7 @@ pub fn run() {
             commands::test_doh_server,
             commands::get_track_lyrics,
             commands::get_artist_yandex_info,
+            commands::get_artist_preview_track,
             commands::get_yandex_album_tracks,
             commands::record_listen,
             commands::get_listening_recap,
@@ -162,6 +151,9 @@ pub fn run() {
             commands::pick_and_add_local_folder,
             commands::remove_local_folder,
             commands::scan_local_tracks,
+            commands::update_smtc_state,
+            commands::set_track_cache_enabled,
+            commands::report_wave_feedback,
             commands::open_external_url,
         ])
         .run(tauri::generate_context!())

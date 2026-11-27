@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { Crop, LogIn, LogOut, Save, Upload, User, UserPlus, X } from 'lucide-svelte';
+  import { CloudUpload, Crop, LogIn, LogOut, Save, Upload, User, UserPlus, X } from 'lucide-svelte';
+  import RadixDialog from './ui/RadixDialog.svelte';
+  import RadixSlider from './ui/RadixSlider.svelte';
   import * as sb from '../supabase';
   import type { FlowlyProfile, SupabaseSession } from '../supabase';
 
@@ -10,9 +12,10 @@
     onClose: () => void;
     onAuthChange: (session: SupabaseSession | null, profile: FlowlyProfile | null) => void;
     onSyncCloudSettings?: () => Promise<void>;
+    embedded?: boolean;
   }
 
-  let { open, session, profile, onClose, onAuthChange, onSyncCloudSettings }: Props = $props();
+  let { open, session, profile, onClose, onAuthChange, onSyncCloudSettings, embedded = false }: Props = $props();
 
   let mode = $state<'login' | 'register'>('login');
   let email = $state('');
@@ -160,29 +163,23 @@
   function handleLogout() {
     sb.signOut();
     onAuthChange(null, null);
-    onClose();
+    if (!embedded) onClose();
   }
 
   const roleBadge = $derived(sb.ROLE_BADGES[profile?.role ?? 'listener'] ?? null);
 </script>
 
-{#if open}
-  <div
-    class="modal-backdrop"
-    role="presentation"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) onClose();
-    }}
-  >
-    <div class="modal-card">
+{#snippet accountBody()}
       <div class="modal-head">
         <div class="m-title">
           <User size={17} />
           <span>{profile ? 'Профиль Flowly' : 'Аккаунт Flowly'}</span>
         </div>
-        <button type="button" class="close-btn" onclick={onClose} aria-label="Закрыть">
-          <X size={16} />
-        </button>
+        {#if !embedded}
+          <button type="button" class="close-btn" onclick={onClose} aria-label="Закрыть">
+            <X size={16} />
+          </button>
+        {/if}
       </div>
 
       {#if !sb.isSupabaseConfigured()}
@@ -211,10 +208,17 @@
               style={`transform: translate(${cropX}px, ${cropY}px) scale(${cropZoom})`}
             />
           </div>
-          <label class="zoom-row">
+          <div class="zoom-row">
             <span>Масштаб</span>
-            <input type="range" min="1" max="3.5" step="0.05" bind:value={cropZoom} />
-          </label>
+            <RadixSlider
+              value={cropZoom}
+              min={1}
+              max={3.5}
+              step={0.05}
+              ariaLabel="Масштаб фото"
+              onValueChange={(v) => (cropZoom = v)}
+            />
+          </div>
           <div class="modal-actions">
             <button type="button" class="btn-primary" onclick={applyCrop}>Применить кадр</button>
             <button type="button" class="btn-danger" onclick={() => (cropSrc = null)}>Отмена</button>
@@ -278,7 +282,8 @@
           {#if onSyncCloudSettings}
             <button
               type="button"
-              class="btn-sm"
+              class="btn-cloud"
+              title="Сохранить настройки в облако аккаунта"
               disabled={busy}
               onclick={async () => {
                 busy = true;
@@ -294,7 +299,8 @@
                 }
               }}
             >
-              <span>Сохранить настройки в облако</span>
+              <CloudUpload size={14} />
+              <span>В облако</span>
             </button>
           {/if}
           <button type="button" class="btn-danger" onclick={handleLogout}>
@@ -351,33 +357,27 @@
           <span>Быстрый вход без email (для Jam-комнат)</span>
         </button>
       {/if}
-    </div>
+{/snippet}
+
+{#if embedded}
+  <div class="account-embedded">
+    {@render accountBody()}
   </div>
+{:else}
+  <RadixDialog {open} onOpenChange={(v) => { if (!v) onClose(); }} maxWidth="440px">
+    {@render accountBody()}
+  </RadixDialog>
 {/if}
 
 <style>
-  .modal-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 200;
-    background: rgba(5, 5, 9, 0.72);
-    backdrop-filter: blur(10px);
-    display: grid;
-    place-items: center;
-    padding: 20px;
-  }
-
-  .modal-card {
-    width: 100%;
-    max-width: 420px;
-    padding: 20px;
-    border-radius: 18px;
-    background: rgba(18, 18, 24, 0.96);
-    border: 1px solid var(--border-subtle);
-    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+  .account-embedded {
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 12px;
+    padding: 16px 18px;
+    border-radius: 14px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
   }
 
   .modal-head {
@@ -528,9 +528,8 @@
     color: var(--text-secondary);
   }
 
-  .zoom-row input {
+  .zoom-row :global(.rx-slider-root) {
     flex: 1;
-    accent-color: var(--accent);
   }
 
   .profile-preview {
@@ -599,6 +598,33 @@
     width: 100%;
     display: flex;
     gap: 8px;
+    align-items: center;
+  }
+
+  .btn-cloud {
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 140ms ease, border-color 140ms ease;
+  }
+
+  .btn-cloud:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.11);
+    border-color: rgba(255, 255, 255, 0.24);
+  }
+
+  .btn-cloud:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .btn-primary {

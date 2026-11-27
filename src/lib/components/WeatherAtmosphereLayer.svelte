@@ -65,8 +65,14 @@
 
     let lightningAlpha = 0;
     let nextLightningAt = performance.now() + 3000 + Math.random() * 6000;
+    let lastRender = 0;
 
     const render = (now: number) => {
+      if (document.hidden || now - lastRender < 33) {
+        rafId = requestAnimationFrame(render);
+        return;
+      }
+      lastRender = now;
       const w = canvas.width;
       const h = canvas.height;
       ctx.clearRect(0, 0, w, h);

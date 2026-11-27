@@ -1,28 +1,68 @@
 <script lang="ts">
-  import { Search, Play, ExternalLink, Sparkles } from 'lucide-svelte';
+  import { Search, Play, ExternalLink, Sparkles, LayoutGrid, List, Heart } from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
   import * as api from '../api';
   import { fuzzySearchTracks, hasCyrillic, transliterateRuToEn } from '../fuzzySearch';
-  import type { GroupedSearchResult, SourceKind, Track } from '../types';
+  import type { AuthStatus, GroupedSearchResult, SourceKind, Track } from '../types';
 
   interface Props {
     initialQuery?: string;
     enabledSources?: SourceKind[];
+    authStatuses?: AuthStatus[];
+    likedIds?: Set<string>;
     localLibrary?: Track[];
     onPlayTrack: (track: Track, queue: Track[]) => void;
+    onToggleLike?: (track: Track) => void;
+    onOpenArtist?: (artist: string) => void;
+    onOpenAuth?: () => void;
   }
 
   let {
     initialQuery = '',
-    enabledSources = ['yandex', 'spotify', 'soundcloud'],
+    enabledSources = ['yandex', 'soundcloud'],
+    authStatuses = [],
+    likedIds = new Set(),
     localLibrary = [],
     onPlayTrack,
+    onToggleLike,
+    onOpenArtist,
+    onOpenAuth,
   }: Props = $props();
 
   let query = $state('');
   let sourceFilter = $state<SourceKind | null>(null);
+  let viewMode = $state<'grid' | 'list'>('grid');
   let groups = $state<GroupedSearchResult[]>([]);
   let loading = $state(false);
+
+  const mergedTracks = $derived.by(() => {
+    const out: Track[] = [];
+    const seen = new Set<string>();
+    const activeGroups = sourceFilter ? groups.filter((g) => g.source === sourceFilter) : groups;
+    const maxLen = activeGroups.reduce((m, g) => Math.max(m, g.tracks.length), 0);
+    for (let i = 0; i < maxLen; i++) {
+      for (const g of activeGroups) {
+        const t = g.tracks[i];
+        if (t && !seen.has(t.id)) {
+          seen.add(t.id);
+          out.push(t);
+        }
+      }
+    }
+    return out;
+  });
+
+  const foundArtists = $derived.by(() => {
+    const map = new Map<string, { name: string; artwork: string }>();
+    for (const t of [...mergedTracks, ...localFuzzyMatches]) {
+      const name = t.artist.split(/[,&]/)[0]?.trim() || t.artist;
+      if (name && !map.has(name)) {
+        map.set(name, { name, artwork: t.artwork });
+        if (map.size >= 12) break;
+      }
+    }
+    return Array.from(map.values());
+  });
 
   const localFuzzyMatches = $derived.by(() => {
     if (!query.trim() || localLibrary.length === 0) return [];
@@ -107,23 +147,54 @@
     <input
       type="text"
       bind:value={query}
-      placeholder="Поиск по Yandex Music, Spotify и SoundCloud..."
+      placeholder="Поиск по Яндекс Музыке и SoundCloud..."
     />
     <button type="submit" class="search-btn">Найти</button>
   </form>
 
-  {#if enabledSources.length > 1}
-    <div class="filters">
-      <button class:active={sourceFilter === null} onclick={() => { sourceFilter = null; runSearch(); }}>Все</button>
-      {#if enabledSources.includes('yandex')}
-        <button class:active={sourceFilter === 'yandex'} onclick={() => { sourceFilter = 'yandex'; runSearch(); }}>Яндекс Музыка</button>
-      {/if}
-      {#if enabledSources.includes('spotify')}
-        <button class:active={sourceFilter === 'spotify'} onclick={() => { sourceFilter = 'spotify'; runSearch(); }}>Spotify</button>
-      {/if}
-      {#if enabledSources.includes('soundcloud')}
-        <button class:active={sourceFilter === 'soundcloud'} onclick={() => { sourceFilter = 'soundcloud'; runSearch(); }}>SoundCloud</button>
-      {/if}
+  <div class="search-toolbar">
+    {#if enabledSources.length > 1}
+      <div class="filters">
+        <button class:active={sourceFilter === null} onclick={() => { sourceFilter = null; runSearch(); }}>Все</button>
+        {#if enabledSources.includes('yandex')}
+          <button class:active={sourceFilter === 'yandex'} onclick={() => { sourceFilter = 'yandex'; runSearch(); }}>Яндекс Музыка</button>
+        {/if}
+        {#if enabledSources.includes('soundcloud')}
+          <button class:active={sourceFilter === 'soundcloud'} onclick={() => { sourceFilter = 'soundcloud'; runSearch(); }}>SoundCloud</button>
+        {/if}
+      </div>
+    {/if}
+
+    <div class="view-toggle">
+      <button
+        type="button"
+        class:active={viewMode === 'grid'}
+        onclick={() => (viewMode = 'grid')}
+        title="Мозаика обложек"
+        aria-label="Сетка"
+      >
+        <LayoutGrid size={14} />
+      </button>
+      <button
+        type="button"
+        class:active={viewMode === 'list'}
+        onclick={() => (viewMode = 'list')}
+        title="Список по сервисам"
+        aria-label="Список"
+      >
+        <List size={14} />
+      </button>
+    </div>
+  </div>
+
+  {#if foundArtists.length > 0 && !loading}
+    <div class="artists-strip">
+      {#each foundArtists as art (art.name)}
+        <button type="button" class="artist-pill" onclick={() => onOpenArtist?.(art.name)}>
+          <img src={art.artwork} alt={art.name} />
+          <span>{art.name}</span>
+        </button>
+      {/each}
     </div>
   {/if}
 
@@ -153,20 +224,106 @@
   {/if}
 
   {#if loading}
-    <div class="hint">Поиск по сервисам...</div>
+    {#if viewMode === 'grid'}
+      <div class="search-bento-grid">
+        {#each Array(9) as _, i (i)}
+          <div class="s-skel-tile" class:featured={i === 0}></div>
+        {/each}
+      </div>
+    {:else}
+      <div class="groups-list">
+        {#each Array(6) as _, i (i)}
+          <div class="s-skel-row"></div>
+        {/each}
+      </div>
+    {/if}
+  {:else if viewMode === 'grid'}
+    {#each groups as group (group.source)}
+      {@const isConnected = authStatuses.find((a) => a.source === group.source)?.connected ?? false}
+      {#if (!isConnected && authStatuses.length > 0) || group.error === 'Вы не авторизованы'}
+        <div class="unauth-card">
+          <div class="unauth-text">
+            <strong>Вы не авторизованы ({group.sourceName})</strong>
+            <span>Войдите в {group.sourceName}, чтобы искать и слушать треки из этого сервиса.</span>
+          </div>
+          {#if onOpenAuth}
+            <button type="button" class="unauth-btn" onclick={onOpenAuth}>Войти</button>
+          {/if}
+        </div>
+      {/if}
+    {/each}
+
+    {#if mergedTracks.length > 0}
+      <div class="search-bento-grid">
+        {#each mergedTracks as track, idx (track.id)}
+          {@const isLiked = likedIds.has(track.id)}
+          <div
+            class="s-bento-tile"
+            class:featured={idx === 0 && mergedTracks.length > 3}
+            role="button"
+            tabindex="0"
+            onclick={() => onPlayTrack(track, mergedTracks)}
+            onkeydown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onPlayTrack(track, mergedTracks);
+              }
+            }}
+          >
+            <img src={track.artwork} alt={track.title} loading="lazy" />
+            <div class="s-bento-grad"></div>
+            <div class="s-bento-top">
+              <SourceBadge source={track.source} showLabel={false} />
+              {#if onToggleLike}
+                <button
+                  type="button"
+                  class="s-bento-like"
+                  class:liked={isLiked}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    onToggleLike(track);
+                  }}
+                  aria-label="Нравится"
+                >
+                  <Heart size={13} fill={isLiked ? 'currentColor' : 'none'} />
+                </button>
+              {/if}
+            </div>
+            <div class="s-bento-play"><Play size={17} fill="currentColor" /></div>
+            <div class="s-bento-meta">
+              <div class="s-bento-title">{track.title}</div>
+              <div class="s-bento-sub">{track.artist}</div>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {:else if query.trim()}
+      <div class="hint">Ничего не найдено по запросу «{query}».</div>
+    {/if}
   {:else}
     <div class="groups-list">
       {#each groups as group (group.source)}
+        {@const isConnected = authStatuses.find((a) => a.source === group.source)?.connected ?? false}
         <div class="source-group">
           <div class="group-head">
             <SourceBadge source={group.source} />
             <span class="group-count">{group.tracks.length}</span>
-            {#if group.error}
+            {#if group.error && group.error !== 'Вы не авторизованы'}
               <span class="group-note">{group.error}</span>
             {/if}
           </div>
 
-          {#if group.tracks.length > 0}
+          {#if (!isConnected && authStatuses.length > 0) || group.error === 'Вы не авторизованы'}
+            <div class="unauth-card">
+              <div class="unauth-text">
+                <strong>Вы не авторизованы</strong>
+                <span>Войдите в {group.sourceName}, чтобы искать и слушать треки из этого сервиса.</span>
+              </div>
+              {#if onOpenAuth}
+                <button type="button" class="unauth-btn" onclick={onOpenAuth}>Войти</button>
+              {/if}
+            </div>
+          {:else if group.tracks.length > 0}
             <div class="group-tracks">
               {#each group.tracks as track (track.id)}
                 <div class="s-row">
@@ -291,6 +448,46 @@
     color: var(--text-muted);
   }
 
+  .unauth-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--accent, #6366f1) 10%, var(--bg-elevated));
+    border: 1px solid color-mix(in srgb, var(--accent, #6366f1) 28%, transparent);
+  }
+
+  .unauth-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .unauth-text strong {
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .unauth-btn {
+    flex-shrink: 0;
+    padding: 6px 14px;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: var(--accent, #6366f1);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .unauth-btn:hover {
+    filter: brightness(1.08);
+  }
+
   .group-tracks {
     display: flex;
     flex-direction: column;
@@ -402,5 +599,220 @@
     font-size: 12px;
     font-weight: 700;
     color: var(--accent);
+  }
+
+  .search-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .view-toggle {
+    margin-left: auto;
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 10px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    gap: 2px;
+  }
+
+  .view-toggle button {
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 5px 8px;
+    border-radius: 7px;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+
+  .view-toggle button.active {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+  }
+
+  .artists-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .artist-pill {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px 4px 4px;
+    border-radius: 999px;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 140ms ease, border-color 140ms ease;
+  }
+
+  .artist-pill:hover {
+    background: var(--bg-elevated);
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  .artist-pill img {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    object-fit: cover;
+  }
+
+  .search-bento-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
+    grid-auto-rows: 156px;
+    grid-auto-flow: dense;
+    gap: 12px;
+  }
+
+  .s-bento-tile {
+    position: relative;
+    border-radius: 14px;
+    overflow: hidden;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    cursor: pointer;
+    transition: transform 140ms ease, border-color 140ms ease;
+  }
+
+  .s-bento-tile.featured {
+    grid-column: span 2;
+    grid-row: span 2;
+  }
+
+  .s-bento-tile:hover {
+    transform: translateY(-2px);
+    border-color: rgba(255, 255, 255, 0.22);
+  }
+
+  .s-bento-tile img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .s-bento-grad {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.1) 0%, rgba(0, 0, 0, 0.14) 45%, rgba(8, 8, 12, 0.88) 100%);
+  }
+
+  .s-bento-top {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .s-bento-like {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(12, 12, 16, 0.72);
+    color: rgba(255, 255, 255, 0.78);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+
+  .s-bento-like.liked {
+    color: var(--accent);
+  }
+
+  .s-bento-play {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%) scale(0.9);
+    width: 42px;
+    height: 42px;
+    border-radius: 50%;
+    background: var(--accent);
+    color: #fff;
+    display: grid;
+    place-items: center;
+    opacity: 0;
+    transition: opacity 140ms ease, transform 140ms ease;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+
+  .s-bento-tile:hover .s-bento-play {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  .s-bento-meta {
+    position: absolute;
+    left: 10px;
+    right: 10px;
+    bottom: 9px;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .s-bento-title {
+    font-size: 12.5px;
+    font-weight: 700;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .s-bento-tile.featured .s-bento-title {
+    font-size: 16px;
+  }
+
+  .s-bento-sub {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.74);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .s-skel-tile {
+    border-radius: 14px;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.04) 25%, rgba(255, 255, 255, 0.08) 50%, rgba(255, 255, 255, 0.04) 75%);
+    background-size: 200% 100%;
+    animation: sSkel 1.4s infinite linear;
+  }
+
+  .s-skel-tile.featured {
+    grid-column: span 2;
+    grid-row: span 2;
+  }
+
+  .s-skel-row {
+    height: 46px;
+    border-radius: 10px;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.03) 25%, rgba(255, 255, 255, 0.07) 50%, rgba(255, 255, 255, 0.03) 75%);
+    background-size: 200% 100%;
+    animation: sSkel 1.4s infinite linear;
+  }
+
+  @keyframes sSkel {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
   }
 </style>

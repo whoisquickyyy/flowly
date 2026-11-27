@@ -1,10 +1,18 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { CheckCircle2, XCircle, RefreshCw, KeyRound, LogOut, ExternalLink, Shield, Globe, Sparkles, Mic, Download, Cpu } from 'lucide-svelte';
+  import { CheckCircle2, XCircle, RefreshCw, KeyRound, LogOut, ExternalLink, Shield, Globe, Sparkles, Mic, Download, Cpu, Search, Palette, Layers, Headphones, Info, User } from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
+  import FlowlyLogo from './FlowlyLogo.svelte';
+  import AccountModal from './AccountModal.svelte';
+  import RadixSelect from './ui/RadixSelect.svelte';
+  import RadixSwitch from './ui/RadixSwitch.svelte';
+  import RadixSlider from './ui/RadixSlider.svelte';
   import * as api from '../api';
+  import { audioEngine } from '../audioEngine';
+  import type { FlowlyProfile, SupabaseSession } from '../supabase';
   import type {
     ActivityConfig,
+    MixConfig,
     NetworkLyricsSettings,
     Playlist,
     ProxyConfig,
@@ -14,12 +22,15 @@
     SourceStatus,
   } from '../types';
 
+  type SettingsTabId = 'services' | 'appearance' | 'sound' | 'network' | 'integrations' | 'account' | 'general' | 'about';
+
   interface Props {
     sources: SourceStatus[];
     enabledSources?: SourceKind[];
     onEnabledSourcesChange?: (next: SourceKind[]) => void;
     onSourcesChanged: (next: SourceStatus[]) => void;
     onOpenGuide?: () => void;
+    onOpenWhatsNew?: () => void;
     atmosphereSummary?: string;
     onDynamicThemeChange?: (enabled: boolean, city: string) => void;
     activityConfig?: ActivityConfig;
@@ -35,14 +46,22 @@
     onTestRadio?: () => void;
     ramSaverEnabled?: boolean;
     onRamSaverChange?: (next: boolean) => void;
+    initialTab?: SettingsTabId;
+    mix?: MixConfig;
+    onMixChange?: (next: MixConfig) => void;
+    sbSession?: SupabaseSession | null;
+    sbProfile?: FlowlyProfile | null;
+    onAuthChange?: (session: SupabaseSession | null, profile: FlowlyProfile | null) => void;
+    onSyncCloudSettings?: () => Promise<void>;
   }
 
   let {
     sources,
-    enabledSources = ['yandex', 'spotify', 'soundcloud'],
+    enabledSources = ['yandex', 'soundcloud'],
     onEnabledSourcesChange = () => {},
     onSourcesChanged,
     onOpenGuide = () => {},
+    onOpenWhatsNew = () => {},
     atmosphereSummary = '',
     onDynamicThemeChange = () => {},
     activityConfig = {
@@ -68,10 +87,72 @@
     onTestRadio = () => {},
     ramSaverEnabled = false,
     onRamSaverChange = () => {},
+    initialTab = 'services',
+    mix = { enabled: true, mode: 'auto', preset: 'fade', durationSec: 6, eqSweep: true },
+    onMixChange = () => {},
+    sbSession = null,
+    sbProfile = null,
+    onAuthChange = () => {},
+    onSyncCloudSettings,
   }: Props = $props();
 
   let installingPiper = $state(false);
   let piperInstallMsg = $state('');
+
+  let audioOutputs = $state<{ value: string; label: string }[]>([
+    { value: 'default', label: 'По умолчанию (системное)' },
+  ]);
+  let selectedOutputId = $state(
+    typeof localStorage !== 'undefined' ? localStorage.getItem('flowly_audio_output_id') || 'default' : 'default'
+  );
+  let outputFeedback = $state('');
+
+  async function refreshAudioOutputs() {
+    try {
+      if (!navigator?.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const outs = devices.filter((d) => d.kind === 'audiooutput');
+      const opts: { value: string; label: string }[] = [
+        { value: 'default', label: 'По умолчанию (системное)' },
+      ];
+      let unnamedIdx = 1;
+      for (const d of outs) {
+        if (!d.deviceId || d.deviceId === 'default') continue;
+        const label =
+          d.label?.trim() ||
+          (d.deviceId === 'communications' ? 'Устройство связи (системное)' : `Устройство вывода ${unnamedIdx++}`);
+        opts.push({ value: d.deviceId, label });
+      }
+      audioOutputs = opts;
+    } catch {
+      // ignore
+    }
+  }
+
+  async function handleSelectAudioOutput(id: string) {
+    selectedOutputId = id;
+    outputFeedback = '';
+    try {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('flowly_audio_output_id', id);
+      }
+      const ok = await audioEngine.setOutputDevice(id);
+      if (!ok) {
+        outputFeedback = 'Выбор устройства вывода не поддерживается текущей версией WebView.';
+      }
+    } catch (e) {
+      outputFeedback = `Не удалось переключить устройство: ${String(e)}`;
+    }
+  }
+
+  onMount(() => {
+    void refreshAudioOutputs();
+    const md = navigator?.mediaDevices;
+    if (!md?.addEventListener) return;
+    const onDeviceChange = () => void refreshAudioOutputs();
+    md.addEventListener('devicechange', onDeviceChange);
+    return () => md.removeEventListener('devicechange', onDeviceChange);
+  });
 
   let updateStatus = $state<'idle' | 'checking' | 'available' | 'latest' | 'installing' | 'error'>('idle');
   let updateVersion = $state('');
@@ -107,6 +188,18 @@
       const { relaunch } = await import('@tauri-apps/plugin-process');
       const upd = await check();
       if (upd) {
+        try {
+          localStorage.setItem(
+            'flowly_pending_changelog',
+            JSON.stringify({
+              version: upd.version,
+              notes: upd.body?.trim() ?? '',
+              date: upd.date ?? null,
+            })
+          );
+        } catch {
+          // ignore
+        }
         await upd.downloadAndInstall();
         await relaunch();
       } else {
@@ -131,15 +224,37 @@
     }
   }
 
-  let settingsTab = $state<'services' | 'network' | 'appearance' | 'themes' | 'integrations'>('services');
+  let settingsTab = $state<SettingsTabId>('services');
+  $effect(() => {
+    settingsTab = initialTab;
+  });
+  let settingsQuery = $state('');
 
-  const settingsTabs: { id: 'services' | 'network' | 'appearance' | 'themes' | 'integrations'; label: string }[] = [
-    { id: 'services', label: 'Сервисы и аккаунты' },
-    { id: 'network', label: 'Сеть и тексты' },
-    { id: 'appearance', label: 'Система и тема' },
-    { id: 'themes', label: 'Магазин тем (CSS)' },
-    { id: 'integrations', label: 'Интеграции и режимы' },
+  const settingsTabs: { id: SettingsTabId; label: string; keywords: string }[] = [
+    { id: 'services', label: 'Сервисы', keywords: 'яндекс soundcloud токен вход авторизация прокси' },
+    { id: 'appearance', label: 'Оформление', keywords: 'тема css стиль цвета шрифт погода динамическая тема' },
+    { id: 'sound', label: 'Звук', keywords: 'кроссфейд микс dj переход радио ведущий голос озвучка' },
+    { id: 'network', label: 'Сеть и DoH', keywords: 'doh dns cloudflare google прокси сеть' },
+    { id: 'integrations', label: 'Интеграции', keywords: 'активность кодинг игры spicy lyrics тексты discord rpc' },
+    { id: 'account', label: 'Профиль', keywords: 'аккаунт профиль flowly аватар облако вход' },
+    { id: 'general', label: 'Система', keywords: 'закрытие трей озу память обновления ota обучение' },
+    { id: 'about', label: 'О программе', keywords: 'о программе версия создатель telegram правовая информация' },
   ];
+
+  const filteredSettingsTabs = $derived.by(() => {
+    const q = settingsQuery.trim().toLowerCase();
+    if (!q) return settingsTabs;
+    return settingsTabs.filter(
+      (t) => t.label.toLowerCase().includes(q) || t.keywords.includes(q),
+    );
+  });
+
+  $effect(() => {
+    const q = settingsQuery.trim();
+    if (q && filteredSettingsTabs.length > 0 && !filteredSettingsTabs.some((t) => t.id === settingsTab)) {
+      settingsTab = filteredSettingsTabs[0].id;
+    }
+  });
 
   interface CssThemePreset {
     id: string;
@@ -265,7 +380,6 @@
 
   const sourceLabels: { id: SourceKind; label: string }[] = [
     { id: 'yandex', label: 'Яндекс Музыка' },
-    { id: 'spotify', label: 'Spotify' },
     { id: 'soundcloud', label: 'SoundCloud' },
   ];
 
@@ -280,7 +394,6 @@
   }
 
   let yandexToken = $state('');
-  let spotifyClientId = $state('');
   let scToken = $state('');
   let scClientId = $state('');
 
@@ -427,20 +540,6 @@
     }
   }
 
-  async function handleConnectSpotify() {
-    busy.spotify = true;
-    feedback.spotify = 'Откройте браузер и подтвердите вход в Spotify...';
-    try {
-      const next = await api.startSpotifyOAuth(spotifyClientId);
-      onSourcesChanged(next);
-      feedback.spotify = 'Spotify подключён';
-    } catch (e) {
-      feedback.spotify = String(e);
-    } finally {
-      busy.spotify = false;
-    }
-  }
-
   async function handleConnectSoundCloud() {
     busy.soundcloud = true;
     feedback.soundcloud = '';
@@ -463,25 +562,60 @@
   }
 </script>
 
-<section class="settings-view">
-  <div class="settings-head">
-    <div>
-      <h2>Настройки Flowly</h2>
-      <p>Токены хранятся локально в зашищённом хранилище Rust-бэкенда и не передаются во frontend.</p>
+<section class="settings-shell">
+  <aside class="settings-sidebar">
+    <div class="settings-search-box">
+      <Search size={13} />
+      <input
+        type="text"
+        bind:value={settingsQuery}
+        placeholder="Поиск по настройкам..."
+      />
     </div>
-    <div class="settings-tabs">
-      {#each settingsTabs as st (st.id)}
+
+    <nav class="settings-nav">
+      {#each filteredSettingsTabs as st (st.id)}
         <button
           type="button"
-          class="s-tab-btn"
+          class="s-nav-btn"
           class:active={settingsTab === st.id}
           onclick={() => (settingsTab = st.id)}
         >
-          {st.label}
+          {#if st.id === 'services'}
+            <Layers size={15} />
+          {:else if st.id === 'appearance'}
+            <Palette size={15} />
+          {:else if st.id === 'sound'}
+            <Headphones size={15} />
+          {:else if st.id === 'network'}
+            <Globe size={15} />
+          {:else if st.id === 'integrations'}
+            <Sparkles size={15} />
+          {:else if st.id === 'account'}
+            <User size={15} />
+          {:else if st.id === 'general'}
+            <Cpu size={15} />
+          {:else}
+            <Info size={15} />
+          {/if}
+          <span>{st.label}</span>
         </button>
       {/each}
+      {#if filteredSettingsTabs.length === 0}
+        <div class="s-nav-empty">Ничего не найдено</div>
+      {/if}
+    </nav>
+
+    <div class="settings-sec-note">
+      <Shield size={12} />
+      <span>Токены шифруются локально в Rust-хранилище.</span>
     </div>
-  </div>
+  </aside>
+
+  <div class="settings-content">
+    <div class="settings-content-head">
+      <h2>{settingsTabs.find((t) => t.id === settingsTab)?.label ?? 'Настройки'}</h2>
+    </div>
 
   {#if settingsTab === 'services'}
   <!-- Выбор активных источников музыки -->
@@ -494,8 +628,8 @@
       <button
         type="button"
         class="btn-sm"
-        class:active-pill={enabledSources.length === 3}
-        onclick={() => onEnabledSourcesChange(['yandex', 'spotify', 'soundcloud'])}
+        class:active-pill={enabledSources.length === 2}
+        onclick={() => onEnabledSourcesChange(['yandex', 'soundcloud'])}
       >
         Все сервисы
       </button>
@@ -529,7 +663,7 @@
   </div>
   {/if}
 
-  {#if settingsTab === 'appearance'}
+  {#if settingsTab === 'general'}
   <!-- Режим закрытия окна -->
   <div class="service-card">
     <div class="card-top">
@@ -565,44 +699,6 @@
     </div>
   </div>
 
-  <!-- Динамическая тема по времени и погоде -->
-  <div class="service-card">
-    <div class="card-top">
-      <div class="card-title">
-        <Sparkles size={16} />
-        <span class="net-title">Динамическая тема (Время и погода)</span>
-      </div>
-      <button
-        type="button"
-        class="btn-sm"
-        class:active-pill={netLyrics.dynamic_theme_enabled}
-        onclick={() => saveNetLyrics({ dynamic_theme_enabled: !netLyrics.dynamic_theme_enabled })}
-      >
-        {netLyrics.dynamic_theme_enabled ? 'Тема: Включена' : 'Тема: Выключена'}
-      </button>
-    </div>
-    <p class="active-src-desc">
-      Акцент и атмосфера плеера автоматически подстраиваются под время суток (утро, день, вечер,
-      ночь) и текущую погоду в указанном городе.
-    </p>
-    <div class="auth-box">
-      <div class="auth-row">
-        <input
-          type="text"
-          bind:value={netLyrics.weather_city}
-          placeholder="Город (например: Москва или Казань)"
-        />
-        <button class="btn-accent" disabled={busy.netLyrics} onclick={() => saveNetLyrics()}>
-          <RefreshCw size={13} />
-          <span>Применить</span>
-        </button>
-      </div>
-      {#if netLyrics.dynamic_theme_enabled && atmosphereSummary}
-        <div class="feedback">Сейчас в эфире: {atmosphereSummary}</div>
-      {/if}
-    </div>
-  </div>
-
   <!-- Режим экономии ОЗУ -->
   <div class="service-card">
     <div class="card-top">
@@ -610,14 +706,11 @@
         <Cpu size={16} />
         <span class="net-title">Режим экономии ОЗУ и ресурсов</span>
       </div>
-      <button
-        type="button"
-        class="btn-sm"
-        class:active-pill={ramSaverEnabled}
-        onclick={() => onRamSaverChange(!ramSaverEnabled)}
-      >
-        {ramSaverEnabled ? 'Экономия ОЗУ: Включена' : 'Экономия ОЗУ: Выключена'}
-      </button>
+      <RadixSwitch
+        checked={ramSaverEnabled}
+        ariaLabel="Режим экономии ОЗУ"
+        onCheckedChange={(v) => onRamSaverChange(v)}
+      />
     </div>
     <p class="active-src-desc">
       Отключает предзагрузку второго трека в память, немедленно очищает буфер неактивной аудио-деки и убирает фоновые анимации и погодные эффекты.
@@ -698,28 +791,24 @@
     <div class="act-rules">
       <div class="act-rule-row">
         <span class="act-lbl">Кодинг (VS Code, Cursor, JetBrains):</span>
-        <select
-          class="act-select"
+        <RadixSelect
           value={activityConfig.codingPlaylistId}
-          onchange={(e) =>
-            onActivityConfigChange({ ...activityConfig, codingPlaylistId: e.currentTarget.value })}
-        >
-          <option value="">Плейлист: не менять</option>
-          {#each playlists as pl (pl.id)}
-            <option value={pl.id}>{pl.title}</option>
-          {/each}
-        </select>
-        <select
-          class="act-select"
+          options={[
+            { value: '', label: 'Плейлист: не менять' },
+            ...playlists.map((pl) => ({ value: pl.id, label: pl.title })),
+          ]}
+          onValueChange={(v) => onActivityConfigChange({ ...activityConfig, codingPlaylistId: v })}
+        />
+        <RadixSelect
           value={activityConfig.codingEqPreset}
-          onchange={(e) =>
-            onActivityConfigChange({ ...activityConfig, codingEqPreset: e.currentTarget.value })}
-        >
-          <option value="">EQ: не менять</option>
-          <option value="Lo-Fi">EQ: Lo-Fi</option>
-          <option value="Flat">EQ: Flat</option>
-          <option value="Late Night">EQ: Late Night</option>
-        </select>
+          options={[
+            { value: '', label: 'EQ: не менять' },
+            { value: 'Lo-Fi', label: 'EQ: Lo-Fi' },
+            { value: 'Flat', label: 'EQ: Flat' },
+            { value: 'Late Night', label: 'EQ: Late Night' },
+          ]}
+          onValueChange={(v) => onActivityConfigChange({ ...activityConfig, codingEqPreset: v })}
+        />
         <button
           type="button"
           class="btn-sm"
@@ -732,17 +821,16 @@
 
       <div class="act-rule-row">
         <span class="act-lbl">Игры (Steam, Epic, Riot + свои):</span>
-        <select
-          class="act-select"
+        <RadixSelect
           value={activityConfig.gamingEqPreset}
-          onchange={(e) =>
-            onActivityConfigChange({ ...activityConfig, gamingEqPreset: e.currentTarget.value })}
-        >
-          <option value="">EQ: не менять</option>
-          <option value="Gaming">EQ: Gaming</option>
-          <option value="Bass Boost">EQ: Bass Boost</option>
-          <option value="Electronic">EQ: Electronic</option>
-        </select>
+          options={[
+            { value: '', label: 'EQ: не менять' },
+            { value: 'Gaming', label: 'EQ: Gaming' },
+            { value: 'Bass Boost', label: 'EQ: Bass Boost' },
+            { value: 'Electronic', label: 'EQ: Electronic' },
+          ]}
+          onValueChange={(v) => onActivityConfigChange({ ...activityConfig, gamingEqPreset: v })}
+        />
         <button
           type="button"
           class="btn-sm"
@@ -840,7 +928,7 @@
         <div class="auth-block">
           {#if src.source === 'yandex'}
             <div class="guide-box">
-              <strong>Как подключить Yandex Music:</strong>
+              <strong>Как подключить Яндекс Музыку:</strong>
               <ol>
                 <li>Нажмите <b>«Открыть вход Яндекс»</b> — в браузере откроется страница авторизации.</li>
                 <li>Войдите в свой аккаунт Яндекса и разрешите доступ.</li>
@@ -866,26 +954,6 @@
               <button class="btn-accent" disabled={busy.yandex} onclick={handleConnectYandex}>
                 <KeyRound size={13} />
                 <span>{busy.yandex ? 'Проверка...' : 'Подключить'}</span>
-              </button>
-            </div>
-          {:else if src.source === 'spotify'}
-            <div class="guide-box">
-              <strong>Как подключить Spotify (OAuth 2.0 PKCE):</strong>
-              <ol>
-                <li>Если работает системный VPN (как и для десктопного Spotify) — выберите сеть <b>Direct</b>. Если используете локальный прокси (v2rayN/Nekoray) — укажите <b>SOCKS5/HTTP</b> и нажмите «Применить прокси».</li>
-                <li>В <button class="inline-link" onclick={() => api.openExternalUrl('https://developer.spotify.com/dashboard')}>Spotify Developer Dashboard</button> создайте приложение, добавьте Redirect URI: <code>http://127.0.0.1:8888/callback</code> и в разделе <b>User Management</b> добавьте свой email Spotify (иначе будет ошибка 403).</li>
-                <li>Скопируйте <b>Client ID</b> в поле ниже и нажмите <b>«Войти через OAuth PKCE»</b>.</li>
-              </ol>
-            </div>
-            <div class="auth-row">
-              <input
-                type="text"
-                bind:value={spotifyClientId}
-                placeholder="Вставьте Spotify Client ID..."
-              />
-              <button class="btn-accent" disabled={busy.spotify} onclick={handleConnectSpotify}>
-                <KeyRound size={13} />
-                <span>{busy.spotify ? 'Ожидание браузера...' : 'Войти через OAuth PKCE'}</span>
               </button>
             </div>
           {:else}
@@ -1070,6 +1138,336 @@
     </div>
   </div>
 
+  <!-- Discord Rich Presence -->
+  <div class="service-card">
+    <div class="card-top">
+      <div class="card-title">
+        <Sparkles size={16} />
+        <span class="net-title">Discord Rich Presence (RPC)</span>
+      </div>
+      <RadixSwitch
+        checked={netLyrics.discord_rpc_enabled}
+        ariaLabel="Discord Rich Presence"
+        onCheckedChange={(v) => saveNetLyrics({ discord_rpc_enabled: v })}
+      />
+    </div>
+
+    <p class="active-src-desc">
+      Работает из коробки и показывает в профиле Discord текущий трек, исполнителя, обложку и таймер прослушивания. При желании можно указать свой Application ID.
+    </p>
+
+    <div class="auth-box">
+      <div class="auth-row">
+        <input
+          type="text"
+          bind:value={netLyrics.discord_client_id}
+          placeholder="Свой Application ID (опционально, по умолчанию встроенный Flowly)"
+        />
+        <button class="btn-accent" disabled={busy.netLyrics} onclick={() => saveNetLyrics()}>
+          <KeyRound size={13} />
+          <span>Сохранить</span>
+        </button>
+        <button
+          type="button"
+          class="btn-sm"
+          onclick={() => api.openExternalUrl('https://discord.com/developers/applications')}
+        >
+          <ExternalLink size={12} />
+          <span>Создать App</span>
+        </button>
+      </div>
+    </div>
+  </div>
+  {/if}
+
+  {#if settingsTab === 'appearance'}
+  <div class="themes-section">
+    <div class="service-card">
+      <div class="card-top">
+        <div class="card-title">
+          <Palette size={16} />
+          <span class="net-title">Темы оформления</span>
+        </div>
+        <span class="theme-count-badge">{cssThemeStore.length} тем</span>
+      </div>
+      <p class="active-src-desc">
+        Выберите готовую тему с предпросмотром или загрузите её в редактор ниже для тонкой настройки под себя.
+      </p>
+
+      <div class="theme-store-grid">
+        {#each cssThemeStore as theme (theme.id)}
+          {@const active = activeCssThemeId === theme.id}
+          {@const bg = theme.swatches[0]}
+          {@const surface = theme.swatches[1]}
+          {@const accent = theme.swatches[2]}
+          <div class="theme-card" class:active>
+            <button
+              type="button"
+              class="theme-preview-btn"
+              onclick={() => {
+                cssDraft = theme.css;
+                onApplyCssTheme(theme.id, theme.css);
+              }}
+              aria-label={`Применить тему ${theme.name}`}
+            >
+              <div
+                class="theme-preview"
+                style="--pv-bg: {bg}; --pv-surface: {surface}; --pv-accent: {accent};"
+              >
+                <div class="pv-sidebar">
+                  <span class="pv-dot active"></span>
+                  <span class="pv-dot"></span>
+                  <span class="pv-dot"></span>
+                </div>
+                <div class="pv-main">
+                  <div class="pv-topbar">
+                    <span class="pv-pill"></span>
+                    <span class="pv-badge"></span>
+                  </div>
+                  <div class="pv-wave">
+                    <span style="height: 45%"></span>
+                    <span style="height: 85%"></span>
+                    <span style="height: 60%"></span>
+                    <span style="height: 95%"></span>
+                    <span style="height: 50%"></span>
+                    <span style="height: 75%"></span>
+                  </div>
+                  <div class="pv-player">
+                    <span class="pv-cover"></span>
+                    <span class="pv-lines">
+                      <i></i>
+                      <i class="short"></i>
+                    </span>
+                    <span class="pv-play"></span>
+                  </div>
+                </div>
+              </div>
+            </button>
+
+            <div class="theme-card-top">
+              <div class="theme-info">
+                <div class="theme-name">{theme.name}</div>
+                <div class="theme-author">{theme.author}</div>
+              </div>
+              {#if active}
+                <span class="theme-active-badge">Активна</span>
+              {/if}
+            </div>
+            <div class="theme-desc">{theme.desc}</div>
+            <div class="theme-actions">
+              <button
+                type="button"
+                class={active ? 'btn-accent' : 'btn-sm'}
+                onclick={() => {
+                  cssDraft = theme.css;
+                  onApplyCssTheme(theme.id, theme.css);
+                }}
+              >
+                {active ? 'Применена' : 'Применить'}
+              </button>
+              <button
+                type="button"
+                class="btn-sm"
+                onclick={() => {
+                  cssDraft = theme.css;
+                }}
+              >
+                В редактор
+              </button>
+            </div>
+          </div>
+        {/each}
+      </div>
+    </div>
+
+    <!-- Динамическая тема по времени и погоде -->
+    <div class="service-card">
+      <div class="card-top">
+        <div class="card-title">
+          <Sparkles size={16} />
+          <span class="net-title">Динамическая тема (Время и погода)</span>
+        </div>
+        <RadixSwitch
+          checked={netLyrics.dynamic_theme_enabled}
+          ariaLabel="Динамическая тема"
+          onCheckedChange={(v) => saveNetLyrics({ dynamic_theme_enabled: v })}
+        />
+      </div>
+      <p class="active-src-desc">
+        Акцент и атмосфера плеера автоматически подстраиваются под время суток (утро, день, вечер,
+        ночь) и текущую погоду в указанном городе.
+      </p>
+      <div class="auth-box">
+        <div class="auth-row">
+          <input
+            type="text"
+            bind:value={netLyrics.weather_city}
+            placeholder="Город (например: Москва или Казань)"
+          />
+          <button class="btn-accent" disabled={busy.netLyrics} onclick={() => saveNetLyrics()}>
+            <RefreshCw size={13} />
+            <span>Применить</span>
+          </button>
+        </div>
+        {#if netLyrics.dynamic_theme_enabled && atmosphereSummary}
+          <div class="feedback">Сейчас в эфире: {atmosphereSummary}</div>
+        {/if}
+      </div>
+    </div>
+
+    <div class="service-card">
+      <div class="card-top">
+        <div class="card-title">
+          <KeyRound size={16} />
+          <span class="net-title">Редактор своей CSS-темы</span>
+        </div>
+        <span class="css-len">{cssDraft.length} симв.</span>
+      </div>
+      <p class="active-src-desc">
+        Пишите любой CSS поверх интерфейса. Основные переменные: <code>--accent</code>, <code>--bg-graphite</code>, <code>--bg-surface</code>, <code>--bg-elevated</code>.
+      </p>
+
+      <div class="css-snippets">
+        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--accent: #00e5ff;')}>+ --accent</button>
+        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--bg-graphite: #0a0f18;')}>+ --bg-graphite</button>
+        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--bg-surface: #111827;')}>+ --bg-surface</button>
+        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--radius-md: 16px;')}>+ --radius-md</button>
+      </div>
+
+      <textarea
+        class="css-editor"
+        bind:value={cssDraft}
+        spellcheck={false}
+        placeholder={`:root {\n  --accent: #a855f7;\n  --bg-graphite: #0c0914;\n  --bg-surface: #151024;\n}\n\n.artwork-img {\n  border-radius: 24px;\n}`}
+      ></textarea>
+
+      <div class="css-editor-actions">
+        <button
+          type="button"
+          class="btn-accent"
+          onclick={() => onApplyCssTheme('custom', cssDraft)}
+        >
+          Применить свой CSS
+        </button>
+        <button
+          type="button"
+          class="btn-sm"
+          onclick={async () => {
+            try {
+              await navigator.clipboard.writeText(cssDraft);
+              cssCopied = true;
+              setTimeout(() => (cssCopied = false), 1600);
+            } catch {}
+          }}
+        >
+          {cssCopied ? 'Скопировано!' : 'Копировать CSS'}
+        </button>
+        <button
+          type="button"
+          class="btn-sm"
+          onclick={() => {
+            cssDraft = '';
+            onApplyCssTheme('default', '');
+          }}
+        >
+          Сбросить к стандартной
+        </button>
+      </div>
+    </div>
+  </div>
+  {/if}
+
+  {#if settingsTab === 'sound'}
+  <!-- Устройство вывода звука -->
+  <div class="service-card">
+    <div class="card-top">
+      <div class="card-title">
+        <Headphones size={16} />
+        <span class="net-title">Устройство вывода звука</span>
+      </div>
+      <button type="button" class="btn-sm" onclick={refreshAudioOutputs}>
+        <RefreshCw size={12} />
+        <span>Обновить список</span>
+      </button>
+    </div>
+    <p class="active-src-desc">
+      Выберите наушники, колонки или внешнюю звуковую карту, через которую будет воспроизводиться музыка.
+    </p>
+    <div class="auth-box">
+      <RadixSelect
+        value={selectedOutputId}
+        options={audioOutputs}
+        onValueChange={handleSelectAudioOutput}
+      />
+      {#if outputFeedback}
+        <div class="feedback err">{outputFeedback}</div>
+      {/if}
+    </div>
+  </div>
+
+  <!-- Плавные переходы и кроссфейд -->
+  <div class="service-card">
+    <div class="card-top">
+      <div class="card-title">
+        <Headphones size={16} />
+        <span class="net-title">Плавные переходы и кроссфейд</span>
+      </div>
+      <RadixSwitch
+        checked={mix.enabled}
+        ariaLabel="Кроссфейд и микс"
+        onCheckedChange={(v) => onMixChange({ ...mix, enabled: v })}
+      />
+    </div>
+    <p class="active-src-desc">
+      Бесшовное сведение треков при окончании композиции или ручном переключении с автоматическим подбором перехода.
+    </p>
+
+    <div class="radio-grid">
+      <div class="radio-group">
+        <span class="rg-lbl">Режим сведения</span>
+        <div class="mode-pills">
+          <button type="button" class:active={mix.mode === 'auto'} onclick={() => onMixChange({ ...mix, mode: 'auto' })}>Авто</button>
+          <button type="button" class:active={mix.mode === 'manual'} onclick={() => onMixChange({ ...mix, mode: 'manual' })}>Ручной</button>
+        </div>
+      </div>
+
+      <div class="radio-group">
+        <span class="rg-lbl">Стиль перехода</span>
+        <div class="mode-pills">
+          <button type="button" class:active={mix.preset === 'fade'} onclick={() => onMixChange({ ...mix, preset: 'fade' })}>Fade</button>
+          <button type="button" class:active={mix.preset === 'rise'} onclick={() => onMixChange({ ...mix, preset: 'rise' })}>Rise</button>
+          <button type="button" class:active={mix.preset === 'bass-swap'} onclick={() => onMixChange({ ...mix, preset: 'bass-swap' })}>Bass Swap</button>
+          <button type="button" class:active={mix.preset === 'echo-out'} onclick={() => onMixChange({ ...mix, preset: 'echo-out' })}>Echo Out</button>
+          <button type="button" class:active={mix.preset === 'dj-vocal'} onclick={() => onMixChange({ ...mix, preset: 'dj-vocal' })}>DJ-вокал</button>
+        </div>
+      </div>
+
+      <div class="radio-group">
+        <span class="rg-lbl">Длительность кроссфейда: {mix.durationSec} сек</span>
+        <RadixSlider
+          value={mix.durationSec}
+          min={2}
+          max={12}
+          step={1}
+          ariaLabel="Длительность кроссфейда"
+          onValueChange={(v) => onMixChange({ ...mix, durationSec: v })}
+        />
+      </div>
+
+      <div class="radio-group">
+        <span class="rg-lbl">Частотный сдвиг (EQ Sweep)</span>
+        <div style="display: flex; align-items: center; gap: 10px; padding-top: 2px;">
+          <RadixSwitch
+            checked={mix.eqSweep}
+            ariaLabel="EQ Sweep"
+            onCheckedChange={(v) => onMixChange({ ...mix, eqSweep: v })}
+          />
+          <span class="active-src-desc" style="margin: 0;">Плавный срез баса при сведении</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Симуляция радио (Виртуальный ведущий) -->
   <div class="service-card">
     <div class="card-top">
@@ -1152,227 +1550,177 @@
       <div class="feedback">{radioStatus}</div>
     {/if}
   </div>
+  {/if}
 
-  <!-- Discord Rich Presence -->
-  <div class="service-card">
+  {#if settingsTab === 'account'}
+  <AccountModal
+    embedded={true}
+    open={true}
+    session={sbSession}
+    profile={sbProfile}
+    onClose={() => {}}
+    {onAuthChange}
+    {onSyncCloudSettings}
+  />
+  {/if}
+
+  {#if settingsTab === 'about'}
+  <div class="service-card about-settings-card">
     <div class="card-top">
-      <div class="card-title">
-        <Sparkles size={16} />
-        <span class="net-title">Discord Rich Presence (RPC)</span>
+      <div class="about-settings-brand">
+        <FlowlyLogo size={38} />
+        <div>
+          <h3>Flowly</h3>
+          <span class="about-settings-ver">Версия 0.1.1 · Desktop Music Client</span>
+        </div>
       </div>
-      <button
-        type="button"
-        class="btn-sm"
-        class:active-pill={netLyrics.discord_rpc_enabled}
-        onclick={() => saveNetLyrics({ discord_rpc_enabled: !netLyrics.discord_rpc_enabled })}
-      >
-        {netLyrics.discord_rpc_enabled ? 'Discord RPC: Включён' : 'Discord RPC: Выключен'}
+      <button type="button" class="btn-sm" onclick={onOpenWhatsNew}>
+        <Sparkles size={12} />
+        <span>Что нового</span>
       </button>
     </div>
 
     <p class="active-src-desc">
-      Работает из коробки и показывает в профиле Discord текущий трек, исполнителя, обложку и таймер прослушивания. При желании можно указать свой Application ID.
+      Современный мультистриминговый музыкальный плеер, объединяющий Яндекс Музыку, SoundCloud и локальную библиотеку с «Моей волной», Jam-комнатами, 10-полосным эквалайзером и настраиваемыми сценами.
     </p>
 
-    <div class="auth-box">
-      <div class="auth-row">
-        <input
-          type="text"
-          bind:value={netLyrics.discord_client_id}
-          placeholder="Свой Application ID (опционально, по умолчанию встроенный Flowly)"
-        />
-        <button class="btn-accent" disabled={busy.netLyrics} onclick={() => saveNetLyrics()}>
-          <KeyRound size={13} />
-          <span>Сохранить</span>
-        </button>
-        <button
-          type="button"
-          class="btn-sm"
-          onclick={() => api.openExternalUrl('https://discord.com/developers/applications')}
-        >
-          <ExternalLink size={12} />
-          <span>Создать App</span>
-        </button>
+    <div class="about-settings-creator">
+      <div>
+        <span class="about-settings-lbl">Создатель проекта</span>
+        <strong>whoisquinckyyy</strong>
       </div>
+      <button
+        type="button"
+        class="btn-accent"
+        onclick={() => api.openExternalUrl('https://t.me/whoisquicky')}
+      >
+        <span>Telegram-канал</span>
+        <ExternalLink size={13} />
+      </button>
+    </div>
+
+    <div class="about-settings-legal">
+      <div class="about-settings-legal-head">
+        <Shield size={14} />
+        <span>Правовая информация и отказ от ответственности</span>
+      </div>
+      <p>
+        Flowly является независимым неофициальным клиентским интерфейсом (wrapper/player) и не связан с ООО «Яндекс» или SoundCloud Global Limited &amp; Co. KG.
+      </p>
+      <p>
+        Приложение не размещает, не хранит на сторонних серверах и не распространяет защищённые авторским правом аудиофайлы. Воспроизведение осуществляется исключительно через авторизованные пользовательские сессии выбранных сервисов или из локальных файлов пользователя.
+      </p>
+      <p>
+        Все товарные знаки, логотипы, обложки и музыкальные произведения принадлежат их законным правообладателям. Предоставляется «как есть» (AS IS) исключительно для личного некоммерческого использования.
+      </p>
     </div>
   </div>
   {/if}
-
-  {#if settingsTab === 'themes'}
-  <div class="themes-section">
-    <div class="service-card">
-      <div class="card-top">
-        <div class="card-title">
-          <Sparkles size={16} />
-          <span class="net-title">Магазин CSS-тем</span>
-        </div>
-        <span class="theme-count-badge">{cssThemeStore.length} тем</span>
-      </div>
-      <p class="active-src-desc">
-        Выберите готовую тему или загрузите её в редактор ниже для доработки под себя.
-      </p>
-
-      <div class="theme-store-grid">
-        {#each cssThemeStore as theme (theme.id)}
-          {@const active = activeCssThemeId === theme.id}
-          <div class="theme-card" class:active>
-            <div class="theme-card-top">
-              <div class="theme-swatches">
-                {#each theme.swatches as col}
-                  <span class="swatch-dot" style="background: {col}"></span>
-                {/each}
-              </div>
-              {#if active}
-                <span class="theme-active-badge">Активна</span>
-              {/if}
-            </div>
-            <div class="theme-info">
-              <div class="theme-name">{theme.name}</div>
-              <div class="theme-author">by {theme.author}</div>
-              <div class="theme-desc">{theme.desc}</div>
-            </div>
-            <div class="theme-actions">
-              <button
-                type="button"
-                class={active ? 'btn-accent' : 'btn-sm'}
-                onclick={() => {
-                  cssDraft = theme.css;
-                  onApplyCssTheme(theme.id, theme.css);
-                }}
-              >
-                {active ? 'Применена' : 'Применить'}
-              </button>
-              <button
-                type="button"
-                class="btn-sm"
-                onclick={() => {
-                  cssDraft = theme.css;
-                }}
-              >
-                В редактор
-              </button>
-            </div>
-          </div>
-        {/each}
-      </div>
-    </div>
-
-    <div class="service-card">
-      <div class="card-top">
-        <div class="card-title">
-          <KeyRound size={16} />
-          <span class="net-title">Редактор своей CSS-темы</span>
-        </div>
-        <span class="css-len">{cssDraft.length} симв.</span>
-      </div>
-      <p class="active-src-desc">
-        Пишите любой CSS поверх интерфейса. Основные переменные: <code>--accent</code>, <code>--bg-graphite</code>, <code>--bg-surface</code>, <code>--bg-elevated</code>.
-      </p>
-
-      <div class="css-snippets">
-        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--accent: #00e5ff;')}>+ --accent</button>
-        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--bg-graphite: #0a0f18;')}>+ --bg-graphite</button>
-        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--bg-surface: #111827;')}>+ --bg-surface</button>
-        <button type="button" class="btn-sm" onclick={() => insertCssSnippet('--radius-md: 16px;')}>+ --radius-md</button>
-      </div>
-
-      <textarea
-        class="css-editor"
-        bind:value={cssDraft}
-        spellcheck={false}
-        placeholder={`:root {\n  --accent: #a855f7;\n  --bg-graphite: #0c0914;\n  --bg-surface: #151024;\n}\n\n.artwork-img {\n  border-radius: 24px;\n}`}
-      ></textarea>
-
-      <div class="css-editor-actions">
-        <button
-          type="button"
-          class="btn-accent"
-          onclick={() => onApplyCssTheme('custom', cssDraft)}
-        >
-          Применить свой CSS
-        </button>
-        <button
-          type="button"
-          class="btn-sm"
-          onclick={async () => {
-            try {
-              await navigator.clipboard.writeText(cssDraft);
-              cssCopied = true;
-              setTimeout(() => (cssCopied = false), 1600);
-            } catch {}
-          }}
-        >
-          {cssCopied ? 'Скопировано!' : 'Копировать CSS'}
-        </button>
-        <button
-          type="button"
-          class="btn-sm"
-          onclick={() => {
-            cssDraft = '';
-            onApplyCssTheme('default', '');
-          }}
-        >
-          Сбросить к стандартной
-        </button>
-      </div>
-    </div>
   </div>
-  {/if}
 </section>
 
 <style>
-  .settings-view {
+  .settings-shell {
     padding: 20px 28px;
-    display: flex;
-    flex-direction: column;
-    gap: 18px;
+    display: grid;
+    grid-template-columns: 224px minmax(0, 780px);
+    gap: 24px;
+    align-items: start;
+    justify-content: center;
   }
 
-  .settings-head {
+  .settings-sidebar {
+    position: sticky;
+    top: 16px;
     display: flex;
     flex-direction: column;
     gap: 12px;
   }
 
-  .settings-tabs {
+  .settings-search-box {
     display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-
-  .s-tab-btn {
-    padding: 7px 14px;
-    border-radius: 999px;
-    border: 1px solid var(--border-subtle);
+    align-items: center;
+    gap: 8px;
+    padding: 7px 11px;
+    border-radius: 10px;
     background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
     color: var(--text-secondary);
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
   }
 
-  .s-tab-btn:hover {
+  .settings-search-box input {
+    width: 100%;
+    border: none;
+    background: transparent;
     color: var(--text-primary);
-    background: var(--bg-elevated);
-  }
-
-  .s-tab-btn.active {
-    background: var(--accent);
-    border-color: var(--accent);
-    color: #0b0b0e;
-    font-weight: 700;
-  }
-
-  .settings-head h2 {
-    font-size: 20px;
-    font-weight: 700;
-  }
-
-  .settings-head p {
     font-size: 12px;
+    outline: none;
+  }
+
+  .settings-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .s-nav-btn {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    background: transparent;
     color: var(--text-secondary);
-    margin-top: 4px;
+    font-size: 12.5px;
+    font-weight: 600;
+    text-align: left;
+    cursor: pointer;
+    transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+  }
+
+  .s-nav-btn:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-primary);
+  }
+
+  .s-nav-btn.active {
+    background: color-mix(in srgb, var(--accent) 14%, var(--bg-surface));
+    border-color: color-mix(in srgb, var(--accent) 34%, transparent);
+    color: var(--text-primary);
+  }
+
+  .s-nav-empty {
+    padding: 10px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .settings-sec-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid var(--border-subtle);
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-muted);
+  }
+
+  .settings-content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+  }
+
+  .settings-content-head h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 700;
   }
 
   .services-list {
@@ -1467,16 +1815,6 @@
     padding: 1px 5px;
     border-radius: 4px;
     color: var(--accent);
-  }
-
-  .inline-link {
-    border: none;
-    background: transparent;
-    color: var(--accent);
-    font-size: inherit;
-    cursor: pointer;
-    text-decoration: underline;
-    padding: 0;
   }
 
   .auth-row {
@@ -1750,7 +2088,6 @@
     min-width: 220px;
   }
 
-  .act-select,
   .act-input {
     padding: 6px 10px;
     border-radius: 8px;
@@ -1857,17 +2194,216 @@
     border-color: var(--border-subtle);
   }
 
-  .theme-swatches {
+  .theme-preview-btn {
+    border: none;
+    padding: 0;
+    background: transparent;
+    cursor: pointer;
+    border-radius: 10px;
+    overflow: hidden;
+    display: block;
+    width: 100%;
+  }
+
+  .theme-preview {
+    height: 104px;
+    width: 100%;
+    border-radius: 10px;
+    background: var(--pv-bg, #0b0b0e);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    display: grid;
+    grid-template-columns: 24px 1fr;
+    overflow: hidden;
+    position: relative;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  .pv-sidebar {
+    background: color-mix(in srgb, var(--pv-surface, #131318) 92%, #000);
+    border-right: 1px solid rgba(255, 255, 255, 0.06);
+    padding: 8px 6px;
     display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .pv-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.14);
+  }
+
+  .pv-dot.active {
+    background: var(--pv-accent, #ff3b5c);
+    box-shadow: 0 0 8px var(--pv-accent, #ff3b5c);
+  }
+
+  .pv-main {
+    padding: 8px 9px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 6px;
+    background: radial-gradient(circle at 80% 15%, color-mix(in srgb, var(--pv-accent, #ff3b5c) 20%, transparent), transparent 60%);
+  }
+
+  .pv-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     gap: 6px;
   }
 
-  .swatch-dot {
-    width: 20px;
-    height: 20px;
+  .pv-pill {
+    width: 56%;
+    height: 8px;
     border-radius: 999px;
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+    background: var(--pv-surface, #1b1b22);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .pv-badge {
+    width: 14px;
+    height: 8px;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--pv-accent, #ff3b5c) 45%, transparent);
+  }
+
+  .pv-wave {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 24px;
+    padding: 0 2px;
+  }
+
+  .pv-wave span {
+    flex: 1;
+    border-radius: 999px;
+    background: linear-gradient(180deg, var(--pv-accent, #ff3b5c), color-mix(in srgb, var(--pv-accent, #ff3b5c) 35%, transparent));
+    opacity: 0.85;
+  }
+
+  .pv-player {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 7px;
+    border-radius: 7px;
+    background: var(--pv-surface, #131318);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .pv-cover {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background: linear-gradient(135deg, var(--pv-accent, #ff3b5c), rgba(255, 255, 255, 0.18));
+    flex-shrink: 0;
+  }
+
+  .pv-lines {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .pv-lines i {
+    display: block;
+    height: 3px;
+    width: 72%;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.5);
+  }
+
+  .pv-lines i.short {
+    width: 44%;
+    background: rgba(255, 255, 255, 0.22);
+  }
+
+  .pv-play {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: var(--pv-accent, #ff3b5c);
+    flex-shrink: 0;
+  }
+
+  .about-settings-card {
+    gap: 14px;
+  }
+
+  .about-settings-brand {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+
+  .about-settings-brand h3 {
+    margin: 0;
+    font-size: 20px;
+    color: var(--text-primary);
+  }
+
+  .about-settings-ver {
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .about-settings-creator {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .about-settings-creator > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .about-settings-lbl {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .about-settings-creator strong {
+    font-size: 14px;
+    color: var(--text-primary);
+  }
+
+  .about-settings-legal {
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .about-settings-legal-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .about-settings-legal p {
+    margin: 0;
+    font-size: 11.5px;
+    line-height: 1.48;
+    color: var(--text-muted);
   }
 
   .theme-info {

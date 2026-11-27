@@ -10,9 +10,11 @@ class AudioEngine {
   private deckGainB: GainNode | null = null;
   private deckFilterA: BiquadFilterNode | null = null;
   private deckFilterB: BiquadFilterNode | null = null;
+  private preampGain: GainNode | null = null;
   private filters: BiquadFilterNode[] = [];
   private bassFilter: BiquadFilterNode | null = null;
   private compressor: DynamicsCompressorNode | null = null;
+  private limiter: DynamicsCompressorNode | null = null;
   private makeupGain: GainNode | null = null;
   private dryGain: GainNode | null = null;
   private wetGain: GainNode | null = null;
@@ -21,6 +23,7 @@ class AudioEngine {
   private analyser: AnalyserNode | null = null;
   private freqBuf: Uint8Array<ArrayBuffer> | null = null;
   private initialized = false;
+  private pendingSinkId = 'default';
   private beatmatchRaf = new WeakMap<HTMLAudioElement, number>();
 
   private setPreservesPitch(el: HTMLAudioElement, enabled: boolean) {
@@ -48,7 +51,7 @@ class AudioEngine {
   }
 
   /**
-   * Spotify-style Time-Stretch Beatmatching:
+   * Time-Stretch Beatmatching:
    * Подстраивает темп входящего трека (playbackRate с сохранением тональности)
    * под BPM уходящего трека и плавно возвращает к 1.0 после перехода.
    */
@@ -119,6 +122,10 @@ class AudioEngine {
 
     try {
       this.ctx = new AudioCtx();
+      if (this.pendingSinkId && this.pendingSinkId !== 'default' && 'setSinkId' in this.ctx) {
+        const ctxWithSink = this.ctx as AudioContext & { setSinkId?: (id: string) => Promise<void> };
+        void ctxWithSink.setSinkId?.(this.pendingSinkId).catch(() => {});
+      }
       this.sourceA = this.ctx.createMediaElementSource(elA);
       this.sourceB = this.ctx.createMediaElementSource(elB);
       this.deckGainA = this.ctx.createGain();
@@ -141,6 +148,10 @@ class AudioEngine {
       this.deckGainB.connect(mixBus);
 
       this.initialized = true;
+
+      // Preamp (-24..+6 dB) before EQ filters
+      this.preampGain = this.ctx.createGain();
+      this.preampGain.gain.value = 1.0;
 
       // 10-band EQ
       this.filters = EQ_FREQS.map((freq, idx) => {
@@ -194,14 +205,23 @@ class AudioEngine {
       const invR = this.ctx.createGain();
       invR.gain.value = -0.35;
 
+      // Output Soft Limiter (anti-clipping protection like Rodio master limiter)
+      this.limiter = this.ctx.createDynamicsCompressor();
+      this.limiter.threshold.value = -0.8;
+      this.limiter.knee.value = 3.0;
+      this.limiter.ratio.value = 20.0;
+      this.limiter.attack.value = 0.002;
+      this.limiter.release.value = 0.08;
+
       // Analyser for live FFT
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 128;
       this.analyser.smoothingTimeConstant = 0.78;
       this.freqBuf = new Uint8Array(new ArrayBuffer(this.analyser.frequencyBinCount));
 
-      // Chain: mixBus -> filters[0..9] -> bassFilter -> compressor -> makeupGain
-      let node: AudioNode = mixBus;
+      // Chain: mixBus -> preampGain -> filters[0..9] -> bassFilter -> compressor -> makeupGain
+      let node: AudioNode = this.preampGain;
+      mixBus.connect(this.preampGain);
       for (const f of this.filters) {
         node.connect(f);
         node = f;
@@ -212,7 +232,7 @@ class AudioEngine {
 
       // Dry path
       this.makeupGain.connect(this.dryGain);
-      this.dryGain.connect(this.analyser);
+      this.dryGain.connect(this.limiter);
 
       // Wet spatial path
       this.makeupGain.connect(splitter);
@@ -223,8 +243,9 @@ class AudioEngine {
       invL.connect(merger, 0, 1);
       invR.connect(merger, 0, 0);
       merger.connect(this.wetGain);
-      this.wetGain.connect(this.analyser);
+      this.wetGain.connect(this.limiter);
 
+      this.limiter.connect(this.analyser);
       this.analyser.connect(this.ctx.destination);
     } catch (e) {
       console.warn('Web Audio API init failed:', e);
@@ -562,6 +583,12 @@ class AudioEngine {
     if (!this.ctx) return;
     const now = this.ctx.currentTime;
 
+    if (this.preampGain) {
+      const clampedDb = Math.max(-24, Math.min(6, effects.preamp_db ?? 0));
+      const linear = effects.eq_enabled ? Math.pow(10, clampedDb / 20) : 1.0;
+      this.preampGain.gain.setTargetAtTime(linear, now, 0.03);
+    }
+
     this.filters.forEach((f, idx) => {
       const targetGain = effects.eq_enabled ? (effects.bands[idx] ?? 0) : 0;
       f.gain.setTargetAtTime(targetGain, now, 0.03);
@@ -593,6 +620,15 @@ class AudioEngine {
         this.wetGain.gain.setTargetAtTime(0.0, now, 0.04);
       }
     }
+  }
+
+  async setOutputDevice(deviceId: string): Promise<boolean> {
+    this.pendingSinkId = deviceId || 'default';
+    if (!this.ctx) return true;
+    if (!('setSinkId' in this.ctx)) return false;
+    const ctxWithSink = this.ctx as AudioContext & { setSinkId: (id: string) => Promise<void> };
+    await ctxWithSink.setSinkId(this.pendingSinkId === 'default' ? '' : this.pendingSinkId);
+    return true;
   }
 
   getFrequencyData(): Uint8Array | null {

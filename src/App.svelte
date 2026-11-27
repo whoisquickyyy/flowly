@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { listen } from '@tauri-apps/api/event';
+  import MarqueeText from './lib/components/MarqueeText.svelte';
   import {
     Play,
     Pause,
@@ -25,28 +27,36 @@
     BarChart3,
     Radio,
     User,
+    Heart,
+    Info,
+    ExternalLink,
+    Shield,
+    Download,
+    RefreshCw,
+    Sparkles,
   } from 'lucide-svelte';
 
   import DetailsView from './lib/components/DetailsView.svelte';
   import LibraryView from './lib/components/LibraryView.svelte';
   import SearchView from './lib/components/SearchView.svelte';
   import PlaylistsView from './lib/components/PlaylistsView.svelte';
-  import EqualizerPanel from './lib/components/EqualizerPanel.svelte';
-  import SettingsView from './lib/components/SettingsView.svelte';
   import SourceBadge from './lib/components/SourceBadge.svelte';
   import FlowlyLogo from './lib/components/FlowlyLogo.svelte';
   import ArtistView from './lib/components/ArtistView.svelte';
-  import RecapView from './lib/components/RecapView.svelte';
-  import RoomView from './lib/components/RoomView.svelte';
   import AccountModal from './lib/components/AccountModal.svelte';
   import ReactiveBackground from './lib/components/ReactiveBackground.svelte';
-  import OnboardingModal from './lib/components/OnboardingModal.svelte';
   import WeatherAtmosphereLayer from './lib/components/WeatherAtmosphereLayer.svelte';
+  import RadixSlider from './lib/components/ui/RadixSlider.svelte';
+  import RadixDialog from './lib/components/ui/RadixDialog.svelte';
+  import './lib/styles/radix-ui.css';
   import * as sb from './lib/supabase';
   import type { FlowlyProfile, SupabaseSession } from './lib/supabase';
   import {
     buildBlendedQueue,
     generateRoomCode,
+    trackMatchKey,
+    type BlendedTrack,
+    type JamChatMessage,
     type JamMember,
     type JamRoomState,
   } from './lib/jamRoom';
@@ -73,7 +83,7 @@
 
   type TabId = 'details' | 'library' | 'search' | 'playlists' | 'recap' | 'room' | 'equalizer' | 'settings';
 
-  const ALL_SOURCES: import('./lib/types').SourceKind[] = ['yandex', 'spotify', 'soundcloud'];
+  const ALL_SOURCES: import('./lib/types').SourceKind[] = ['yandex', 'soundcloud'];
 
   let enabledSources = $state<import('./lib/types').SourceKind[]>(
     (() => {
@@ -144,21 +154,64 @@
   let likedTracks = $state<Track[]>([]);
   let recentTracks = $state<Track[]>([]);
   let localTracks = $state<Track[]>([]);
+  let settingsInitialTab = $state<'services' | 'appearance' | 'sound' | 'network' | 'integrations' | 'account' | 'general' | 'about'>('services');
   let availableUpdateVersion = $state<string | null>(null);
+  let availableUpdateNotes = $state<string>('');
+  let availableUpdateDate = $state<string | null>(null);
+  let showUpdateModal = $state(false);
+  let showWhatsNewModal = $state(false);
+  let whatsNewVersion = $state('0.1.1');
+  let whatsNewNotes = $state('');
+  let whatsNewDate = $state<string | null>(null);
   let installingOta = $state(false);
+  let updateDownloadPct = $state<number | null>(null);
+  let updateInstallError = $state('');
 
   async function installTopbarUpdate() {
     if (installingOta) return;
     installingOta = true;
+    updateInstallError = '';
+    updateDownloadPct = null;
     try {
       const { check } = await import('@tauri-apps/plugin-updater');
       const { relaunch } = await import('@tauri-apps/plugin-process');
       const upd = await check();
       if (upd) {
-        await upd.downloadAndInstall();
+        try {
+          localStorage.setItem(
+            'flowly_pending_changelog',
+            JSON.stringify({
+              version: upd.version,
+              notes: upd.body?.trim() ?? '',
+              date: upd.date ?? null,
+            })
+          );
+        } catch {
+          // ignore
+        }
+        let totalBytes = 0;
+        let downloadedBytes = 0;
+        await upd.downloadAndInstall((event) => {
+          if (event.event === 'Started') {
+            totalBytes = event.data.contentLength ?? 0;
+            downloadedBytes = 0;
+            updateDownloadPct = totalBytes > 0 ? 0 : null;
+          } else if (event.event === 'Progress') {
+            downloadedBytes += event.data.chunkLength;
+            if (totalBytes > 0) {
+              updateDownloadPct = Math.min(100, Math.round((downloadedBytes / totalBytes) * 100));
+            }
+          } else if (event.event === 'Finished') {
+            updateDownloadPct = 100;
+          }
+        });
         await relaunch();
+      } else {
+        installingOta = false;
+        showUpdateModal = false;
       }
-    } catch {
+    } catch (e) {
+      updateInstallError = String(e);
       installingOta = false;
     }
   }
@@ -225,8 +278,8 @@
     return Math.pow(norm, 2.0);
   }
 
-  function setMusicDucking(ducked: boolean) {
-    const targetVol = (ducked ? 0.58 : 1.0) * toAudioVolume(player.volume);
+  function setMusicDucking(ducked: boolean, factor = 0.58) {
+    const targetVol = (ducked ? factor : 1.0) * toAudioVolume(player.volume);
     const cur = getActiveAudio();
     if (cur) cur.volume = Math.max(0, Math.min(1, targetVol));
   }
@@ -313,16 +366,30 @@
     }
   }
 
+  let effectsSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
   async function saveEffects(next: AudioEffectsConfig) {
     effects = next;
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem('flowly_effects', JSON.stringify(next));
-    }
-    effects = await api.updateAudioEffects(next);
+    audioEngine.applyEffects(next);
+    if (effectsSaveTimer) clearTimeout(effectsSaveTimer);
+    effectsSaveTimer = setTimeout(async () => {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem('flowly_effects', JSON.stringify(next));
+      }
+      try {
+        await api.updateAudioEffects(next);
+      } catch {
+        // ignore transient ipc errors during rapid drag
+      }
+    }, 150);
   }
 
   function effectiveCrossfadeSec(nextTrack?: Track | null): number {
     if (!mixConfig.enabled) return 0;
+    if (waveActive) {
+      // В «Моей волне» без Auto-DJ — короткий простой кроссфейд
+      return mixConfig.mode === 'manual' ? Math.min(5, Math.max(2, mixConfig.durationSec)) : 3;
+    }
     const base = mixConfig.mode === 'auto' ? 6 : mixConfig.durationSec;
     if (mixConfig.mode === 'auto' && player.current_track && nextTrack) {
       return getHarmonicCrossfadeSec(player.current_track, nextTrack, base, true);
@@ -333,7 +400,7 @@
     (() => {
       const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('flowly_layout_style') : null;
       if (raw === 'studio-split') return 'tv-mode';
-      return (raw as LayoutStyle | null) || 'wave-dock';
+      return (raw as LayoutStyle | null) || 'modern-analog';
     })()
   );
   let bgMode = $state<BackgroundMode>(
@@ -369,9 +436,9 @@
   });
 
   const layoutOptions: { id: LayoutStyle; label: string; desc: string }[] = [
-    { id: 'wave-dock', label: 'Wave Dock', desc: 'Классическая сцена с нижней полкой треков' },
-    { id: 'modern-analog', label: 'Modern Analog', desc: 'Чистая 3-колоночная сцена без полки' },
-    { id: 'tv-mode', label: 'TV Mode', desc: 'Эстетичный кино-режим для монитора и ТВ' },
+    { id: 'modern-analog', label: 'Студия', desc: 'Чистая 3-колоночная сцена без лишних панелей' },
+    { id: 'wave-dock', label: 'Витрина', desc: 'Классический экран с нижней полкой треков' },
+    { id: 'tv-mode', label: 'Кинозал', desc: 'Широкоформатный режим для монитора и ТВ' },
   ];
 
   function selectLayoutStyle(style: LayoutStyle) {
@@ -447,6 +514,7 @@
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('flowly_ram_saver', next ? 'true' : 'false');
     }
+    api.setTrackCacheEnabled(!next);
     if (next) {
       const inactive = activeDeck === 'A' ? audioB : audioA;
       if (inactive && inactive.paused) {
@@ -614,6 +682,9 @@
       : palette.primary || player.current_track?.accentColor || '#ff3b5c'
   );
   const authStatuses = $derived(sources.map((s) => s.auth));
+  const anyEnabledServiceConnected = $derived(
+    sources.some((s) => enabledSources.includes(s.source) && s.auth.connected),
+  );
   const localPlaylists = $derived(playlists.filter((p) => p.isLocal));
 
   let cloudHydrating = false;
@@ -703,6 +774,34 @@
     }, 2000);
   });
 
+  $effect(() => {
+    const tr = player.current_track;
+    const playing = player.is_playing;
+    if (!tr) return;
+    api.updateSmtcState({
+      title: tr.title,
+      artist: tr.artist,
+      album: tr.album || 'Flowly',
+      coverUrl: tr.artwork?.startsWith('http') ? tr.artwork : null,
+      durationSec: tr.duration || 0,
+      playing,
+      positionSec: player.position_sec || 0,
+    });
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: tr.title,
+          artist: tr.artist,
+          album: tr.album || 'Flowly',
+          artwork: tr.artwork ? [{ src: tr.artwork, sizes: '512x512', type: 'image/jpeg' }] : [],
+        });
+        navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
+      } catch {
+        // ignore
+      }
+    }
+  });
+
   onMount(async () => {
     if (api.isTauri()) {
       getCurrentWindow().show().catch(() => {});
@@ -731,6 +830,36 @@
       if (splash) {
         splash.classList.add('hide');
         setTimeout(() => splash.remove(), 420);
+      }
+    }
+
+    api.setTrackCacheEnabled(!ramSaverEnabled);
+
+    if (api.isTauri()) {
+      void listen('media:toggle', () => {
+        handleToggle();
+      });
+      void listen('media:play', () => {
+        if (!player.is_playing) handleToggle();
+      });
+      void listen('media:pause', () => {
+        if (player.is_playing) handleToggle();
+      });
+      void listen('media:next', () => {
+        handleNext();
+      });
+      void listen('media:prev', () => {
+        handlePrev();
+      });
+    }
+    if (typeof navigator !== 'undefined' && 'mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.setActionHandler('play', () => { if (!player.is_playing) handleToggle(); });
+        navigator.mediaSession.setActionHandler('pause', () => { if (player.is_playing) handleToggle(); });
+        navigator.mediaSession.setActionHandler('nexttrack', () => { handleNext(); });
+        navigator.mediaSession.setActionHandler('previoustrack', () => { handlePrev(); });
+      } catch {
+        // ignore
       }
     }
 
@@ -764,17 +893,79 @@
       localTracks = t;
     }).catch(() => {});
 
+    // Восстановление выбранного устройства вывода звука
+    try {
+      const savedSink = typeof localStorage !== 'undefined' ? localStorage.getItem('flowly_audio_output_id') : null;
+      if (savedSink && savedSink !== 'default') {
+        void audioEngine.setOutputDevice(savedSink);
+      }
+    } catch {
+      // ignore
+    }
+
+    // Проверка, обновилось ли приложение с прошлого запуска
+    (async () => {
+      try {
+        const { getVersion } = await import('@tauri-apps/api/app');
+        const currentVersion = await getVersion().catch(() => '0.1.1');
+        whatsNewVersion = currentVersion;
+
+        if (typeof localStorage !== 'undefined') {
+          const lastSeen = localStorage.getItem('flowly_last_seen_version');
+          const pendingRaw = localStorage.getItem('flowly_pending_changelog');
+
+          if (pendingRaw) {
+            try {
+              const parsed = JSON.parse(pendingRaw);
+              if (parsed && parsed.version === currentVersion) {
+                whatsNewNotes = parsed.notes ?? '';
+                whatsNewDate = parsed.date ?? null;
+              }
+            } catch {
+              // ignore
+            }
+            localStorage.removeItem('flowly_pending_changelog');
+          }
+
+          if (lastSeen && lastSeen !== currentVersion) {
+            if (!whatsNewNotes) {
+              try {
+                const resp = await fetch(
+                  `https://api.github.com/repos/whoisquickyyy/flowly/releases/tags/v${currentVersion}`,
+                );
+                if (resp.ok) {
+                  const rel = await resp.json();
+                  if (typeof rel?.body === 'string') whatsNewNotes = rel.body.trim();
+                  if (typeof rel?.published_at === 'string') whatsNewDate = rel.published_at;
+                }
+              } catch {
+                // ignore offline
+              }
+            }
+            showWhatsNewModal = true;
+          }
+
+          localStorage.setItem('flowly_last_seen_version', currentVersion);
+        }
+      } catch {
+        // ignore non-tauri
+      }
+    })();
+
     const otaTimer = setTimeout(async () => {
       try {
         const { check } = await import('@tauri-apps/plugin-updater');
         const upd = await check();
         if (upd) {
           availableUpdateVersion = upd.version;
+          availableUpdateNotes = upd.body?.trim() ?? '';
+          availableUpdateDate = upd.date ?? null;
+          showUpdateModal = true;
         }
       } catch {
         // ignore offline / non-tauri
       }
-    }, 4500);
+    }, 2000);
     void otaTimer;
 
     // Детектор активности (опрос раз в 2 сек с debounce 2 тика = ~4 сек)
@@ -899,9 +1090,9 @@
         let deferredOutgoingStop = false;
         if (shouldCrossfade) {
           cleanupSec = xfTargetSec;
-          const chosenPreset = pickDjTransitionPreset();
-          audioEngine.crossfadeTo(targetDeck, xfTargetSec, chosenPreset, mixConfig.eqSweep);
-          if (outgoingTrackForMix && player.current_track) {
+          const chosenPreset = waveActive ? 'fade' : pickDjTransitionPreset();
+          audioEngine.crossfadeTo(targetDeck, xfTargetSec, chosenPreset, waveActive ? false : mixConfig.eqSweep);
+          if (!waveActive && outgoingTrackForMix && player.current_track) {
             const bpmOut = getTrackAudioFeatures(outgoingTrackForMix).bpm;
             const bpmIn = getTrackAudioFeatures(player.current_track).bpm;
             audioEngine.beatmatchTransition(incoming, bpmOut, bpmIn, xfTargetSec);
@@ -1005,6 +1196,14 @@
   }
 
   async function handlePlayTrack(track: Track, queue?: Track[]) {
+    if (jamRoom.connected) {
+      if (!jamRoom.isHost) {
+        jamRoom.statusText = 'В Jam-комнате треками управляет хост';
+        return;
+      }
+      jamPlayTrack(track);
+      return;
+    }
     const token = ++switchToken;
     await audioEngine.resume();
     const mStyle = mixConfig.manualTransition ?? 'filter-cut';
@@ -1057,6 +1256,9 @@
   }
 
   async function handleDislikeTrack(track: Track) {
+    if (waveActive) {
+      api.reportWaveFeedback(track, false);
+    }
     const token = ++switchToken;
     const nextLiked = new Set(likedIds);
     nextLiked.delete(track.id);
@@ -1076,14 +1278,32 @@
   }
 
   async function handleToggle() {
+    if (jamRoom.connected) {
+      if (!jamRoom.isHost) {
+        jamRoom.statusText = 'Паузой в Jam-комнате управляет хост';
+        return;
+      }
+      jamTogglePlay();
+      return;
+    }
     await audioEngine.resume();
     applyStatePreservingPosition(await api.togglePlayback());
   }
 
   async function handleNext() {
-    if (jamRoom.connected && jamRoom.isHost && jamRoom.queue.length > 0) {
-      jamAdvanceNext();
+    if (jamRoom.connected) {
+      if (jamRoom.isHost && jamRoom.queue.length > 0) {
+        jamAdvanceNext();
+      } else if (!jamRoom.isHost) {
+        jamSkip();
+      }
       return;
+    }
+    if (waveActive && player.current_track) {
+      const cur = getActiveAudio();
+      const share = cur && cur.duration > 0 ? cur.currentTime / cur.duration : 0;
+      const positive = isNaturalEndTransition || share >= 0.7;
+      api.reportWaveFeedback(player.current_track, positive);
     }
     const token = ++switchToken;
     const mStyle = mixConfig.manualTransition ?? 'filter-cut';
@@ -1092,9 +1312,13 @@
       audioEngine.prepareManualSkipDuck(activeDeck, mStyle);
     }
     try {
+      const prevLen = player.queue.length;
       const next = await api.nextTrack();
       if (token !== switchToken) return;
       player = next;
+      if (!waveActive && player.repeat === 'off' && next.queue.length > prevLen) {
+        waveActive = true;
+      }
       if (waveActive) {
         waveTracks = next.queue;
       }
@@ -1124,6 +1348,77 @@
   let jamPhxHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let jamPhxRef = 1;
   let jamMemberMap = new Map<string, JamMember>();
+  let jamPlayedKeys = new Set<string>();
+  let jamRefillBusy = false;
+  let jamLastAlignMs = 0;
+  let jamLastHostHeartbeatMs = 0;
+
+  async function refillJamQueueIfNeeded() {
+    if (!jamRoom.connected || !jamRoom.isHost || jamRefillBusy) return;
+    const curIdx = jamRoom.currentTrack
+      ? jamRoom.queue.findIndex((q) => q.track.id === jamRoom.currentTrack?.id)
+      : -1;
+    const remaining = curIdx >= 0 ? jamRoom.queue.length - 1 - curIdx : jamRoom.queue.length;
+    if (remaining > 8) return;
+
+    jamRefillBusy = true;
+    try {
+      const seeds = new Set<string>();
+      if (jamRoom.currentTrack?.artist) {
+        seeds.add(jamRoom.currentTrack.artist.split(/[,&]/)[0].trim());
+      }
+      for (const m of jamRoom.members) {
+        const sample = m.tracks[Math.floor(Math.random() * Math.max(1, m.tracks.length))];
+        if (sample?.artist) seeds.add(sample.artist.split(/[,&]/)[0].trim());
+      }
+      const existingKeys = new Set(jamRoom.queue.map((q) => trackMatchKey(q.track)));
+      const fresh: BlendedTrack[] = [];
+      for (const seed of [...seeds].slice(0, 3)) {
+        if (!seed) continue;
+        const grouped = await api.searchGrouped(seed, null).catch(() => []);
+        for (const g of grouped) {
+          for (const tr of g.tracks) {
+            const k = trackMatchKey(tr);
+            if (existingKeys.has(k) || jamPlayedKeys.has(k)) continue;
+            existingKeys.add(k);
+            fresh.push({
+              track: tr,
+              reason: `Бесконечный Jam · ${seed}`,
+              matchCount: 1,
+              score: 50 + Math.random() * 20,
+            });
+          }
+        }
+      }
+      if (fresh.length > 0) {
+        const picked = fresh.sort(() => Math.random() - 0.5).slice(0, 32);
+        // Оставляем небольшой хвост истории, но не даём очереди расти бесконечно
+        const baseQueue = curIdx > 15 ? jamRoom.queue.slice(curIdx - 5) : jamRoom.queue;
+        jamRoom.queue = [...baseQueue, ...picked];
+        hostBroadcastState();
+      }
+    } finally {
+      jamRefillBusy = false;
+    }
+  }
+
+  function jamSendChat(text: string) {
+    const clean = text.trim();
+    if (!clean || !jamRoom.connected) return;
+    const myName =
+      jamMemberMap.get(jamRoom.myId)?.name ||
+      sbProfile?.username ||
+      'Участник';
+    const msg: JamChatMessage = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      senderId: jamRoom.myId,
+      senderName: myName,
+      text: clean,
+      ts: Date.now(),
+    };
+    jamRoom.chat = [...(jamRoom.chat ?? []).slice(-49), msg];
+    sendJamMsg({ type: 'chat', message: msg });
+  }
 
   function sendJamMsg(msg: Record<string, unknown>) {
     if (!jamWs || jamWs.readyState !== WebSocket.OPEN) return;
@@ -1204,6 +1499,11 @@
       : -1;
     const nextItem = jamRoom.queue[(curIdx + 1) % jamRoom.queue.length];
     if (!nextItem) return;
+    if (jamRoom.currentTrack) {
+      jamPlayedKeys.add(trackMatchKey(jamRoom.currentTrack));
+    }
+    jamPlayedKeys.add(trackMatchKey(nextItem.track));
+    if (jamPlayedKeys.size > 400) jamPlayedKeys.clear();
     jamRoom.currentTrack = nextItem.track;
     jamRoom.isPlaying = true;
     jamRoom.positionSec = 0;
@@ -1216,6 +1516,7 @@
       positionSec: 0,
       sentAtMs: Date.now(),
     });
+    void refillJamQueueIfNeeded();
   }
 
   function openJamSocket(
@@ -1374,7 +1675,11 @@
           }
         } else if (msg.type === 'request_rebuild' && jamRoom.isHost) {
           jamRebuildBlend();
+        } else if (msg.type === 'chat' && msg.message) {
+          const chatMsg = msg.message as JamChatMessage;
+          jamRoom.chat = [...(jamRoom.chat ?? []).slice(-49), chatMsg];
         } else if (msg.type === 'heartbeat' && !jamRoom.isHost) {
+          jamLastHostHeartbeatMs = Date.now();
           if (msg.trackId && jamRoom.currentTrack?.id === msg.trackId) {
             if (player.is_playing !== Boolean(msg.isPlaying)) {
               jamRoom.isPlaying = Boolean(msg.isPlaying);
@@ -1383,10 +1688,17 @@
             const expected =
               (msg.positionSec ?? 0) +
               (msg.isPlaying ? Math.max(0, (Date.now() - (msg.sentAtMs ?? Date.now())) / 1000) : 0);
-            if (Math.abs(player.position_sec - expected) > 2.2) {
-              const cur = getActiveAudio();
-              if (cur) cur.currentTime = expected;
-              player.position_sec = Math.floor(expected);
+            const drift = Math.abs(player.position_sec - expected);
+            if (drift > 0.45) {
+              jamRoom.syncStatus = 'catching-up';
+              if (Date.now() - jamLastAlignMs > 2500) {
+                jamLastAlignMs = Date.now();
+                const cur = getActiveAudio();
+                if (cur) cur.currentTime = expected;
+                player.position_sec = Math.floor(expected);
+              }
+            } else {
+              jamRoom.syncStatus = 'synced';
             }
           }
         }
@@ -1484,6 +1796,10 @@
   }
 
   async function cyclePlaybackMode() {
+    if (waveActive) {
+      applyStatePreservingPosition(await api.cycleRepeat());
+      return;
+    }
     if (!player.shuffle && player.repeat === 'off') {
       applyStatePreservingPosition(await api.cycleRepeat());
     } else if (!player.shuffle && player.repeat === 'all') {
@@ -1508,6 +1824,10 @@
   });
 
   async function handlePrev() {
+    if (jamRoom.connected && !jamRoom.isHost) {
+      jamRoom.statusText = 'В Jam-комнате переключением управляет хост';
+      return;
+    }
     const token = ++switchToken;
     const mStyle = mixConfig.manualTransition ?? 'filter-cut';
     if (player.is_playing && mStyle !== 'off') {
@@ -1553,7 +1873,10 @@
 
   function handleDeckTimeUpdate(deck: 'A' | 'B', el: HTMLAudioElement) {
     if (deck !== activeDeck || Number.isNaN(el.currentTime)) return;
-    player.position_sec = Math.floor(el.currentTime);
+    const nextSec = Math.floor(el.currentTime);
+    if (player.position_sec !== nextSec) {
+      player.position_sec = nextSec;
+    }
 
     // Трекинг честных прослушиваний для вкладки «Итоги»
     const curTrack = player.current_track;
@@ -1607,6 +1930,7 @@
 
     // Auto-Mix / Crossfade за N секунд до конца трека
     const xf = effectiveCrossfadeSec();
+    const expectedDur = player.current_track?.duration ?? 0;
     if (
       xf > 0 &&
       player.is_playing &&
@@ -1614,7 +1938,7 @@
       trackId &&
       crossfadeTriggeredForId !== trackId &&
       Number.isFinite(el.duration) &&
-      el.duration > xf + 2 &&
+      el.duration >= Math.max(xf + 4, expectedDur * 0.5) &&
       el.duration - el.currentTime <= xf
     ) {
       crossfadeTriggeredForId = trackId;
@@ -1623,12 +1947,26 @@
     }
   }
 
+  let seekSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
   async function handleSeekVal(val: number) {
     const cur = getActiveAudio();
     if (cur && player.current_track?.playbackUrl) {
       cur.currentTime = val;
     }
-    player = await api.seekTo(val);
+    const sec = Math.max(0, Math.floor(val));
+    if (player.position_sec !== sec) {
+      player.position_sec = sec;
+    }
+    if (seekSaveTimer) clearTimeout(seekSaveTimer);
+    seekSaveTimer = setTimeout(async () => {
+      try {
+        const next = await api.seekTo(val);
+        player.position_sec = next.position_sec;
+      } catch {
+        // ignore transient ipc errors during rapid drag
+      }
+    }, 120);
   }
 
   let volumeSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1727,6 +2065,13 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      const input = document.querySelector<HTMLInputElement>('.top-search input');
+      input?.focus();
+      input?.select();
+      return;
+    }
     const tag = (e.target as HTMLElement | null)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
     if (e.code === 'Space') {
@@ -1777,7 +2122,7 @@
     <div class="bg-layer bg-aurora" class:playing={player.is_playing}></div>
   {:else if bgMode === 'spotlight'}
     <div class="bg-layer bg-spotlight"></div>
-  {:else if bgMode !== 'graphite' && !ecoMode && !ramSaverEnabled}
+  {:else if bgMode !== 'graphite' && !ecoMode && !ramSaverEnabled && (bgMode !== 'dynamic-lyrics' || (!activeArtist && activeTab === 'details'))}
     <ReactiveBackground
       mode={bgMode}
       track={player.current_track}
@@ -1806,9 +2151,8 @@
         <button
           type="button"
           class="ota-pill"
-          disabled={installingOta}
-          onclick={installTopbarUpdate}
-          title="Установить обновление и перезапустить"
+          onclick={() => (showUpdateModal = true)}
+          title="Посмотреть список изменений и установить обновление"
         >
           {installingOta ? 'Обновление...' : `Обновить до v${availableUpdateVersion}`}
         </button>
@@ -1998,8 +2342,12 @@
       <button
         type="button"
         class="rail-btn"
-        onclick={() => (showAccountModal = true)}
-        title={sbProfile ? `${sbProfile.username}#${sbProfile.tag}` : 'Аккаунт Flowly'}
+        class:active={!activeArtist && activeTab === 'settings' && settingsInitialTab === 'account'}
+        onclick={() => {
+          settingsInitialTab = 'account';
+          goTab('settings');
+        }}
+        title={sbProfile ? `${sbProfile.username}#${sbProfile.tag}` : 'Профиль Flowly'}
       >
         {#if sbProfile?.avatar_url}
           <img class="rail-avatar" src={sbProfile.avatar_url} alt={sbProfile.username} />
@@ -2013,15 +2361,37 @@
       <button
         type="button"
         class="rail-btn"
-        class:active={!activeArtist && activeTab === 'settings'}
-        onclick={() => goTab('settings')}
-        title="Настройки и аккаунты"
+        class:active={!activeArtist && activeTab === 'settings' && settingsInitialTab !== 'account'}
+        onclick={() => {
+          if (settingsInitialTab === 'account') settingsInitialTab = 'services';
+          goTab('settings');
+        }}
+        title="Настройки и сервисы"
       >
         <Settings size={18} />
       </button>
     </nav>
 
-    <main class="main-area" bind:this={mainAreaEl}>
+    <main class="main-area" class:has-floating-bar={activeTab !== 'details'} bind:this={mainAreaEl}>
+      {#if sources.length > 0 && !anyEnabledServiceConnected && activeTab !== 'settings'}
+        <div class="global-unauth-banner">
+          <div class="global-unauth-copy">
+            <strong>Вы не авторизованы</strong>
+            <span>Подключите Яндекс Музыку или SoundCloud, чтобы слушать треки, искать музыку и запускать «Мою волну».</span>
+          </div>
+          <button
+            type="button"
+            class="global-unauth-btn"
+            onclick={() => {
+              settingsInitialTab = 'services';
+              goTab('settings');
+            }}
+          >
+            Войти в сервис
+          </button>
+        </div>
+      {/if}
+
       {#if activeArtist}
         <ArtistView
           artistName={activeArtist}
@@ -2043,10 +2413,15 @@
           {localPlaylists}
           {likedIds}
           {enabledSources}
+          {authStatuses}
           onPlayTrack={handlePlayTrack}
           onAddToPlaylist={handleAddToPlaylist}
           onToggleLike={handleToggleLike}
           onOpenArtist={handleOpenArtist}
+          onOpenAuth={() => {
+            settingsInitialTab = 'services';
+            goTab('settings');
+          }}
         />
       </div>
 
@@ -2054,8 +2429,16 @@
         <SearchView
           initialQuery={quickSearch}
           {enabledSources}
+          {authStatuses}
+          {likedIds}
           localLibrary={[...likedTracks, ...recentTracks, ...localTracks]}
           onPlayTrack={handlePlayTrack}
+          onToggleLike={handleToggleLike}
+          onOpenArtist={handleOpenArtist}
+          onOpenAuth={() => {
+            settingsInitialTab = 'services';
+            goTab('settings');
+          }}
         />
       </div>
 
@@ -2102,6 +2485,8 @@
           onToggleEq={() => saveEffects({ ...effects, eq_enabled: !effects.eq_enabled })}
           onOpenEqTab={() => goTab('equalizer')}
           onGoSettings={() => goTab('settings')}
+          {audioProxyPort}
+          onDuckMainAudio={(duck) => setMusicDucking(duck, 0.15)}
         />
       {:else if !activeArtist && activeTab === 'playlists'}
         <PlaylistsView
@@ -2111,69 +2496,97 @@
           onRemoveTrack={handleRemoveFromPlaylist}
         />
       {:else if !activeArtist && activeTab === 'recap'}
-        <RecapView
-          currentTrackId={player.current_track?.id ?? null}
-          {likedIds}
-          onPlayTrack={handlePlayTrack}
-          onToggleLike={handleToggleLike}
-          onOpenArtist={handleOpenArtist}
-        />
+        {#await import('./lib/components/RecapView.svelte') then { default: RecapView }}
+          <RecapView
+            currentTrackId={player.current_track?.id ?? null}
+            {likedIds}
+            onPlayTrack={handlePlayTrack}
+            onToggleLike={handleToggleLike}
+            onOpenArtist={handleOpenArtist}
+          />
+        {/await}
       {:else if !activeArtist && activeTab === 'room'}
-        <RoomView
-          room={jamRoom}
-          {likedTracks}
-          playlists={playlists}
-          defaultName={sbProfile?.username || sources.find((s) => s.auth.connected)?.auth.account_name || ''}
-          onCreateRoom={createJamRoom}
-          onJoinRoom={joinJamRoom}
-          onLeaveRoom={leaveJamRoom}
-          onUpdateTaste={updateJamTaste}
-          onPlayTrack={jamPlayTrack}
-          onTogglePlay={jamTogglePlay}
-          onSkip={jamSkip}
-          onRebuildBlend={jamRebuildBlend}
-        />
+        {#await import('./lib/components/RoomView.svelte') then { default: RoomView }}
+          <RoomView
+            room={jamRoom}
+            {likedTracks}
+            playlists={playlists}
+            defaultName={sbProfile?.username || sources.find((s) => s.auth.connected)?.auth.account_name || ''}
+            onCreateRoom={createJamRoom}
+            onJoinRoom={joinJamRoom}
+            onLeaveRoom={leaveJamRoom}
+            onUpdateTaste={updateJamTaste}
+            onPlayTrack={jamPlayTrack}
+            onTogglePlay={jamTogglePlay}
+            onSkip={jamSkip}
+            onRebuildBlend={jamRebuildBlend}
+            onSendChat={jamSendChat}
+          />
+        {/await}
       {:else if !activeArtist && activeTab === 'equalizer'}
         <div class="eq-wrap">
-          <EqualizerPanel
-            {effects}
-            mix={mixConfig}
-            shuffleMode={player.shuffle_mode ?? 'classic'}
-            isPlaying={player.is_playing}
-            {accentColor}
-            onChange={saveEffects}
-            onMixChange={updateMixConfig}
-            onShuffleModeChange={async (mode) => applyStatePreservingPosition(await api.setShuffleMode(mode))}
-          />
+          {#await import('./lib/components/EqualizerPanel.svelte') then { default: EqualizerPanel }}
+            <EqualizerPanel
+              {effects}
+              mix={mixConfig}
+              shuffleMode={player.shuffle_mode ?? 'classic'}
+              isPlaying={player.is_playing}
+              {accentColor}
+              onChange={saveEffects}
+              onMixChange={updateMixConfig}
+              onShuffleModeChange={async (mode) => applyStatePreservingPosition(await api.setShuffleMode(mode))}
+            />
+          {/await}
         </div>
       {:else if !activeArtist && activeTab === 'settings'}
-        <SettingsView
-          {sources}
-          {enabledSources}
-          onEnabledSourcesChange={updateEnabledSources}
-          onSourcesChanged={(next) => {
-            sources = next;
-          }}
-          onOpenGuide={() => (showOnboarding = true)}
-          atmosphereSummary={atmosphere ? `${atmosphere.city}: ${atmosphere.summary}` : ''}
-          onDynamicThemeChange={(en, city) => refreshAtmosphere(en, city)}
-          {activityConfig}
-          onActivityConfigChange={updateActivityConfig}
-          {playlists}
-          {currentActivityLabel}
-          {activeCssThemeId}
-          {customThemeCss}
-          onApplyCssTheme={applyCssTheme}
-          radio={radioConfig}
-          {radioStatus}
-          onRadioChange={updateRadioConfig}
-          onTestRadio={() => {
-            const tr = player.current_track ?? likedTracks[0];
-            if (tr) triggerRadioHost(tr, true);
-          }}
-          {ramSaverEnabled}
-          onRamSaverChange={updateRamSaver}
-        />
+        {#await import('./lib/components/SettingsView.svelte') then { default: SettingsView }}
+          <SettingsView
+            {sources}
+            {enabledSources}
+            onEnabledSourcesChange={updateEnabledSources}
+            onSourcesChanged={(next) => {
+              sources = next;
+            }}
+            onOpenGuide={() => (showOnboarding = true)}
+            onOpenWhatsNew={() => (showWhatsNewModal = true)}
+            atmosphereSummary={atmosphere ? `${atmosphere.city}: ${atmosphere.summary}` : ''}
+            onDynamicThemeChange={(en, city) => refreshAtmosphere(en, city)}
+            {activityConfig}
+            onActivityConfigChange={updateActivityConfig}
+            {playlists}
+            {currentActivityLabel}
+            {activeCssThemeId}
+            {customThemeCss}
+            onApplyCssTheme={applyCssTheme}
+            radio={radioConfig}
+            {radioStatus}
+            onRadioChange={updateRadioConfig}
+            onTestRadio={() => {
+              const tr = player.current_track ?? likedTracks[0];
+              if (tr) triggerRadioHost(tr, true);
+            }}
+            {ramSaverEnabled}
+            onRamSaverChange={updateRamSaver}
+            initialTab={settingsInitialTab}
+            mix={mixConfig}
+            onMixChange={updateMixConfig}
+            {sbSession}
+            {sbProfile}
+            onAuthChange={async (s, p) => {
+              sbSession = s;
+              sbProfile = p;
+              if (s) {
+                const cloud = await sb.loadCloudSettings(s).catch(() => null);
+                await applyCloudSettings(cloud);
+              }
+            }}
+            onSyncCloudSettings={async () => {
+              if (sbSession) {
+                await sb.saveCloudSettings(sbSession, buildCloudSettingsPayload());
+              }
+            }}
+          />
+        {/await}
       {/if}
     </main>
   </div>
@@ -2198,50 +2611,168 @@
     }}
   />
 
-  <OnboardingModal
-    open={showOnboarding}
-    onClose={() => (showOnboarding = false)}
-    onGoSettings={() => goTab('settings')}
-  />
+  {#if showOnboarding}
+    {#await import('./lib/components/OnboardingModal.svelte') then { default: OnboardingModal }}
+      <OnboardingModal
+        open={showOnboarding}
+        onClose={() => (showOnboarding = false)}
+        onGoSettings={() => goTab('settings')}
+      />
+    {/await}
+  {/if}
 
-  <!-- Компактная нижняя панель (скрыта на главном экране Details, чтобы не дублировать контролы) -->
+  {#if showWhatsNewModal}
+    {#await import('./lib/components/WhatsNewModal.svelte') then { default: WhatsNewModal }}
+      <WhatsNewModal
+        open={showWhatsNewModal}
+        version={whatsNewVersion}
+        notes={whatsNewNotes}
+        date={whatsNewDate}
+        onClose={() => (showWhatsNewModal = false)}
+      />
+    {/await}
+  {/if}
+
+  <RadixDialog
+    open={showUpdateModal && Boolean(availableUpdateVersion)}
+    onOpenChange={(v) => {
+      if (!v && !installingOta) showUpdateModal = false;
+    }}
+    maxWidth="470px"
+  >
+    <div class="update-modal">
+    <div class="update-head">
+      <div class="update-head-left">
+        <div class="update-icon-badge">
+          <Sparkles size={18} />
+        </div>
+        <div>
+          <div class="update-kicker">Доступно обновление Flowly</div>
+          <h3>Версия v{availableUpdateVersion}</h3>
+          {#if availableUpdateDate}
+            <span class="update-date">
+              {new Date(availableUpdateDate).toLocaleDateString('ru-RU', {
+                day: 'numeric',
+                month: 'long',
+                year: 'numeric',
+              })}
+            </span>
+          {/if}
+        </div>
+      </div>
+      <button
+        type="button"
+        class="about-close"
+        disabled={installingOta}
+        onclick={() => (showUpdateModal = false)}
+        aria-label="Закрыть"
+      >
+        <X size={16} />
+      </button>
+    </div>
+
+    <div class="update-changelog-box">
+      <div class="update-changelog-title">Список изменений</div>
+      <div class="update-changelog-list">
+        {#if availableUpdateNotes}
+          {#each availableUpdateNotes.split(/\r?\n/).filter((l) => l.trim().length > 0) as line}
+            {@const clean = line.trim().replace(/^[-*•]\s+/, '')}
+            <div class="update-changelog-item">
+              <span class="update-dot"></span>
+              <span>{clean}</span>
+            </div>
+          {/each}
+        {:else}
+          <div class="update-changelog-item">
+            <span class="update-dot"></span>
+            <span>Улучшения стабильности, производительности и исправления ошибок.</span>
+          </div>
+        {/if}
+      </div>
+    </div>
+
+    {#if installingOta}
+      <div class="update-progress-wrap">
+        <div class="update-progress-row">
+          <span>Загрузка и установка обновления...</span>
+          <span>{updateDownloadPct !== null ? `${updateDownloadPct}%` : '...'}</span>
+        </div>
+        <div class="update-progress-track">
+          <div
+            class="update-progress-fill"
+            class:indeterminate={updateDownloadPct === null}
+            style={updateDownloadPct !== null ? `width: ${updateDownloadPct}%` : ''}
+          ></div>
+        </div>
+      </div>
+    {/if}
+
+    {#if updateInstallError}
+      <div class="update-err">{updateInstallError}</div>
+    {/if}
+
+    <div class="update-actions">
+      <button
+        type="button"
+        class="update-later-btn"
+        disabled={installingOta}
+        onclick={() => (showUpdateModal = false)}
+      >
+        Позже
+      </button>
+      <button
+        type="button"
+        class="update-now-btn"
+        disabled={installingOta}
+        onclick={installTopbarUpdate}
+      >
+        {#if installingOta}
+          <RefreshCw size={14} class="spin" />
+          <span>Установка...</span>
+        {:else}
+          <Download size={14} />
+          <span>Обновить и перезапустить</span>
+        {/if}
+      </button>
+    </div>
+    </div>
+  </RadixDialog>
+
+  <!-- Парящий мини-плеер (скрыт на главном экране Details, чтобы не дублировать контролы) -->
   {#if activeTab !== 'details'}
     <footer class="player-bar">
-    <button type="button" class="np-left" onclick={() => (activeTab = 'details')}>
-      {#if player.current_track}
-        <img src={player.current_track.artwork} alt={player.current_track.title} />
-        <div class="np-text">
-          <div class="np-title">{player.current_track.title}</div>
-          <div class="np-sub">
-            <span>{player.current_track.artist}</span>
-            <SourceBadge source={player.current_track.source} showLabel={false} />
-          </div>
-        </div>
-      {:else}
-        <div class="np-empty">Не выбрано</div>
-      {/if}
-    </button>
+      <div class="pb-top">
+        <button type="button" class="np-left" onclick={() => (activeTab = 'details')}>
+          {#if player.current_track}
+            <img src={player.current_track.artwork} alt={player.current_track.title} />
+            <div class="np-text">
+              <div class="np-title"><MarqueeText text={player.current_track.title} paused={ramSaverEnabled} /></div>
+              <div class="np-sub">
+                <span>{player.current_track.artist}</span>
+                <SourceBadge source={player.current_track.source} showLabel={false} />
+              </div>
+            </div>
+          {:else}
+            <div class="np-empty">Не выбрано</div>
+          {/if}
+        </button>
 
-    <div class="np-center">
-      <div class="np-buttons">
-        <div class="np-side"></div>
         <div class="np-core">
-          <button class="c-btn" onclick={handlePrev} aria-label="Previous">
-            <SkipBack size={16} />
-          </button>
-          <button class="play-btn" onclick={handleToggle} aria-label="Play / Pause">
-            {#if player.is_playing}
-              <Pause size={15} fill="currentColor" />
-            {:else}
-              <Play size={15} fill="currentColor" />
-            {/if}
-          </button>
-          <button class="c-btn" onclick={handleNext} aria-label="Next">
-            <SkipForward size={16} />
-          </button>
-        </div>
-        <div class="np-side right">
+          {#if player.current_track}
+            {@const isLiked = likedIds.has(player.current_track.id)}
+            <button
+              type="button"
+              class="c-btn"
+              class:liked-btn={isLiked}
+              onclick={() => player.current_track && handleToggleLike(player.current_track)}
+              aria-label="Нравится"
+              title="Нравится"
+            >
+              <Heart size={15} fill={isLiked ? 'currentColor' : 'none'} />
+            </button>
+          {/if}
           <button
+            type="button"
             class="c-btn"
             class:active={playbackModeInfo.active}
             onclick={cyclePlaybackMode}
@@ -2256,34 +2787,64 @@
               <Repeat size={14} />
             {/if}
           </button>
+          <button type="button" class="c-btn" onclick={handlePrev} aria-label="Previous">
+            <SkipBack size={16} />
+          </button>
+          <button type="button" class="play-btn" onclick={handleToggle} aria-label="Play / Pause">
+            {#if player.is_playing}
+              <Pause size={15} fill="currentColor" />
+            {:else}
+              <Play size={15} fill="currentColor" />
+            {/if}
+          </button>
+          <button type="button" class="c-btn" onclick={handleNext} aria-label="Next">
+            <SkipForward size={16} />
+          </button>
+        </div>
+
+        <div class="np-right">
+          <button
+            type="button"
+            class="c-btn"
+            onclick={() => goTab('equalizer')}
+            title="Эквалайзер"
+            aria-label="Эквалайзер"
+          >
+            <Sliders size={14} />
+          </button>
+          <div class="vol-wrap">
+            {#if player.volume === 0}
+              <VolumeX size={15} />
+            {:else}
+              <Volume2 size={15} />
+            {/if}
+            <RadixSlider
+              value={player.volume}
+              min={0}
+              max={100}
+              step={1}
+              ariaLabel="Громкость"
+              onValueChange={handleVolumeVal}
+            />
+            <span class="vol-pct">{player.volume}%</span>
+          </div>
         </div>
       </div>
 
       <div class="seek-row">
         <span>{formatTime(player.position_sec)}</span>
-        <input
-          type="range"
-          min="0"
-          max={player.current_track?.duration ?? 100}
+        <RadixSlider
           value={player.position_sec}
-          oninput={(e) => handleSeekVal(Number((e.target as HTMLInputElement).value))}
+          min={0}
+          max={player.current_track?.duration ?? 100}
+          step={1}
           disabled={!player.current_track}
+          ariaLabel="Позиция трека"
+          onValueChange={handleSeekVal}
         />
         <span>{formatTime(player.current_track?.duration ?? 0)}</span>
       </div>
-    </div>
-
-    <div class="np-right">
-      <div class="vol-wrap">
-        {#if player.volume === 0}
-          <VolumeX size={15} />
-        {:else}
-          <Volume2 size={15} />
-        {/if}
-        <input type="range" min="0" max="100" value={player.volume} oninput={handleVolume} />
-      </div>
-    </div>
-  </footer>
+    </footer>
   {/if}
 </div>
 
@@ -2565,8 +3126,8 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 5px 14px;
-    border-radius: 999px;
+    padding: 6px 12px;
+    border-radius: 10px;
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
     color: var(--text-secondary);
@@ -2695,6 +3256,47 @@
     overflow-y: auto;
   }
 
+  .global-unauth-banner {
+    margin: 14px 28px 0;
+    padding: 12px 16px;
+    border-radius: var(--radius-md);
+    background: color-mix(in srgb, var(--accent, #6366f1) 12%, var(--bg-surface));
+    border: 1px solid color-mix(in srgb, var(--accent, #6366f1) 34%, transparent);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+  }
+
+  .global-unauth-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+
+  .global-unauth-copy strong {
+    font-size: 13.5px;
+    color: var(--text-primary);
+  }
+
+  .global-unauth-btn {
+    flex-shrink: 0;
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    border: none;
+    background: var(--accent, #6366f1);
+    color: #fff;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .global-unauth-btn:hover {
+    filter: brightness(1.08);
+  }
+
   .tab-keep {
     display: contents;
   }
@@ -2707,17 +3309,34 @@
     padding: 20px 28px;
   }
 
+  .main-area.has-floating-bar {
+    padding-bottom: 108px;
+  }
+
   .player-bar {
-    position: relative;
-    z-index: 10;
-    height: 64px;
-    padding: 0 18px;
-    border-top: 1px solid var(--border-subtle);
-    background: var(--bg-surface);
+    position: fixed;
+    left: calc(50% + 28px);
+    bottom: 16px;
+    transform: translateX(-50%);
+    z-index: 40;
+    width: min(860px, calc(100vw - 104px));
+    padding: 10px 16px 8px;
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    background: color-mix(in srgb, var(--bg-surface, #131318) 92%, #1a1b24);
+    box-shadow:
+      0 18px 48px rgba(0, 0, 0, 0.58),
+      0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .pb-top {
     display: grid;
-    grid-template-columns: 1fr 1.4fr 1fr;
+    grid-template-columns: 1fr auto 1fr;
     align-items: center;
-    gap: 16px;
+    gap: 14px;
   }
 
   .np-left {
@@ -2765,36 +3384,11 @@
     color: var(--text-muted);
   }
 
-  .np-center {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 3px;
-  }
-
-  .np-buttons {
-    display: grid;
-    grid-template-columns: 1fr auto 1fr;
-    align-items: center;
-    width: 100%;
-    max-width: 260px;
-    gap: 10px;
-  }
-
   .np-core {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 12px;
-  }
-
-  .np-side {
-    display: flex;
-    align-items: center;
-  }
-
-  .np-side.right {
-    justify-content: flex-start;
+    gap: 10px;
   }
 
   .c-btn {
@@ -2805,6 +3399,7 @@
     display: grid;
     place-items: center;
     padding: 4px;
+    transition: color 130ms ease, transform 120ms ease;
   }
 
   .c-btn:hover,
@@ -2812,9 +3407,13 @@
     color: var(--accent);
   }
 
+  .c-btn.liked-btn {
+    color: var(--accent);
+  }
+
   .play-btn {
-    width: 30px;
-    height: 30px;
+    width: 34px;
+    height: 34px;
     border-radius: 50%;
     border: none;
     background: var(--text-primary);
@@ -2822,29 +3421,32 @@
     display: grid;
     place-items: center;
     cursor: pointer;
+    transition: transform 120ms ease;
+  }
+
+  .play-btn:hover {
+    transform: scale(1.06);
   }
 
   .seek-row {
     width: 100%;
-    max-width: 420px;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 10px;
     font-size: 10px;
     color: var(--text-muted);
     font-variant-numeric: tabular-nums;
   }
 
-  .seek-row input {
+  .seek-row :global(.rx-slider-root) {
     flex: 1;
-    height: 3px;
-    cursor: pointer;
   }
 
   .np-right {
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    gap: 8px;
   }
 
   .vol-wrap {
@@ -2854,9 +3456,224 @@
     color: var(--text-secondary);
   }
 
-  .vol-wrap input {
-    width: 88px;
-    height: 3px;
+  .vol-pct {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    min-width: 28px;
+    text-align: right;
+  }
+
+  .vol-wrap :global(.rx-slider-root) {
+    width: 78px;
+  }
+
+  .about-close {
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-secondary);
+    display: grid;
+    place-items: center;
     cursor: pointer;
+  }
+
+  .about-close:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+  }
+
+  .update-modal {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .update-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .update-head-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .update-icon-badge {
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    display: grid;
+    place-items: center;
+    background: linear-gradient(135deg, rgba(99, 102, 241, 0.28), rgba(168, 85, 247, 0.24));
+    border: 1px solid rgba(129, 140, 248, 0.35);
+    color: #c7d2fe;
+    flex-shrink: 0;
+  }
+
+  .update-kicker {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--accent, #818cf8);
+  }
+
+  .update-head h3 {
+    margin: 2px 0 0;
+    font-size: 17px;
+    color: var(--text-primary);
+  }
+
+  .update-date {
+    display: inline-block;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .update-changelog-box {
+    padding: 12px 14px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+
+  .update-changelog-title {
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .update-changelog-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .update-changelog-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+  }
+
+  .update-dot {
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent, #818cf8);
+    margin-top: 7px;
+    flex-shrink: 0;
+  }
+
+  .update-progress-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .update-progress-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+  }
+
+  .update-progress-track {
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+  }
+
+  .update-progress-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent, #6366f1), #a855f7);
+    transition: width 0.2s ease;
+  }
+
+  .update-progress-fill.indeterminate {
+    width: 45%;
+    animation: update-slide 1.1s ease-in-out infinite alternate;
+  }
+
+  @keyframes update-slide {
+    from {
+      transform: translateX(-15%);
+    }
+    to {
+      transform: translateX(135%);
+    }
+  }
+
+  .update-err {
+    padding: 9px 12px;
+    border-radius: 9px;
+    background: rgba(244, 63, 94, 0.14);
+    border: 1px solid rgba(244, 63, 94, 0.35);
+    color: #fda4af;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .update-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 2px;
+  }
+
+  .update-later-btn,
+  .update-now-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-radius: 9px;
+    font-size: 12.5px;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+
+  .update-later-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: var(--border-subtle);
+    color: var(--text-secondary);
+  }
+
+  .update-later-btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.09);
+    color: var(--text-primary);
+  }
+
+  .update-now-btn {
+    background: var(--accent, #6366f1);
+    color: #fff;
+  }
+
+  .update-now-btn:hover:not(:disabled) {
+    filter: brightness(1.08);
+  }
+
+  .update-later-btn:disabled,
+  .update-now-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>
