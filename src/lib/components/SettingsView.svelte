@@ -107,11 +107,33 @@
   );
   let outputFeedback = $state('');
 
-  async function refreshAudioOutputs() {
+  async function refreshAudioOutputs(requestPermission = false) {
+    outputFeedback = '';
     try {
-      if (!navigator?.mediaDevices?.enumerateDevices) return;
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const outs = devices.filter((d) => d.kind === 'audiooutput');
+      if (!navigator?.mediaDevices?.enumerateDevices) {
+        outputFeedback = 'Список устройств недоступен в текущей среде.';
+        return;
+      }
+      let devices = await navigator.mediaDevices.enumerateDevices();
+      let outs = devices.filter((d) => d.kind === 'audiooutput');
+
+      const hasRealDevices = outs.some((d) => d.deviceId && d.deviceId !== 'default' && d.label);
+      if (!hasRealDevices && requestPermission && navigator.mediaDevices.getUserMedia) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          stream.getTracks().forEach((t) => t.stop());
+          devices = await navigator.mediaDevices.enumerateDevices();
+          outs = devices.filter((d) => d.kind === 'audiooutput');
+        } catch (err) {
+          const msg = String(err);
+          if (msg.includes('NotAllowed') || msg.includes('Permission')) {
+            outputFeedback = 'Доступ отклонён. Разрешите доступ к аудиоустройствам, чтобы увидеть все выходы.';
+          } else if (msg.includes('NotFound')) {
+            outputFeedback = 'WebView2 скрывает список устройств без активного микрофона/аудиовхода в системе.';
+          }
+        }
+      }
+
       const opts: { value: string; label: string }[] = [
         { value: 'default', label: 'По умолчанию (системное)' },
       ];
@@ -1385,7 +1407,7 @@
         <Headphones size={16} />
         <span class="net-title">Устройство вывода звука</span>
       </div>
-      <button type="button" class="btn-sm" onclick={refreshAudioOutputs}>
+      <button type="button" class="btn-sm" onclick={() => refreshAudioOutputs(true)}>
         <RefreshCw size={12} />
         <span>Обновить список</span>
       </button>
@@ -1401,6 +1423,10 @@
       />
       {#if outputFeedback}
         <div class="feedback err">{outputFeedback}</div>
+      {:else if audioOutputs.length <= 1}
+        <div class="feedback">
+          Если отображается только «По умолчанию» — нажмите «Обновить список» и разрешите доступ, чтобы WebView показал все ваши наушники и колонки.
+        </div>
       {/if}
     </div>
   </div>
