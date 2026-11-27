@@ -1,4 +1,4 @@
-import type { AudioEffectsConfig, ManualTransitionStyle, MixPreset } from './types';
+import type { AudioEffectsConfig, CrossfadeCurve, MixPreset } from './types';
 
 const EQ_FREQS = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 
@@ -186,7 +186,7 @@ class AudioEngine {
       this.makeupGain = this.ctx.createGain();
       this.makeupGain.gain.value = 1.0;
 
-      // Spatial 3D stage (subtle Haas stereo widening)
+      // Spatial 3D stage (True Mid-Side stereo widening + Binaural early-reflection room)
       this.dryGain = this.ctx.createGain();
       this.dryGain.gain.value = 1.0;
 
@@ -195,17 +195,51 @@ class AudioEngine {
 
       const splitter = this.ctx.createChannelSplitter(2);
       const merger = this.ctx.createChannelMerger(2);
-      this.delayL = this.ctx.createDelay(0.05);
-      this.delayR = this.ctx.createDelay(0.05);
-      this.delayL.delayTime.value = 0.011;
-      this.delayR.delayTime.value = 0.017;
 
-      const invL = this.ctx.createGain();
-      invL.gain.value = -0.35;
-      const invR = this.ctx.createGain();
-      invR.gain.value = -0.35;
+      // Mid = 0.5*L + 0.5*R
+      const midL = this.ctx.createGain();
+      const midR = this.ctx.createGain();
+      midL.gain.value = 0.5;
+      midR.gain.value = 0.5;
+      const midOut = this.ctx.createGain();
+      midOut.gain.value = 0.85;
 
-      // Output Soft Limiter (anti-clipping protection like Rodio master limiter)
+      // Side = 0.5*L - 0.5*R -> Air shelf -> Boost 1.9x
+      const sideL = this.ctx.createGain();
+      const sideR = this.ctx.createGain();
+      sideL.gain.value = 0.5;
+      sideR.gain.value = -0.5;
+      const sideAir = this.ctx.createBiquadFilter();
+      sideAir.type = 'highshelf';
+      sideAir.frequency.value = 5500;
+      sideAir.gain.value = 4.0;
+      const sideBoost = this.ctx.createGain();
+      sideBoost.gain.value = 1.9;
+      const sideInvert = this.ctx.createGain();
+      sideInvert.gain.value = -1.0;
+
+      // Short decorrelated binaural room impulse (75ms)
+      const roomConv = this.ctx.createConvolver();
+      const sr = this.ctx.sampleRate;
+      const irLen = Math.max(1, Math.floor(sr * 0.075));
+      const irBuf = this.ctx.createBuffer(2, irLen, sr);
+      const preDelay = Math.floor(sr * 0.004);
+      for (let ch = 0; ch < 2; ch++) {
+        const chData = irBuf.getChannelData(ch);
+        for (let i = preDelay; i < irLen; i++) {
+          const t = (i - preDelay) / (irLen - preDelay);
+          const env = Math.pow(1 - t, 2.5);
+          chData[i] = (Math.random() * 2 - 1) * env * 0.35;
+        }
+      }
+      roomConv.buffer = irBuf;
+      const roomFilter = this.ctx.createBiquadFilter();
+      roomFilter.type = 'lowpass';
+      roomFilter.frequency.value = 5200;
+      const roomGain = this.ctx.createGain();
+      roomGain.gain.value = 0.28;
+
+      // Output Soft Limiter (anti-clipping protection)
       this.limiter = this.ctx.createDynamicsCompressor();
       this.limiter.threshold.value = -0.8;
       this.limiter.knee.value = 3.0;
@@ -230,19 +264,36 @@ class AudioEngine {
       this.bassFilter.connect(this.compressor);
       this.compressor.connect(this.makeupGain);
 
-      // Dry path
+      // Dry path (transparent bypass when Spatial is OFF)
       this.makeupGain.connect(this.dryGain);
       this.dryGain.connect(this.limiter);
 
-      // Wet spatial path
+      // Wet spatial path (M/S widener + binaural early reflections)
       this.makeupGain.connect(splitter);
-      splitter.connect(this.delayL, 0);
-      splitter.connect(this.delayR, 1);
-      this.delayL.connect(invL);
-      this.delayR.connect(invR);
-      invL.connect(merger, 0, 1);
-      invR.connect(merger, 0, 0);
+      splitter.connect(midL, 0);
+      splitter.connect(midR, 1);
+      midL.connect(midOut);
+      midR.connect(midOut);
+
+      splitter.connect(sideL, 0);
+      splitter.connect(sideR, 1);
+      sideL.connect(sideAir);
+      sideR.connect(sideAir);
+      sideAir.connect(sideBoost);
+
+      // L = Mid + Side, R = Mid - Side
+      midOut.connect(merger, 0, 0);
+      sideBoost.connect(merger, 0, 0);
+      midOut.connect(merger, 0, 1);
+      sideBoost.connect(sideInvert);
+      sideInvert.connect(merger, 0, 1);
+
       merger.connect(this.wetGain);
+      this.makeupGain.connect(roomConv);
+      roomConv.connect(roomFilter);
+      roomFilter.connect(roomGain);
+      roomGain.connect(this.wetGain);
+
       this.wetGain.connect(this.limiter);
 
       this.limiter.connect(this.analyser);
@@ -252,7 +303,12 @@ class AudioEngine {
     }
   }
 
-  crossfadeTo(target: 'A' | 'B', durationSec: number, preset: MixPreset = 'fade', eqSweep = true) {
+  crossfadeTo(
+    target: 'A' | 'B',
+    durationSec: number,
+    preset: MixPreset = 'fade',
+    curve: CrossfadeCurve = 'equal-power'
+  ) {
     if (!this.ctx || !this.deckGainA || !this.deckGainB || !this.deckFilterA || !this.deckFilterB) return;
     const now = this.ctx.currentTime;
     const inGain = target === 'A' ? this.deckGainA.gain : this.deckGainB.gain;
@@ -260,12 +316,18 @@ class AudioEngine {
     const inFilter = target === 'A' ? this.deckFilterA : this.deckFilterB;
     const outFilter = target === 'A' ? this.deckFilterB : this.deckFilterA;
 
-    inGain.cancelScheduledValues(now);
-    outGain.cancelScheduledValues(now);
-    inFilter.frequency.cancelScheduledValues(now);
-    inFilter.gain.cancelScheduledValues(now);
-    outFilter.frequency.cancelScheduledValues(now);
-    outFilter.gain.cancelScheduledValues(now);
+    try {
+      inGain.cancelAndHoldAtTime?.(now);
+      outGain.cancelAndHoldAtTime?.(now);
+    } catch {
+      // ignore if unsupported
+    }
+    inGain.cancelScheduledValues(0);
+    outGain.cancelScheduledValues(0);
+    inFilter.frequency.cancelScheduledValues(0);
+    inFilter.gain.cancelScheduledValues(0);
+    outFilter.frequency.cancelScheduledValues(0);
+    outFilter.gain.cancelScheduledValues(0);
 
     if (durationSec <= 0.1) {
       inGain.setValueAtTime(1, now);
@@ -275,46 +337,36 @@ class AudioEngine {
       return;
     }
 
-    // Equal-power S-curve (sin / cos)
     const steps = 32;
     const inCurve = new Float32Array(steps);
     const outCurve = new Float32Array(steps);
     for (let i = 0; i < steps; i++) {
       const t = i / (steps - 1);
-      if (preset === 'dj-vocal') {
-        // Держим старый бит и новый вокал вместе в середине перехода
-        inCurve[i] = Math.pow(Math.sin(t * Math.PI * 0.5), 0.72);
-        outCurve[i] = Math.pow(Math.cos(t * Math.PI * 0.5), 0.85);
+      if (curve === 'linear') {
+        inCurve[i] = t;
+        outCurve[i] = 1 - t;
+      } else if (curve === 's-curve') {
+        const s = t * t * (3 - 2 * t);
+        inCurve[i] = Math.sin(s * Math.PI * 0.5);
+        outCurve[i] = Math.cos(s * Math.PI * 0.5);
       } else {
         inCurve[i] = Math.sin(t * Math.PI * 0.5);
         outCurve[i] = Math.cos(t * Math.PI * 0.5);
       }
     }
-    inGain.setValueCurveAtTime(inCurve, now, durationSec);
-    outGain.setValueCurveAtTime(outCurve, now, durationSec);
-
-    if (!eqSweep || preset === 'fade') {
-      inFilter.type = 'allpass';
-      outFilter.type = 'allpass';
-      return;
+    try {
+      inGain.setValueCurveAtTime(inCurve, now, durationSec);
+      outGain.setValueCurveAtTime(outCurve, now, durationSec);
+    } catch {
+      inGain.cancelScheduledValues(0);
+      outGain.cancelScheduledValues(0);
+      inGain.setValueAtTime(0.001, now);
+      inGain.linearRampToValueAtTime(1, now + durationSec);
+      outGain.setValueAtTime(1, now);
+      outGain.linearRampToValueAtTime(0, now + durationSec);
     }
 
-    if (preset === 'dj-vocal') {
-      // Старый бит (lowpass ~260 Hz) + новый вокал/верх (highpass ~360 Hz -> 20 Hz)
-      outFilter.type = 'lowpass';
-      outFilter.Q.value = 0.85;
-      outFilter.frequency.setValueAtTime(16000, now);
-      outFilter.frequency.exponentialRampToValueAtTime(260, now + durationSec * 0.18);
-      outFilter.frequency.setValueAtTime(260, now + durationSec * 0.72);
-      outFilter.frequency.exponentialRampToValueAtTime(90, now + durationSec);
-
-      inFilter.type = 'highpass';
-      inFilter.Q.value = 0.9;
-      inFilter.frequency.setValueAtTime(380, now);
-      inFilter.frequency.setValueAtTime(340, now + durationSec * 0.55);
-      inFilter.frequency.exponentialRampToValueAtTime(22, now + durationSec * 0.9);
-    } else if (preset === 'rise') {
-      // Входящий трек плавно открывается через lowpass sweep (350 Hz -> 18000 Hz)
+    if (preset === 'rise') {
       inFilter.type = 'lowpass';
       inFilter.Q.value = 1.1;
       inFilter.frequency.setValueAtTime(350, now);
@@ -322,25 +374,9 @@ class AudioEngine {
       outFilter.type = 'highpass';
       outFilter.frequency.setValueAtTime(60, now);
       outFilter.frequency.exponentialRampToValueAtTime(1400, now + durationSec);
-    } else if (preset === 'bass-swap') {
-      // DJ Bass Swap: у входящего срезан низ до середины перехода, затем бас меняется местами
-      inFilter.type = 'lowshelf';
-      inFilter.frequency.value = 140;
-      inFilter.gain.setValueAtTime(-18, now);
-      inFilter.gain.setValueAtTime(-18, now + durationSec * 0.45);
-      inFilter.gain.linearRampToValueAtTime(0, now + durationSec * 0.75);
-
-      outFilter.type = 'lowshelf';
-      outFilter.frequency.value = 140;
-      outFilter.gain.setValueAtTime(0, now);
-      outFilter.gain.linearRampToValueAtTime(-18, now + durationSec * 0.65);
-    } else if (preset === 'echo-out') {
-      // Мягкий тёплый спад высоких у уходящего трека
+    } else {
       inFilter.type = 'allpass';
-      outFilter.type = 'lowpass';
-      outFilter.Q.value = 0.8;
-      outFilter.frequency.setValueAtTime(16000, now);
-      outFilter.frequency.exponentialRampToValueAtTime(280, now + durationSec);
+      outFilter.type = 'allpass';
     }
   }
 
@@ -349,7 +385,7 @@ class AudioEngine {
    * мягко приглушает текущую деку на время резолва и буферизации нового трека,
    * чтобы не было ни тишины, ни задержки реакции.
    */
-  prepareManualSkipDuck(outgoingDeck: 'A' | 'B', style: ManualTransitionStyle) {
+  prepareManualSkipDuck(outgoingDeck: 'A' | 'B', style: string) {
     if (!this.ctx || !this.deckGainA || !this.deckGainB || !this.deckFilterA || !this.deckFilterB) return;
     if (style === 'off') return;
     const now = this.ctx.currentTime;
@@ -462,14 +498,14 @@ class AudioEngine {
    */
   handoffManualSkip(
     incomingDeck: 'A' | 'B',
-    style: ManualTransitionStyle,
+    style: string,
     outgoingEl?: HTMLAudioElement | null
   ): number {
     if (!this.ctx || !this.deckGainA || !this.deckGainB || !this.deckFilterA || !this.deckFilterB) {
       return 0;
     }
     if (style === 'off') {
-      this.crossfadeTo(incomingDeck, 0, 'fade', false);
+      this.crossfadeTo(incomingDeck, 0, 'fade', 'equal-power');
       return 0;
     }
 
@@ -613,8 +649,8 @@ class AudioEngine {
 
     if (this.wetGain && this.dryGain) {
       if (effects.spatial_audio) {
-        this.dryGain.gain.setTargetAtTime(0.92, now, 0.04);
-        this.wetGain.gain.setTargetAtTime(0.55, now, 0.04);
+        this.dryGain.gain.setTargetAtTime(0.0, now, 0.04);
+        this.wetGain.gain.setTargetAtTime(1.0, now, 0.04);
       } else {
         this.dryGain.gain.setTargetAtTime(1.0, now, 0.04);
         this.wetGain.gain.setTargetAtTime(0.0, now, 0.04);

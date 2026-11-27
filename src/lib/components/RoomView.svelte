@@ -3,6 +3,9 @@
     Check,
     Copy,
     Crown,
+    Globe,
+    ListMusic,
+    Lock,
     LogOut,
     Play,
     Pause,
@@ -11,23 +14,31 @@
     SkipForward,
     Sparkles,
     Users,
-    Vote,
     MessageCircle,
     Send,
     Wifi,
   } from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
-  import { pickDiverseSample, type JamRoomState } from '../jamRoom';
+  import RadixSelect, { type SelectOption } from './ui/RadixSelect.svelte';
+  import { pickDiverseSample, type JamRoomState, type PublicJamRoomInfo } from '../jamRoom';
   import { ROLE_BADGES } from '../supabase';
   import type { Playlist, Track } from '../types';
   import * as api from '../api';
 
   interface Props {
     room: JamRoomState;
+    publicRooms?: PublicJamRoomInfo[];
     likedTracks: Track[];
     playlists: Playlist[];
     defaultName: string;
-    onCreateRoom: (name: string, relayUrl: string, tasteLabel: string, tracks: Track[]) => void;
+    onCreateRoom: (
+      name: string,
+      relayUrl: string,
+      tasteLabel: string,
+      tracks: Track[],
+      isPrivate: boolean,
+      roomTitle: string
+    ) => void;
     onJoinRoom: (
       code: string,
       name: string,
@@ -46,6 +57,7 @@
 
   let {
     room,
+    publicRooms = [],
     likedTracks,
     playlists,
     defaultName,
@@ -64,6 +76,8 @@
 
   let displayName = $state('');
   let joinCode = $state('');
+  let roomTitle = $state('');
+  let isPrivateRoom = $state(false);
   let relayUrl = $state(
     typeof localStorage !== 'undefined'
       ? localStorage.getItem('flowly_jam_relay') || 'supabase'
@@ -72,6 +86,21 @@
   let tasteSource = $state<'liked' | 'recap' | string>('liked');
   let copied = $state(false);
   let loadingTaste = $state(false);
+
+  const tasteOptions = $derived<SelectOption[]>([
+    { value: 'liked', label: `Мне нравится (${likedTracks.length} тр.)` },
+    { value: 'recap', label: 'Топ из Итогов месяца' },
+    ...playlists.map((pl) => ({
+      value: pl.id,
+      label: `${pl.title} (${pl.tracks.length} тр.)`,
+    })),
+  ]);
+
+  const currentTasteCount = $derived.by(() => {
+    if (tasteSource === 'liked') return likedTracks.length;
+    if (tasteSource === 'recap') return null;
+    return playlists.find((p) => p.id === tasteSource)?.tracks.length ?? 0;
+  });
 
   $effect(() => {
     if (defaultName) {
@@ -115,17 +144,21 @@
     const targetRelay = relayUrl.trim() || 'supabase';
     saveRelay(targetRelay);
     const taste = await resolveTasteBundle();
-    onCreateRoom(cleanName, targetRelay, taste.label, taste.tracks);
+    onCreateRoom(cleanName, targetRelay, taste.label, taste.tracks, isPrivateRoom, roomTitle.trim());
   }
 
-  async function handleJoin() {
-    const code = joinCode.trim().toUpperCase();
+  async function handleJoinByCode(rawCode: string) {
+    const code = rawCode.trim().toUpperCase();
     if (!code) return;
     const cleanName = displayName.trim() || 'Гость';
     const targetRelay = relayUrl.trim() || 'supabase';
     saveRelay(targetRelay);
     const taste = await resolveTasteBundle();
     onJoinRoom(code, cleanName, targetRelay, taste.label, taste.tracks);
+  }
+
+  async function handleJoin() {
+    await handleJoinByCode(joinCode);
   }
 
   async function handleChangeTaste(nextSource: string) {
@@ -173,16 +206,14 @@
           <input type="text" bind:value={displayName} placeholder="Например: Квики" />
         </label>
 
-        <label class="field">
+        <div class="field">
           <span>Что добавить в общий микс</span>
-          <select value={tasteSource} onchange={(e) => handleChangeTaste(e.currentTarget.value)}>
-            <option value="liked">Мне нравится ({likedTracks.length} треков)</option>
-            <option value="recap">Топ из Итогов месяца</option>
-            {#each playlists as pl (pl.id)}
-              <option value={pl.id}>Плейлист: {pl.title} ({pl.tracks.length})</option>
-            {/each}
-          </select>
-        </label>
+          <RadixSelect
+            value={tasteSource}
+            options={tasteOptions}
+            onValueChange={(val) => handleChangeTaste(val)}
+          />
+        </div>
 
         <div class="field">
           <span>Транспорт комнаты</span>
@@ -220,9 +251,40 @@
       <div class="lobby-card actions-card">
         <h3>Создать или войти</h3>
         <p class="hint">
-          Права в комнате: <b>Общий пульт</b> — все участники могут добавлять и ставить треки, а
-          хост может скипать любой трек мгновенно без голосования.
+          Права в комнате: <b>управляет только хост</b> — он запускает, переключает и ставит треки на
+          паузу, а остальные слушают синхронно.
         </p>
+
+        <div class="field">
+          <span>Доступ к комнате</span>
+          <div class="preset-row">
+            <button
+              type="button"
+              class="preset-pill"
+              class:active={!isPrivateRoom}
+              onclick={() => (isPrivateRoom = false)}
+            >
+              <Globe size={13} />
+              <span>Общая</span>
+            </button>
+            <button
+              type="button"
+              class="preset-pill"
+              class:active={isPrivateRoom}
+              onclick={() => (isPrivateRoom = true)}
+            >
+              <Lock size={13} />
+              <span>Приватная (по коду)</span>
+            </button>
+          </div>
+        </div>
+
+        {#if !isPrivateRoom}
+          <label class="field">
+            <span>Название комнаты (необязательно)</span>
+            <input type="text" bind:value={roomTitle} placeholder="Например: Ночной чилл" />
+          </label>
+        {/if}
 
         <button type="button" class="btn-primary" disabled={loadingTaste} onclick={handleCreate}>
           <Sparkles size={15} />
@@ -249,11 +311,69 @@
         {/if}
       </div>
     </div>
+
+    <!-- Открытые (общие) комнаты -->
+    <div class="public-rooms-card">
+      <div class="pub-head">
+        <div class="pub-title">
+          <Globe size={15} />
+          <span>Открытые комнаты</span>
+        </div>
+        <span class="pub-count">{publicRooms.length}</span>
+      </div>
+      {#if publicRooms.length === 0}
+        <div class="pub-empty">
+          Пока нет активных общих комнат. Создайте свою с типом «Общая», и она появится здесь.
+        </div>
+      {:else}
+        <div class="pub-list">
+          {#each publicRooms as pub (pub.roomCode)}
+            <div class="pub-room-row">
+              {#if pub.currentTrackArtwork}
+                <img class="pub-art" src={pub.currentTrackArtwork} alt={pub.title} />
+              {:else}
+                <div class="pub-art pub-art-placeholder"><Radio size={16} /></div>
+              {/if}
+              <div class="pub-meta">
+                <div class="pub-name">
+                  <span>{pub.title}</span>
+                  <span class="pub-code">{pub.roomCode}</span>
+                </div>
+                <div class="pub-sub">
+                  Хост: {pub.hostName} · {pub.memberCount} уч.
+                  {#if pub.currentTrackTitle}
+                    · Сейчас: {pub.currentTrackArtist} — {pub.currentTrackTitle}
+                  {/if}
+                </div>
+              </div>
+              <button
+                type="button"
+                class="btn-secondary"
+                disabled={loadingTaste}
+                onclick={() => handleJoinByCode(pub.roomCode)}
+              >
+                Войти
+              </button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
   {:else}
     <!-- Активная комната -->
     <div class="active-top">
       <div class="code-box">
-        <span class="code-lbl">Код комнаты</span>
+        {#if room.roomTitle}
+          <span class="room-name-pill">{room.roomTitle}</span>
+        {/if}
+        <span class="privacy-badge" class:priv={room.isPrivate}>
+          {#if room.isPrivate}
+            <Lock size={11} /> Приватная
+          {:else}
+            <Globe size={11} /> Общая
+          {/if}
+        </span>
+        <span class="code-lbl">Код</span>
         <div class="code-val-row">
           <strong>{room.roomCode}</strong>
           <button type="button" class="icon-btn" onclick={copyCode} title="Скопировать код">
@@ -266,9 +386,9 @@
         </div>
         <span class="role-badge" class:host={room.isHost}>
           {#if room.isHost}
-            <Crown size={12} /> Хост (мгновенный скип)
+            <Crown size={12} /> Хост (управление)
           {:else}
-            <Users size={12} /> Гость (синхронно с хостом)
+            <Users size={12} /> Гость (синхронно)
           {/if}
         </span>
         {#if !room.isHost}
@@ -289,19 +409,27 @@
         {/if}
       </div>
 
-      <div class="taste-switch">
-        <span>Мой вклад в микс:</span>
-        <select value={tasteSource} onchange={(e) => handleChangeTaste(e.currentTarget.value)}>
-          <option value="liked">Мне нравится</option>
-          <option value="recap">Топ из Итогов</option>
-          {#each playlists as pl (pl.id)}
-            <option value={pl.id}>{pl.title}</option>
-          {/each}
-        </select>
-        <button type="button" class="btn-sm" onclick={onRebuildBlend} title="Пересобрать общий микс">
-          <RefreshCw size={13} />
-          <span>Пересобрать микс</span>
-        </button>
+      <div class="contrib-bar">
+        <div class="contrib-label">
+          <ListMusic size={14} />
+          <span>Мой вклад</span>
+          {#if currentTasteCount !== null}
+            <span class="contrib-count">{currentTasteCount} тр.</span>
+          {/if}
+        </div>
+        <div class="contrib-select">
+          <RadixSelect
+            value={tasteSource}
+            options={tasteOptions}
+            onValueChange={(val) => handleChangeTaste(val)}
+          />
+        </div>
+        {#if room.isHost}
+          <button type="button" class="btn-sm" onclick={onRebuildBlend} title="Пересобрать общий микс">
+            <RefreshCw size={13} />
+            <span>Пересобрать микс</span>
+          </button>
+        {/if}
       </div>
     </div>
 
@@ -346,27 +474,24 @@
           <div class="now-artist">{cur.artist}</div>
         </div>
         <div class="now-actions">
-          <button type="button" class="btn-circle" onclick={onTogglePlay} aria-label="Пауза / Плей">
-            {#if room.isPlaying}
-              <Pause size={16} fill="currentColor" />
-            {:else}
-              <Play size={16} fill="currentColor" />
-            {/if}
-          </button>
-          <button
-            type="button"
-            class="btn-skip"
-            class:voted={alreadyVoted && !room.isHost}
-            onclick={onSkip}
-          >
-            {#if room.isHost}
+          {#if room.isHost}
+            <button type="button" class="btn-circle" onclick={onTogglePlay} aria-label="Пауза / Плей">
+              {#if room.isPlaying}
+                <Pause size={16} fill="currentColor" />
+              {:else}
+                <Play size={16} fill="currentColor" />
+              {/if}
+            </button>
+            <button type="button" class="btn-skip" onclick={onSkip}>
               <SkipForward size={14} />
-              <span>Скип (Хост)</span>
-            {:else}
-              <Vote size={14} />
-              <span>Скип ({room.skipVotes.length}/{votesNeeded})</span>
-            {/if}
-          </button>
+              <span>Скип</span>
+            </button>
+          {:else}
+            <span class="host-only-pill">
+              <Crown size={12} />
+              <span>Управляет хост</span>
+            </span>
+          {/if}
         </div>
       </div>
     {/if}
@@ -388,22 +513,39 @@
         <div class="q-list">
           {#each room.queue as item, idx (item.track.id + idx)}
             {@const active = room.currentTrack?.id === item.track.id}
-            <button
-              type="button"
-              class="q-row"
-              class:active
-              class:matched={item.matchCount >= 2}
-              onclick={() => onPlayTrack(item.track)}
-            >
-              <span class="q-idx">{idx + 1}</span>
-              <img src={item.track.artwork} alt={item.track.title} />
-              <div class="q-meta">
-                <div class="q-title">{item.track.title}</div>
-                <div class="q-sub">{item.track.artist}</div>
+            {#if room.isHost}
+              <button
+                type="button"
+                class="q-row"
+                class:active
+                class:matched={item.matchCount >= 2}
+                onclick={() => onPlayTrack(item.track)}
+              >
+                <span class="q-idx">{idx + 1}</span>
+                <img src={item.track.artwork} alt={item.track.title} />
+                <div class="q-meta">
+                  <div class="q-title">{item.track.title}</div>
+                  <div class="q-sub">{item.track.artist}</div>
+                </div>
+                <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
+                <SourceBadge source={item.track.source} showLabel={false} />
+              </button>
+            {:else}
+              <div
+                class="q-row readonly"
+                class:active
+                class:matched={item.matchCount >= 2}
+              >
+                <span class="q-idx">{idx + 1}</span>
+                <img src={item.track.artwork} alt={item.track.title} />
+                <div class="q-meta">
+                  <div class="q-title">{item.track.title}</div>
+                  <div class="q-sub">{item.track.artist}</div>
+                </div>
+                <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
+                <SourceBadge source={item.track.source} showLabel={false} />
               </div>
-              <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
-              <SourceBadge source={item.track.source} showLabel={false} />
-            </button>
+            {/if}
           {/each}
         </div>
       {/if}
@@ -527,9 +669,7 @@
   }
 
   .field input,
-  .field select,
-  .join-row input,
-  .taste-switch select {
+  .join-row input {
     padding: 9px 12px;
     border-radius: 10px;
     border: 1px solid var(--border-subtle);
@@ -691,15 +831,6 @@
     color: var(--accent);
   }
 
-  .taste-switch {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    flex-wrap: wrap;
-  }
-
   .members-strip {
     display: flex;
     gap: 10px;
@@ -848,11 +979,6 @@
     font-size: 12px;
     font-weight: 600;
     cursor: pointer;
-  }
-
-  .btn-skip.voted {
-    border-color: var(--accent);
-    color: var(--accent);
   }
 
   .queue-card {
@@ -1042,5 +1168,186 @@
     color: var(--text-primary);
     font-size: 12.5px;
     outline: none;
+  }
+
+  .room-name-pill {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .privacy-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(52, 211, 153, 0.12);
+    color: #34d399;
+    border: 1px solid rgba(52, 211, 153, 0.25);
+  }
+
+  .privacy-badge.priv {
+    background: rgba(251, 191, 36, 0.12);
+    color: #fbbf24;
+    border-color: rgba(251, 191, 36, 0.25);
+  }
+
+  .contrib-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .contrib-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  .contrib-count {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-primary);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .contrib-select {
+    min-width: 190px;
+  }
+
+  .host-only-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+    font-size: 11.5px;
+    font-weight: 600;
+  }
+
+  .q-row.readonly {
+    cursor: default;
+  }
+
+  .q-row.readonly:hover {
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  .public-rooms-card {
+    padding: 16px 18px;
+    border-radius: 16px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .pub-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .pub-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .pub-count {
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-secondary);
+  }
+
+  .pub-empty {
+    font-size: 12.5px;
+    color: var(--text-muted);
+  }
+
+  .pub-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .pub-room-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .pub-art {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    object-fit: cover;
+    flex-shrink: 0;
+  }
+
+  .pub-art-placeholder {
+    display: grid;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-secondary);
+  }
+
+  .pub-meta {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .pub-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .pub-code {
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-size: 10.5px;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-secondary);
+    letter-spacing: 0.04em;
+  }
+
+  .pub-sub {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 </style>

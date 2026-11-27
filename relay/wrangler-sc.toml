@@ -1,0 +1,8 @@
+name = "flowly-sc-oauth"
+main = "soundcloud-oauth-worker.js"
+compatibility_date = "2025-01-01"
+
+# После `npx wrangler kv namespace create SC_SESSIONS` вставьте свой id ниже:
+[[kv_namespaces]]
+binding = "SC_SESSIONS"
+id = "74878ce59c0641819c45b39b8009e725"

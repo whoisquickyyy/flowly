@@ -3,9 +3,10 @@
   import SpectrumVisualizer from './SpectrumVisualizer.svelte';
   import RadixSlider from './ui/RadixSlider.svelte';
   import RadixSwitch from './ui/RadixSwitch.svelte';
+  import RadixSelect from './ui/RadixSelect.svelte';
   import type {
     AudioEffectsConfig,
-    ManualTransitionStyle,
+    CrossfadeCurve,
     MixConfig,
     MixPreset,
     ShuffleMode,
@@ -33,21 +34,16 @@
     onShuffleModeChange = () => {},
   }: Props = $props();
 
-  const manualSkipOptions: { id: ManualTransitionStyle; label: string }[] = [
-    { id: 'filter-cut', label: 'Filter Cut' },
-    { id: 'echo-tail', label: 'Echo Tail' },
-    { id: 'vinyl-brake', label: 'Винил' },
-    { id: 'tape-whoosh', label: 'Air Whoosh' },
-    { id: 'clean-whip', label: 'Clean Whip' },
-    { id: 'off', label: 'Мгновенно' },
+  const mixPresets: { id: MixPreset; label: string; desc: string }[] = [
+    { id: 'auto', label: 'Auto', desc: 'Умный выбор: Beatmatch или Rise по BPM' },
+    { id: 'fade', label: 'Fade', desc: 'Классический кроссфейд между деками' },
+    { id: 'rise', label: 'Rise', desc: 'Нарастающий фильтр с подъёмом верхов' },
   ];
 
-  const mixPresets: { id: MixPreset; label: string; desc: string }[] = [
-    { id: 'dj-vocal', label: 'Beat + Vocal', desc: 'Старый бит + вокал нового трека' },
-    { id: 'bass-swap', label: 'Bass Swap', desc: 'DJ-смена баса в середине' },
-    { id: 'rise', label: 'Rise', desc: 'Нарастающий фильтр на входе' },
-    { id: 'echo-out', label: 'Echo Out', desc: 'Мягкое затухание верхов' },
-    { id: 'fade', label: 'Fade', desc: 'Плавный громкостной переход' },
+  const curveOptions: { value: CrossfadeCurve; label: string }[] = [
+    { value: 'equal-power', label: 'Плавный (Equal Power)' },
+    { value: 's-curve', label: 'Естественный (S-Curve)' },
+    { value: 'linear', label: 'Резкий (Linear)' },
   ];
 
   const bandFreqs = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
@@ -495,87 +491,48 @@
     </div>
 
     {#if mix.enabled}
-      <div class="mix-modes-grid">
-        <button
-          type="button"
-          class="mix-mode-card"
-          class:active={mix.mode === 'auto'}
-          onclick={() => onMixChange({ ...mix, mode: 'auto' })}
-        >
-          <span class="mmc-title">Auto-DJ (Умный)</span>
-          <span class="mmc-desc">Сам выбирает эффект сведения, точку входа и подстраивает BPM</span>
-        </button>
-        <button
-          type="button"
-          class="mix-mode-card"
-          class:active={mix.mode === 'manual'}
-          onclick={() => onMixChange({ ...mix, mode: 'manual' })}
-        >
-          <span class="mmc-title">Ручной режим</span>
-          <span class="mmc-desc">Фиксированный эффект и точная длительность кроссфейда</span>
-        </button>
+      <div class="mix-presets-row">
+        {#each mixPresets as mp (mp.id)}
+          <button
+            type="button"
+            class="mix-preset-btn"
+            class:active={mix.preset === mp.id}
+            onclick={() => onMixChange({ ...mix, preset: mp.id })}
+          >
+            <span class="mp-name">{mp.label}</span>
+            <span class="mp-desc">{mp.desc}</span>
+          </button>
+        {/each}
       </div>
-
-      {#if mix.mode === 'manual'}
-        <div class="mix-presets-row">
-          {#each mixPresets as mp (mp.id)}
-            <button
-              type="button"
-              class="mix-preset-btn"
-              class:active={mix.preset === mp.id}
-              onclick={() => onMixChange({ ...mix, preset: mp.id })}
-            >
-              <span class="mp-name">{mp.label}</span>
-              <span class="mp-desc">{mp.desc}</span>
-            </button>
-          {/each}
-        </div>
-
-        <div class="mix-slider">
-          <span>Длительность перехода: <b>{mix.durationSec} сек</b></span>
-          <RadixSlider
-            value={mix.durationSec}
-            min={2}
-            max={12}
-            step={1}
-            ariaLabel="Длительность перехода"
-            onValueChange={(v) => onMixChange({ ...mix, durationSec: v })}
-          />
-        </div>
-      {/if}
 
       <div class="mix-setting-row">
         <div class="mix-setting-info">
-          <span class="rg-lbl">EQ-фильтр при переходе</span>
-          <span class="mix-setting-hint">Плавно убирает низкие частоты у уходящего трека</span>
+          <span class="rg-lbl">Кривая кроссфейда</span>
+          <span class="mix-setting-hint">Характер затухания и нарастания громкости</span>
         </div>
-        <RadixSwitch
-          checked={mix.eqSweep}
-          ariaLabel="EQ-фильтр при переходе"
-          onCheckedChange={(v) => onMixChange({ ...mix, eqSweep: v })}
+        <div style="min-width: 220px;">
+          <RadixSelect
+            value={mix.curve}
+            options={curveOptions}
+            onValueChange={(v) => onMixChange({ ...mix, curve: v as CrossfadeCurve })}
+          />
+        </div>
+      </div>
+
+      <div class="mix-slider">
+        <span>Длительность перехода: <b>{mix.durationSec} сек</b></span>
+        <RadixSlider
+          value={mix.durationSec}
+          min={1}
+          max={12}
+          step={1}
+          ariaLabel="Длительность перехода"
+          onValueChange={(v) => onMixChange({ ...mix, durationSec: v })}
         />
       </div>
     {/if}
 
     <div class="mix-divider"></div>
-
-    <div class="mix-setting-row">
-      <div class="mix-setting-info">
-        <span class="rg-lbl">Эффект при ручном скипе</span>
-        <span class="mix-setting-hint">Когда нажимаете «Следующий трек» вручную</span>
-      </div>
-      <div class="mix-mode-pills">
-        {#each manualSkipOptions as opt (opt.id)}
-          <button
-            type="button"
-            class:active={(mix.manualTransition ?? 'filter-cut') === opt.id}
-            onclick={() => onMixChange({ ...mix, manualTransition: opt.id })}
-          >
-            {opt.label}
-          </button>
-        {/each}
-      </div>
-    </div>
 
     <div class="mix-setting-row">
       <div class="mix-setting-info">
@@ -1003,45 +960,6 @@
   .mix-state-lbl {
     font-size: 11px;
     font-weight: 600;
-    color: var(--text-secondary);
-  }
-
-  .mix-modes-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-  }
-
-  .mix-mode-card {
-    padding: 10px 12px;
-    border-radius: 10px;
-    border: 1px solid var(--border-subtle);
-    background: rgba(255, 255, 255, 0.02);
-    text-align: left;
-    cursor: pointer;
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    transition: border-color 140ms ease, background 140ms ease;
-  }
-
-  .mix-mode-card:hover {
-    background: rgba(255, 255, 255, 0.04);
-  }
-
-  .mix-mode-card.active {
-    border-color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 14%, var(--bg-elevated));
-  }
-
-  .mmc-title {
-    font-size: 12.5px;
-    font-weight: 700;
-    color: var(--text-primary);
-  }
-
-  .mmc-desc {
-    font-size: 11px;
     color: var(--text-secondary);
   }
 

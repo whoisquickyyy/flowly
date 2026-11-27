@@ -705,7 +705,7 @@ impl YandexMusicProvider {
         let mut artwork = artist_val["cover"]["uri"]
             .as_str()
             .filter(|u| !u.is_empty())
-            .map(|u| format!("https://{}", u.replace("%%", "400x400")));
+            .map(|u| format!("https://{}", u.replace("%%", "1000x1000")));
 
         let mut req = self
             .client
@@ -722,6 +722,10 @@ impl YandexMusicProvider {
         let mut monthly_listeners: Option<u64> = None;
         let mut latest_release: Option<ArtistRelease> = None;
         let mut similar_artists: Vec<crate::models::SimilarArtist> = Vec::new();
+        let mut albums: Vec<ArtistRelease> = Vec::new();
+        let mut singles: Vec<ArtistRelease> = Vec::new();
+        let mut popular_tracks: Vec<Track> = Vec::new();
+        let mut genres: Vec<String> = Vec::new();
 
         if let Ok(resp) = req.send().await {
             if let Ok(ok_r) = resp.error_for_status() {
@@ -730,13 +734,48 @@ impl YandexMusicProvider {
                     if artwork.is_none() {
                         artwork = res["artist"]["cover"]["uri"]
                             .as_str()
+                            .or_else(|| res["artist"]["ogImage"].as_str())
                             .filter(|u| !u.is_empty())
-                            .map(|u| format!("https://{}", u.replace("%%", "400x400")));
+                            .map(|u| format!("https://{}", u.replace("%%", "1000x1000")));
+                    }
+                    if let Some(g_arr) = res["artist"]["genres"].as_array() {
+                        for g in g_arr.iter().take(4) {
+                            if let Some(gs) = g.as_str().filter(|s| !s.is_empty()) {
+                                genres.push(gs.to_string());
+                            }
+                        }
                     }
                     monthly_listeners = res["stats"]["lastMonthListeners"]
                         .as_u64()
                         .or_else(|| res["artist"]["stats"]["lastMonthListeners"].as_u64())
                         .or_else(|| res["lastMonthListeners"].as_u64());
+
+                    let parse_release = |r: &Value| -> Option<ArtistRelease> {
+                        let rid = r["id"]
+                            .as_u64()
+                            .map(|n| n.to_string())
+                            .or_else(|| r["id"].as_str().map(String::from))?;
+                        let r_title = r["title"].as_str().unwrap_or("Релиз").to_string();
+                        let r_cover = r["coverUri"]
+                            .as_str()
+                            .filter(|u| !u.is_empty())
+                            .map(|u| format!("https://{}", u.replace("%%", "400x400")))
+                            .unwrap_or_else(|| {
+                                artwork.clone().unwrap_or_else(|| {
+                                    "https://images.unsplash.com/photo-1614149162883-504ce4d13909?w=400&q=80".to_string()
+                                })
+                            });
+                        Some(ArtistRelease {
+                            external_url: format!("https://music.yandex.ru/album/{}", rid),
+                            id: rid,
+                            title: r_title,
+                            artwork: r_cover,
+                            year: r["year"].as_u64().map(|y| y as u16),
+                            release_type: r["type"].as_str().map(String::from),
+                            release_date: r["releaseDate"].as_str().map(String::from),
+                            track_count: r["trackCount"].as_u64().map(|c| c as u32),
+                        })
+                    };
 
                     let rel_val = res["lastReleases"]
                         .as_array()
@@ -744,31 +783,49 @@ impl YandexMusicProvider {
                         .or_else(|| res["albums"].as_array().and_then(|a| a.first()));
 
                     if let Some(r) = rel_val {
-                        if let Some(rid) = r["id"]
-                            .as_u64()
-                            .map(|n| n.to_string())
-                            .or_else(|| r["id"].as_str().map(String::from))
-                        {
-                            let r_title = r["title"].as_str().unwrap_or("Релиз").to_string();
-                            let r_cover = r["coverUri"]
-                                .as_str()
-                                .filter(|u| !u.is_empty())
-                                .map(|u| format!("https://{}", u.replace("%%", "400x400")))
-                                .unwrap_or_else(|| {
-                                    artwork.clone().unwrap_or_else(|| {
-                                        "https://images.unsplash.com/photo-1614149162883-504ce4d13909?w=400&q=80".to_string()
-                                    })
-                                });
-                            latest_release = Some(ArtistRelease {
-                                external_url: format!("https://music.yandex.ru/album/{}", rid),
-                                id: rid,
-                                title: r_title,
-                                artwork: r_cover,
-                                year: r["year"].as_u64().map(|y| y as u16),
-                                release_type: r["type"].as_str().map(String::from),
-                                release_date: r["releaseDate"].as_str().map(String::from),
-                                track_count: r["trackCount"].as_u64().map(|c| c as u32),
-                            });
+                        latest_release = parse_release(r);
+                    }
+
+                    let mut seen_rel_ids = std::collections::HashSet::new();
+                    if let Some(alb_arr) = res["albums"].as_array() {
+                        for r in alb_arr.iter().take(40) {
+                            if let Some(rel) = parse_release(r) {
+                                if !seen_rel_ids.insert(rel.id.clone()) {
+                                    continue;
+                                }
+                                let rtype = rel.release_type.as_deref().unwrap_or("").to_lowercase();
+                                if rtype == "single" || rtype == "ep" {
+                                    if singles.len() < 24 {
+                                        singles.push(rel);
+                                    }
+                                } else if albums.len() < 24 {
+                                    albums.push(rel);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(last_arr) = res["lastReleases"].as_array() {
+                        for r in last_arr.iter().take(24) {
+                            if let Some(rel) = parse_release(r) {
+                                if !seen_rel_ids.insert(rel.id.clone()) {
+                                    continue;
+                                }
+                                let rtype = rel.release_type.as_deref().unwrap_or("").to_lowercase();
+                                if rtype == "single" || rtype == "ep" {
+                                    if singles.len() < 24 {
+                                        singles.push(rel);
+                                    }
+                                } else if albums.len() < 24 {
+                                    albums.push(rel);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(pop_arr) = res["popularTracks"].as_array() {
+                        for t in pop_arr.iter().take(20) {
+                            if let Some(tr) = Self::parse_track(t) {
+                                popular_tracks.push(tr);
+                            }
                         }
                     }
 
@@ -827,6 +884,10 @@ impl YandexMusicProvider {
             monthly_listeners,
             latest_release,
             similar_artists,
+            albums,
+            singles,
+            popular_tracks,
+            genres,
         }))
     }
 

@@ -109,11 +109,41 @@ export async function connectYandex(token: string): Promise<SourceStatus[]> {
   return invoke<SourceStatus[]>('connect_yandex', { token });
 }
 
+export interface SoundCloudOAuthStatus {
+  sessionId: string | null;
+  pending: boolean;
+  authenticated: boolean;
+  accountName: string | null;
+  authUrl: string | null;
+  error: string | null;
+}
+
+export interface SoundCloudPollResult {
+  status: SoundCloudOAuthStatus;
+  sources: SourceStatus[] | null;
+}
+
 export async function connectSoundCloud(
   oauthToken: string | null,
   clientId: string | null
 ): Promise<SourceStatus[]> {
   return invoke<SourceStatus[]>('connect_soundcloud', { oauthToken, clientId });
+}
+
+export async function startSoundCloudOAuth(
+  relayUrl?: string | null
+): Promise<SoundCloudOAuthStatus> {
+  return invoke<SoundCloudOAuthStatus>('start_soundcloud_oauth', {
+    relayUrl: relayUrl ?? null,
+  });
+}
+
+export async function pollSoundCloudOAuth(): Promise<SoundCloudPollResult> {
+  return invoke<SoundCloudPollResult>('poll_soundcloud_oauth');
+}
+
+export async function cancelSoundCloudOAuth(): Promise<SoundCloudOAuthStatus> {
+  return invoke<SoundCloudOAuthStatus>('cancel_soundcloud_oauth');
 }
 
 
@@ -299,4 +329,70 @@ export async function setTrackCacheEnabled(enabled: boolean): Promise<void> {
 export async function reportWaveFeedback(track: Track, positive: boolean): Promise<void> {
   if (!isTauri()) return;
   await invoke('report_wave_feedback', { track, positive }).catch(() => {});
+}
+
+export async function audioLoadAndPlay(url: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_load_and_play', { url });
+}
+
+export async function audioPrepareNext(url: string): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_prepare_next', { url });
+}
+
+export async function audioCrossfade(params: {
+  durationSecs: number;
+  curve: 'equal-power' | 's-curve' | 'linear';
+  preset: 'auto' | 'fade' | 'rise';
+  bpmA?: number | null;
+  bpmB?: number | null;
+  keyA?: string | null;
+  keyB?: string | null;
+}): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_crossfade', {
+    durationSecs: params.durationSecs,
+    curve: params.curve,
+    preset: params.preset,
+    bpmA: params.bpmA ?? null,
+    bpmB: params.bpmB ?? null,
+    keyA: params.keyA ?? null,
+    keyB: params.keyB ?? null,
+  });
+}
+
+export async function audioPause(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_pause').catch(() => {});
+}
+
+export async function audioResume(): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_resume').catch(() => {});
+}
+
+export async function audioSeek(seconds: number): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_seek', { seconds }).catch(() => {});
+}
+
+export async function audioSetVolume(volume: number): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_set_volume', { volume }).catch(() => {});
+}
+
+export async function audioSetDucking(ducked: boolean): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_set_ducking', { ducked }).catch(() => {});
+}
+
+export async function audioSetEqBands(bands: number[]): Promise<void> {
+  if (!isTauri()) return;
+  await invoke('audio_set_eq_bands', { bands }).catch(() => {});
+}
+
+export async function audioGetStatus(): Promise<{ position: number; duration: number; is_playing: boolean } | null> {
+  if (!isTauri()) return null;
+  return invoke<{ position: number; duration: number; is_playing: boolean }>('audio_get_status').catch(() => null);
 }

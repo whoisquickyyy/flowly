@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Search, Play, ExternalLink, Sparkles, LayoutGrid, List, Heart } from 'lucide-svelte';
+  import { Search, Play, Sparkles, Heart, Clock, X } from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
   import * as api from '../api';
   import { fuzzySearchTracks, hasCyrillic, transliterateRuToEn } from '../fuzzySearch';
@@ -31,9 +31,79 @@
 
   let query = $state('');
   let sourceFilter = $state<SourceKind | null>(null);
-  let viewMode = $state<'grid' | 'list'>('grid');
   let groups = $state<GroupedSearchResult[]>([]);
   let loading = $state(false);
+
+  const RECENT_KEY = 'flowly_recent_searches';
+  let recentQueries = $state<string[]>(
+    (() => {
+      try {
+        const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(RECENT_KEY) : null;
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) return parsed.filter((x): x is string => typeof x === 'string').slice(0, 10);
+        }
+      } catch {
+        // ignore
+      }
+      return [];
+    })()
+  );
+
+  function saveRecentQuery(rawQ: string) {
+    const clean = rawQ.trim();
+    if (clean.length < 2) return;
+    const next = [clean, ...recentQueries.filter((x) => x.toLowerCase() !== clean.toLowerCase())].slice(0, 10);
+    recentQueries = next;
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+    } catch {
+      // ignore
+    }
+  }
+
+  function removeRecentQuery(target: string) {
+    recentQueries = recentQueries.filter((x) => x !== target);
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(recentQueries));
+    } catch {
+      // ignore
+    }
+  }
+
+  function clearRecentQueries() {
+    recentQueries = [];
+    try {
+      localStorage.removeItem(RECENT_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  const MOOD_CARDS = [
+    { title: 'Phonk', sub: 'Драйв и басы', q: 'phonk', grad: 'linear-gradient(135deg, #4c1d95, #be185d)' },
+    { title: 'Lo-Fi & Chill', sub: 'Спокойный фон', q: 'lofi chill beats', grad: 'linear-gradient(135deg, #0f766e, #1d4ed8)' },
+    { title: 'Русский рэп', sub: 'Новинки и хиты', q: 'русский рэп', grad: 'linear-gradient(135deg, #991b1b, #d97706)' },
+    { title: 'Электроника', sub: 'Synth, House, Techno', q: 'electronic house', grad: 'linear-gradient(135deg, #0369a1, #6d28d9)' },
+    { title: 'Инди и рок', sub: 'Гитары и атмосфера', q: 'indie rock', grad: 'linear-gradient(135deg, #3f6212, #0d9488)' },
+    { title: 'Ночной драйв', sub: 'Для поздних поездок', q: 'night drive synthwave', grad: 'linear-gradient(135deg, #312e81, #701a75)' },
+    { title: 'Для фокуса', sub: 'Кодинг и работа', q: 'ambient instrumental', grad: 'linear-gradient(135deg, #1e293b, #0f766e)' },
+    { title: 'Саундтреки', sub: 'Кино и игры', q: 'soundtrack ost', grad: 'linear-gradient(135deg, #7c2d12, #9f1239)' },
+  ];
+
+  const libraryArtists = $derived.by(() => {
+    const map = new Map<string, { name: string; artwork: string }>();
+    for (const t of localLibrary) {
+      const name = t.artist.split(/[,&]/)[0]?.trim() || t.artist;
+      if (name && t.artwork && !map.has(name)) {
+        map.set(name, { name, artwork: t.artwork });
+        if (map.size >= 10) break;
+      }
+    }
+    return Array.from(map.values());
+  });
+
+  const quickTracks = $derived(localLibrary.slice(0, 8));
 
   const mergedTracks = $derived.by(() => {
     const out: Track[] = [];
@@ -109,6 +179,9 @@
       }
 
       groups = filtered;
+      if (cleanQ && filtered.some((g) => g.tracks.length > 0)) {
+        saveRecentQuery(cleanQ);
+      }
     } finally {
       loading = false;
     }
@@ -140,6 +213,7 @@
     class="search-bar"
     onsubmit={(e) => {
       e.preventDefault();
+      if (query.trim()) saveRecentQuery(query);
       runSearch();
     }}
   >
@@ -149,11 +223,24 @@
       bind:value={query}
       placeholder="Поиск по Яндекс Музыке и SoundCloud..."
     />
+    {#if query}
+      <button
+        type="button"
+        class="search-clear"
+        onclick={() => {
+          query = '';
+          groups = [];
+        }}
+        aria-label="Очистить поиск"
+      >
+        <X size={14} />
+      </button>
+    {/if}
     <button type="submit" class="search-btn">Найти</button>
   </form>
 
-  <div class="search-toolbar">
-    {#if enabledSources.length > 1}
+  {#if enabledSources.length > 1}
+    <div class="search-toolbar">
       <div class="filters">
         <button class:active={sourceFilter === null} onclick={() => { sourceFilter = null; runSearch(); }}>Все</button>
         {#if enabledSources.includes('yandex')}
@@ -163,29 +250,111 @@
           <button class:active={sourceFilter === 'soundcloud'} onclick={() => { sourceFilter = 'soundcloud'; runSearch(); }}>SoundCloud</button>
         {/if}
       </div>
-    {/if}
-
-    <div class="view-toggle">
-      <button
-        type="button"
-        class:active={viewMode === 'grid'}
-        onclick={() => (viewMode = 'grid')}
-        title="Мозаика обложек"
-        aria-label="Сетка"
-      >
-        <LayoutGrid size={14} />
-      </button>
-      <button
-        type="button"
-        class:active={viewMode === 'list'}
-        onclick={() => (viewMode = 'list')}
-        title="Список по сервисам"
-        aria-label="Список"
-      >
-        <List size={14} />
-      </button>
     </div>
-  </div>
+  {/if}
+
+  {#if !query.trim() && !loading}
+    <div class="search-discover">
+      {#if recentQueries.length > 0}
+        <div class="disc-section">
+          <div class="disc-head">
+            <h3>Недавние запросы</h3>
+            <button type="button" class="disc-clear-btn" onclick={clearRecentQueries}>Очистить</button>
+          </div>
+          <div class="recent-chips">
+            {#each recentQueries as rq (rq)}
+              <div class="recent-chip">
+                <button
+                  type="button"
+                  class="recent-chip-main"
+                  onclick={() => {
+                    query = rq;
+                    runSearch();
+                  }}
+                >
+                  <Clock size={12} />
+                  <span>{rq}</span>
+                </button>
+                <button
+                  type="button"
+                  class="recent-chip-del"
+                  onclick={() => removeRecentQuery(rq)}
+                  aria-label={`Удалить ${rq}`}
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      <div class="disc-section">
+        <div class="disc-head">
+          <h3>Обзор по жанрам и настроениям</h3>
+        </div>
+        <div class="mood-grid">
+          {#each MOOD_CARDS as card (card.q)}
+            <button
+              type="button"
+              class="mood-card"
+              style="background: {card.grad}"
+              onclick={() => {
+                query = card.q;
+                saveRecentQuery(card.q);
+                runSearch();
+              }}
+            >
+              <span class="mood-title">{card.title}</span>
+              <span class="mood-sub">{card.sub}</span>
+            </button>
+          {/each}
+        </div>
+      </div>
+
+      {#if libraryArtists.length > 0}
+        <div class="disc-section">
+          <div class="disc-head">
+            <h3>Артисты из вашей медиатеки</h3>
+          </div>
+          <div class="fav-artists-grid">
+            {#each libraryArtists as art (art.name)}
+              <button type="button" class="fav-artist-card" onclick={() => onOpenArtist?.(art.name)}>
+                <img src={art.artwork} alt={art.name} loading="lazy" />
+                <span>{art.name}</span>
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+
+      {#if quickTracks.length > 0}
+        <div class="disc-section">
+          <div class="disc-head">
+            <h3>Быстрый старт</h3>
+          </div>
+          <div class="quick-tracks-grid">
+            {#each quickTracks as tr (tr.id)}
+              <button
+                type="button"
+                class="quick-track-card"
+                onclick={() => onPlayTrack(tr, quickTracks)}
+              >
+                <div class="qt-cover">
+                  <img src={tr.artwork} alt={tr.title} loading="lazy" />
+                  <span class="qt-play"><Play size={14} fill="currentColor" /></span>
+                </div>
+                <div class="qt-meta">
+                  <div class="qt-title">{tr.title}</div>
+                  <div class="qt-artist">{tr.artist}</div>
+                </div>
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   {#if foundArtists.length > 0 && !loading}
     <div class="artists-strip">
@@ -224,20 +393,12 @@
   {/if}
 
   {#if loading}
-    {#if viewMode === 'grid'}
-      <div class="search-bento-grid">
-        {#each Array(9) as _, i (i)}
-          <div class="s-skel-tile" class:featured={i === 0}></div>
-        {/each}
-      </div>
-    {:else}
-      <div class="groups-list">
-        {#each Array(6) as _, i (i)}
-          <div class="s-skel-row"></div>
-        {/each}
-      </div>
-    {/if}
-  {:else if viewMode === 'grid'}
+    <div class="search-bento-grid">
+      {#each Array(9) as _, i (i)}
+        <div class="s-skel-tile" class:featured={i === 0}></div>
+      {/each}
+    </div>
+  {:else}
     {#each groups as group (group.source)}
       {@const isConnected = authStatuses.find((a) => a.source === group.source)?.connected ?? false}
       {#if (!isConnected && authStatuses.length > 0) || group.error === 'Вы не авторизованы'}
@@ -300,65 +461,18 @@
     {:else if query.trim()}
       <div class="hint">Ничего не найдено по запросу «{query}».</div>
     {/if}
-  {:else}
-    <div class="groups-list">
-      {#each groups as group (group.source)}
-        {@const isConnected = authStatuses.find((a) => a.source === group.source)?.connected ?? false}
-        <div class="source-group">
-          <div class="group-head">
-            <SourceBadge source={group.source} />
-            <span class="group-count">{group.tracks.length}</span>
-            {#if group.error && group.error !== 'Вы не авторизованы'}
-              <span class="group-note">{group.error}</span>
-            {/if}
-          </div>
-
-          {#if (!isConnected && authStatuses.length > 0) || group.error === 'Вы не авторизованы'}
-            <div class="unauth-card">
-              <div class="unauth-text">
-                <strong>Вы не авторизованы</strong>
-                <span>Войдите в {group.sourceName}, чтобы искать и слушать треки из этого сервиса.</span>
-              </div>
-              {#if onOpenAuth}
-                <button type="button" class="unauth-btn" onclick={onOpenAuth}>Войти</button>
-              {/if}
-            </div>
-          {:else if group.tracks.length > 0}
-            <div class="group-tracks">
-              {#each group.tracks as track (track.id)}
-                <div class="s-row">
-                  <button class="s-cover" onclick={() => onPlayTrack(track, group.tracks)}>
-                    <img src={track.artwork} alt={track.title} />
-                    <span class="s-play"><Play size={14} fill="currentColor" /></span>
-                  </button>
-                  <button type="button" class="s-meta" onclick={() => onPlayTrack(track, group.tracks)}>
-                    <div class="s-title">{track.title}</div>
-                    <div class="s-sub">{track.artist} · {track.album}</div>
-                  </button>
-                  <span class="s-dur">{formatDuration(track.duration)}</span>
-                  <button
-                    class="s-ext"
-                    title="Открыть в оригинальном сервисе"
-                    onclick={() => api.openExternalUrl(track.externalUrl)}
-                  >
-                    <ExternalLink size={14} />
-                  </button>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-      {/each}
-    </div>
   {/if}
 </section>
 
 <style>
   .search-view {
-    padding: 20px 28px;
+    padding: clamp(20px, 2.2vw, 32px) clamp(24px, 3vw, 44px);
+    max-width: 1260px;
+    width: 100%;
+    margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 18px;
   }
 
   .search-bar {
@@ -379,6 +493,268 @@
     color: var(--text-primary);
     font-size: 14px;
     outline: none;
+  }
+
+  .search-clear {
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+
+  .search-clear:hover {
+    background: rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+  }
+
+  .search-discover {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    margin-top: 4px;
+  }
+
+  .disc-section {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .disc-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .disc-head h3 {
+    margin: 0;
+    font-size: clamp(14px, 1.1vw, 16px);
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .disc-clear-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 12px;
+    cursor: pointer;
+  }
+
+  .disc-clear-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .recent-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .recent-chip {
+    display: inline-flex;
+    align-items: center;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.055);
+    border: 1px solid var(--border-subtle);
+    overflow: hidden;
+    transition: background 0.14s ease, border-color 0.14s ease;
+  }
+
+  .recent-chip:hover {
+    background: rgba(255, 255, 255, 0.09);
+    border-color: rgba(255, 255, 255, 0.18);
+  }
+
+  .recent-chip-main {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 7px 10px 7px 12px;
+    border: none;
+    background: transparent;
+    color: var(--text-primary);
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+
+  .recent-chip-del {
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    padding: 7px 10px 7px 2px;
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+  }
+
+  .recent-chip-del:hover {
+    color: #fb7185;
+  }
+
+  .mood-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(clamp(180px, 15vw, 240px), 1fr));
+    gap: 12px;
+  }
+
+  .mood-card {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 14px;
+    padding: 16px 18px;
+    min-height: 86px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: flex-start;
+    text-align: left;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+    transition: transform 0.15s ease, filter 0.15s ease;
+  }
+
+  .mood-card:hover {
+    transform: translateY(-2px);
+    filter: brightness(1.1);
+  }
+
+  .mood-title {
+    font-size: 15px;
+    font-weight: 800;
+    color: #fff;
+  }
+
+  .mood-sub {
+    font-size: 11.5px;
+    color: rgba(255, 255, 255, 0.8);
+  }
+
+  .fav-artists-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+    gap: 12px;
+  }
+
+  .fav-artist-card {
+    border: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 14px;
+    padding: 12px 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    transition: background 0.14s ease, transform 0.14s ease;
+  }
+
+  .fav-artist-card:hover {
+    background: rgba(255, 255, 255, 0.07);
+    transform: translateY(-2px);
+  }
+
+  .fav-artist-card img {
+    width: 68px;
+    height: 68px;
+    border-radius: 50%;
+    object-fit: cover;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  }
+
+  .fav-artist-card span {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .quick-tracks-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 10px;
+  }
+
+  .quick-track-card {
+    border: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.035);
+    border-radius: 12px;
+    padding: 8px 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.14s ease;
+  }
+
+  .quick-track-card:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .qt-cover {
+    position: relative;
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  .qt-cover img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .qt-play {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.45);
+    color: #fff;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+
+  .quick-track-card:hover .qt-play {
+    opacity: 1;
+  }
+
+  .qt-meta {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .qt-title {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .qt-artist {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .search-btn {
@@ -412,12 +788,6 @@
     color: var(--text-primary);
   }
 
-  .groups-list {
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }
-
   .source-group {
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
@@ -432,20 +802,6 @@
     display: flex;
     align-items: center;
     gap: 10px;
-  }
-
-  .group-count {
-    font-size: 11px;
-    color: var(--text-muted);
-    background: var(--bg-elevated);
-    padding: 1px 7px;
-    border-radius: 999px;
-  }
-
-  .group-note {
-    margin-left: auto;
-    font-size: 11px;
-    color: var(--text-muted);
   }
 
   .unauth-card {
@@ -571,20 +927,6 @@
     font-variant-numeric: tabular-nums;
   }
 
-  .s-ext {
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-    padding: 6px;
-    border-radius: var(--radius-sm);
-  }
-
-  .s-ext:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
   .hint {
     padding: 32px;
     text-align: center;
@@ -607,32 +949,6 @@
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
-  }
-
-  .view-toggle {
-    margin-left: auto;
-    display: inline-flex;
-    padding: 3px;
-    border-radius: 10px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-    gap: 2px;
-  }
-
-  .view-toggle button {
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    padding: 5px 8px;
-    border-radius: 7px;
-    display: grid;
-    place-items: center;
-    cursor: pointer;
-  }
-
-  .view-toggle button.active {
-    background: var(--bg-elevated);
-    color: var(--text-primary);
   }
 
   .artists-strip {
@@ -801,14 +1117,6 @@
   .s-skel-tile.featured {
     grid-column: span 2;
     grid-row: span 2;
-  }
-
-  .s-skel-row {
-    height: 46px;
-    border-radius: 10px;
-    background: linear-gradient(90deg, rgba(255, 255, 255, 0.03) 25%, rgba(255, 255, 255, 0.07) 50%, rgba(255, 255, 255, 0.03) 75%);
-    background-size: 200% 100%;
-    animation: sSkel 1.4s infinite linear;
   }
 
   @keyframes sSkel {

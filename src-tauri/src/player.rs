@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::auth::SecretStore;
+use crate::auth::{SecretStore, SoundCloudOAuthState};
 use crate::discord_rpc::DiscordRpcHandle;
 use crate::models::{AudioEffectsConfig, PlayerState, SourceKind, Track};
 use crate::providers::ProviderRegistry;
@@ -26,6 +26,8 @@ pub struct AppState {
     pub wave_weights: RwLock<std::collections::HashMap<String, f32>>,
     pub discord_rpc: DiscordRpcHandle,
     pub track_cache: crate::track_cache::TrackCache,
+    pub audio_engine: Arc<std::sync::Mutex<Option<crate::audio::KitharaEngine>>>,
+    pub sc_oauth: Arc<RwLock<SoundCloudOAuthState>>,
 }
 
 impl AppState {
@@ -52,7 +54,10 @@ impl AppState {
         if let Some(rp) = store.data.repeat {
             player.repeat = rp;
         }
-        if let Some(last) = store.data.last_track.clone() {
+        if let Some(mut last) = store.data.last_track.clone() {
+            if last.source != SourceKind::Local {
+                last.playback_url = None;
+            }
             player.current_track = Some(last.clone());
             player.queue = if store.data.last_queue.is_empty() {
                 if store.data.liked_tracks.is_empty() {
@@ -89,6 +94,8 @@ impl AppState {
             store.data.discord_client_id.clone().unwrap_or_default(),
         );
 
+        let sc_oauth = SoundCloudOAuthState::from_secrets(&store.data);
+
         Self {
             player: RwLock::new(player),
             registry: Arc::new(RwLock::new(registry)),
@@ -106,6 +113,10 @@ impl AppState {
             wave_weights: RwLock::new(std::collections::HashMap::new()),
             discord_rpc,
             track_cache,
+            audio_engine: Arc::new(std::sync::Mutex::new(
+                crate::audio::KitharaEngine::new().ok(),
+            )),
+            sc_oauth: Arc::new(RwLock::new(sc_oauth)),
         }
     }
 }

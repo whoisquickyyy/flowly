@@ -88,7 +88,7 @@
     ramSaverEnabled = false,
     onRamSaverChange = () => {},
     initialTab = 'services',
-    mix = { enabled: true, mode: 'auto', preset: 'fade', durationSec: 6, eqSweep: true },
+    mix = { enabled: true, preset: 'auto', curve: 'equal-power', durationSec: 6 },
     onMixChange = () => {},
     sbSession = null,
     sbProfile = null,
@@ -562,6 +562,79 @@
     }
   }
 
+  let scPollTimer: ReturnType<typeof setInterval> | null = null;
+  let scOAuthPending = $state(false);
+  let showScManual = $state(false);
+  let scOAuthRelay = $state(
+    typeof localStorage !== 'undefined'
+      ? localStorage.getItem('flowly_sc_oauth_relay') || ''
+      : ''
+  );
+
+  function stopScPolling() {
+    if (scPollTimer) {
+      clearInterval(scPollTimer);
+      scPollTimer = null;
+    }
+    scOAuthPending = false;
+  }
+
+  $effect(() => () => stopScPolling());
+
+  async function handleStartSoundCloudOAuth() {
+    stopScPolling();
+    busy.soundcloud = true;
+    feedback.soundcloud = '';
+    try {
+      const cleanRelay = scOAuthRelay.trim();
+      if (typeof localStorage !== 'undefined' && cleanRelay) {
+        localStorage.setItem('flowly_sc_oauth_relay', cleanRelay);
+      }
+      await api.startSoundCloudOAuth(cleanRelay || null);
+      scOAuthPending = true;
+      feedback.soundcloud = 'Открыли SoundCloud в браузере — подтвердите вход...';
+      let pollInFlight = false;
+      scPollTimer = setInterval(async () => {
+        if (pollInFlight) return;
+        pollInFlight = true;
+        try {
+          const res = await api.pollSoundCloudOAuth();
+          if (res.status.authenticated) {
+            stopScPolling();
+            busy.soundcloud = false;
+            if (res.sources) onSourcesChanged(res.sources);
+            feedback.soundcloud = res.status.accountName
+              ? `SoundCloud подключён (${res.status.accountName})`
+              : 'SoundCloud подключён';
+          } else if (res.status.error) {
+            stopScPolling();
+            busy.soundcloud = false;
+            feedback.soundcloud = res.status.error;
+          } else if (!res.status.pending) {
+            stopScPolling();
+            busy.soundcloud = false;
+          }
+        } catch (e) {
+          stopScPolling();
+          busy.soundcloud = false;
+          feedback.soundcloud = String(e);
+        } finally {
+          pollInFlight = false;
+        }
+      }, 700);
+    } catch (e) {
+      busy.soundcloud = false;
+      feedback.soundcloud = String(e);
+    }
+  }
+
+  async function handleCancelSoundCloudOAuth() {
+    stopScPolling();
+    busy.soundcloud = false;
+    await api.cancelSoundCloudOAuth().catch(() => {});
+    feedback.soundcloud = 'Авторизация отменена';
+  }
+
   async function handleConnectSoundCloud() {
     busy.soundcloud = true;
     feedback.soundcloud = '';
@@ -903,7 +976,6 @@
   {#if settingsTab === 'services'}
   <div class="services-list">
     {#each sources as src (src.source)}
-      {@const draft = proxyDrafts[src.source] ?? src.proxy}
       <div class="service-card">
         <div class="service-top">
           <div class="s-identity">
@@ -980,24 +1052,58 @@
             </div>
           {:else}
             <div class="guide-box">
-              <strong>Как подключить SoundCloud:</strong>
+              <strong>Вход через SoundCloud OAuth:</strong>
               <ol>
-                <li>В РФ обычно требуется <b>SOCKS5/HTTP прокси</b> — настройте его в блоке «Сеть» ниже.</li>
-                <li>Укажите <b>Client ID</b> (для поиска и публичных треков) и/или <b>OAuth Token</b> (для вашей медиатеки).</li>
+                <li>Нажмите <b>Войти через браузер</b> — страница авторизации откроется в системном браузере.</li>
+                <li>Сессия и <code>sessionId</code> сохраняются на стороне Rust; в РФ при необходимости настройте прокси ниже.</li>
               </ol>
             </div>
             <div class="auth-row">
-              <input type="password" bind:value={scToken} placeholder="OAuth Token (опционально)" />
-              <input type="text" bind:value={scClientId} placeholder="Client ID" />
-              <button
-                class="btn-accent"
-                disabled={busy.soundcloud}
-                onclick={handleConnectSoundCloud}
-              >
-                <KeyRound size={13} />
-                <span>Подключить</span>
-              </button>
+              {#if scOAuthPending}
+                <button
+                  class="btn-accent"
+                  disabled={true}
+                >
+                  <KeyRound size={13} />
+                  <span>Ожидаем вход в браузере...</span>
+                </button>
+                <button
+                  class="btn-ghost"
+                  onclick={handleCancelSoundCloudOAuth}
+                >
+                  <span>Отмена</span>
+                </button>
+              {:else}
+                <button
+                  class="btn-accent"
+                  disabled={busy.soundcloud}
+                  onclick={handleStartSoundCloudOAuth}
+                >
+                  <ExternalLink size={13} />
+                  <span>Войти через браузер</span>
+                </button>
+                <button
+                  class="btn-ghost"
+                  onclick={() => (showScManual = !showScManual)}
+                >
+                  <span>{showScManual ? 'Скрыть ручной ввод' : 'Ввести токен вручную'}</span>
+                </button>
+              {/if}
             </div>
+            {#if showScManual}
+              <div class="auth-row" style="margin-top: 8px;">
+                <input type="password" bind:value={scToken} placeholder="OAuth Token (опционально)" />
+                <input type="text" bind:value={scClientId} placeholder="Client ID" />
+                <button
+                  class="btn-accent"
+                  disabled={busy.soundcloud}
+                  onclick={handleConnectSoundCloud}
+                >
+                  <KeyRound size={13} />
+                  <span>Подключить</span>
+                </button>
+              </div>
+            {/if}
           {/if}
 
           {#if feedback[src.source]}
@@ -1006,24 +1112,6 @@
           {#if src.last_error}
             <div class="feedback err">{src.last_error}</div>
           {/if}
-        </div>
-
-        <!-- Прокси для РФ (Split-Tunneling) -->
-        <div class="proxy-row">
-          <span class="row-lbl">
-            <Shield size={13} />
-            <span>Сеть:</span>
-          </span>
-          <div class="mode-pills">
-            <button class:active={draft.mode === 'direct'} onclick={() => setProxyMode(src.source, 'direct')}>Direct</button>
-            <button class:active={draft.mode === 'socks5'} onclick={() => setProxyMode(src.source, 'socks5')}>SOCKS5</button>
-            <button class:active={draft.mode === 'http'} onclick={() => setProxyMode(src.source, 'http')}>HTTP</button>
-          </div>
-          {#if draft.mode !== 'direct'}
-            <input class="p-host" type="text" bind:value={draft.host} placeholder="127.0.0.1" />
-            <input class="p-port" type="number" bind:value={draft.port} placeholder="1080" />
-          {/if}
-          <button class="btn-sm" onclick={() => saveProxy(src.source)}>Применить прокси</button>
         </div>
 
         <!-- Provider Capability System -->
@@ -1040,6 +1128,39 @@
   {/if}
 
   {#if settingsTab === 'network'}
+  {@const scSource = sources.find((s) => s.source === 'soundcloud')}
+  {@const scDraft = proxyDrafts['soundcloud'] ?? scSource?.proxy ?? { mode: 'direct', host: '127.0.0.1', port: 1080 }}
+  <div class="service-card">
+    <div class="card-top">
+      <div class="card-title">
+        <Shield size={16} />
+        <span class="net-title">Прокси для SoundCloud</span>
+      </div>
+    </div>
+    <p class="active-src-desc">
+      Раздельное туннелирование (Split-Tunneling): прокси применяется только для SoundCloud, Яндекс Музыка всегда работает напрямую.
+    </p>
+    <div class="proxy-row">
+      <span class="row-lbl">
+        <Shield size={13} />
+        <span>Режим:</span>
+      </span>
+      <div class="mode-pills">
+        <button class:active={scDraft.mode === 'direct'} onclick={() => setProxyMode('soundcloud', 'direct')}>Direct</button>
+        <button class:active={scDraft.mode === 'socks5'} onclick={() => setProxyMode('soundcloud', 'socks5')}>SOCKS5</button>
+        <button class:active={scDraft.mode === 'http'} onclick={() => setProxyMode('soundcloud', 'http')}>HTTP</button>
+      </div>
+      {#if scDraft.mode !== 'direct'}
+        <input class="p-host" type="text" bind:value={scDraft.host} placeholder="127.0.0.1" />
+        <input class="p-port" type="number" bind:value={scDraft.port} placeholder="1080" />
+      {/if}
+      <button class="btn-sm" onclick={() => saveProxy('soundcloud')}>Применить прокси</button>
+    </div>
+    {#if feedback.soundcloud}
+      <div class="feedback">{feedback.soundcloud}</div>
+    {/if}
+  </div>
+
   <!-- Настройки DoH и Spicy Lyrics -->
   <div class="service-card">
     <div class="card-top">
@@ -1431,12 +1552,12 @@
     </div>
   </div>
 
-  <!-- Плавные переходы и кроссфейд -->
+  <!-- Плавные переходы и кроссфейд (Kithara) -->
   <div class="service-card">
     <div class="card-top">
       <div class="card-title">
         <Headphones size={16} />
-        <span class="net-title">Плавные переходы и кроссфейд</span>
+        <span class="net-title">Плавные переходы и Automix</span>
       </div>
       <RadixSwitch
         checked={mix.enabled}
@@ -1445,51 +1566,42 @@
       />
     </div>
     <p class="active-src-desc">
-      Бесшовное сведение треков при окончании композиции или ручном переключении с автоматическим подбором перехода.
+      Бесшовный кроссфейд между двумя деками (Equal Power, S-Curve, Linear) или умный Automix с подгонкой темпа и Rise-фильтром.
     </p>
 
     <div class="radio-grid">
       <div class="radio-group">
-        <span class="rg-lbl">Режим сведения</span>
+        <span class="rg-lbl">Режим перехода</span>
         <div class="mode-pills">
-          <button type="button" class:active={mix.mode === 'auto'} onclick={() => onMixChange({ ...mix, mode: 'auto' })}>Авто</button>
-          <button type="button" class:active={mix.mode === 'manual'} onclick={() => onMixChange({ ...mix, mode: 'manual' })}>Ручной</button>
+          <button type="button" class:active={mix.preset === 'auto'} onclick={() => onMixChange({ ...mix, preset: 'auto' })}>Auto</button>
+          <button type="button" class:active={mix.preset === 'fade'} onclick={() => onMixChange({ ...mix, preset: 'fade' })}>Fade</button>
+          <button type="button" class:active={mix.preset === 'rise'} onclick={() => onMixChange({ ...mix, preset: 'rise' })}>Rise</button>
         </div>
       </div>
 
       <div class="radio-group">
-        <span class="rg-lbl">Стиль перехода</span>
-        <div class="mode-pills">
-          <button type="button" class:active={mix.preset === 'fade'} onclick={() => onMixChange({ ...mix, preset: 'fade' })}>Fade</button>
-          <button type="button" class:active={mix.preset === 'rise'} onclick={() => onMixChange({ ...mix, preset: 'rise' })}>Rise</button>
-          <button type="button" class:active={mix.preset === 'bass-swap'} onclick={() => onMixChange({ ...mix, preset: 'bass-swap' })}>Bass Swap</button>
-          <button type="button" class:active={mix.preset === 'echo-out'} onclick={() => onMixChange({ ...mix, preset: 'echo-out' })}>Echo Out</button>
-          <button type="button" class:active={mix.preset === 'dj-vocal'} onclick={() => onMixChange({ ...mix, preset: 'dj-vocal' })}>DJ-вокал</button>
-        </div>
+        <span class="rg-lbl">Кривая кроссфейда</span>
+        <RadixSelect
+          value={mix.curve}
+          options={[
+            { value: 'equal-power', label: 'Плавный (Equal Power)' },
+            { value: 's-curve', label: 'Естественный (S-Curve)' },
+            { value: 'linear', label: 'Резкий (Linear)' },
+          ]}
+          onValueChange={(v) => onMixChange({ ...mix, curve: v as 'equal-power' | 's-curve' | 'linear' })}
+        />
       </div>
 
       <div class="radio-group">
         <span class="rg-lbl">Длительность кроссфейда: {mix.durationSec} сек</span>
         <RadixSlider
           value={mix.durationSec}
-          min={2}
+          min={1}
           max={12}
           step={1}
           ariaLabel="Длительность кроссфейда"
           onValueChange={(v) => onMixChange({ ...mix, durationSec: v })}
         />
-      </div>
-
-      <div class="radio-group">
-        <span class="rg-lbl">Частотный сдвиг (EQ Sweep)</span>
-        <div style="display: flex; align-items: center; gap: 10px; padding-top: 2px;">
-          <RadixSwitch
-            checked={mix.eqSweep}
-            ariaLabel="EQ Sweep"
-            onCheckedChange={(v) => onMixChange({ ...mix, eqSweep: v })}
-          />
-          <span class="active-src-desc" style="margin: 0;">Плавный срез баса при сведении</span>
-        </div>
       </div>
     </div>
   </div>
@@ -1647,10 +1759,10 @@
 
 <style>
   .settings-shell {
-    padding: 20px 28px;
+    padding: clamp(20px, 2.2vw, 32px) clamp(24px, 3vw, 44px);
     display: grid;
-    grid-template-columns: 224px minmax(0, 780px);
-    gap: 24px;
+    grid-template-columns: clamp(220px, 18vw, 260px) minmax(0, clamp(760px, 58vw, 1020px));
+    gap: clamp(22px, 2.2vw, 34px);
     align-items: start;
     justify-content: center;
   }
@@ -1808,6 +1920,25 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    border-radius: 10px;
+    border: 1px solid var(--border-subtle);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+
+  .btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.11);
   }
 
   .guide-box {

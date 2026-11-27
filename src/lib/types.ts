@@ -12,8 +12,8 @@ export type BackgroundMode =
   | 'fog-grain'
   | 'dynamic-lyrics';
 export type LayoutStyle = 'wave-dock' | 'modern-analog' | 'tv-mode';
-export type MixMode = 'auto' | 'manual';
-export type MixPreset = 'fade' | 'rise' | 'bass-swap' | 'echo-out' | 'dj-vocal';
+export type MixPreset = 'auto' | 'fade' | 'rise';
+export type CrossfadeCurve = 'equal-power' | 's-curve' | 'linear';
 export type WaveMood = 'mix' | 'energy' | 'chill' | 'discovery' | 'favorites';
 
 export interface WaveConfig {
@@ -21,21 +21,11 @@ export interface WaveConfig {
   mood: WaveMood;
 }
 
-export type ManualTransitionStyle =
-  | 'filter-cut'
-  | 'echo-tail'
-  | 'clean-whip'
-  | 'vinyl-brake'
-  | 'tape-whoosh'
-  | 'off';
-
 export interface MixConfig {
   enabled: boolean;
-  mode: MixMode;
   preset: MixPreset;
+  curve: CrossfadeCurve;
   durationSec: number;
-  eqSweep: boolean;
-  manualTransition?: ManualTransitionStyle;
 }
 export type LibrarySection =
   | 'allTracks'
@@ -202,6 +192,10 @@ export interface ArtistYandexInfo {
   latestRelease: ArtistRelease | null;
   externalUrl: string;
   similarArtists?: SimilarArtist[];
+  albums?: ArtistRelease[];
+  singles?: ArtistRelease[];
+  popularTracks?: Track[];
+  genres?: string[];
 }
 
 export type RecapPeriod = 'day' | 'week' | 'month' | 'all';

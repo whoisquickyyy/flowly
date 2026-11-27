@@ -247,4 +247,12 @@ pub struct ArtistYandexInfo {
     pub external_url: String,
     #[serde(default)]
     pub similar_artists: Vec<SimilarArtist>,
+    #[serde(default)]
+    pub albums: Vec<ArtistRelease>,
+    #[serde(default)]
+    pub singles: Vec<ArtistRelease>,
+    #[serde(default)]
+    pub popular_tracks: Vec<Track>,
+    #[serde(default)]
+    pub genres: Vec<String>,
 }

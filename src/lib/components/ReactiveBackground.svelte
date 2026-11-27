@@ -388,6 +388,11 @@
   <div class="rb-layer rb-grain"></div>
   <div class="rb-layer rb-vignette"></div>
 {:else if mode === 'dynamic-lyrics'}
+  <div
+    class="rb-layer rb-lyrics-ambient"
+    class:playing={isPlaying}
+    style={`--amb-1: ${palette.primary || '#ef4444'}; --amb-2: ${palette.secondary || '#8b5cf6'};`}
+  ></div>
   <div class="rb-layer rb-lyrics-bg">
     {#each kineticWords as kw (kw.id)}
       <span
@@ -470,6 +475,24 @@
     text-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
     animation: kinetic-pop 2.7s cubic-bezier(0.22, 1, 0.36, 1) forwards;
     will-change: transform, opacity, filter;
+  }
+
+  .rb-lyrics-ambient {
+    inset: -12%;
+    background:
+      radial-gradient(circle at 24% 30%, color-mix(in srgb, var(--amb-1, #ef4444) 36%, transparent), transparent 56%),
+      radial-gradient(circle at 76% 68%, color-mix(in srgb, var(--amb-2, #8b5cf6) 30%, transparent), transparent 58%),
+      radial-gradient(circle at 52% 48%, color-mix(in srgb, var(--amb-1, #ef4444) 16%, transparent), transparent 68%);
+    filter: blur(48px) saturate(1.25);
+    opacity: 0.72;
+    transition: background 0.9s ease, opacity 0.6s ease;
+    animation: rb-fog-drift 18s ease-in-out infinite alternate;
+    animation-play-state: paused;
+  }
+
+  .rb-lyrics-ambient.playing {
+    opacity: 0.92;
+    animation-play-state: running;
   }
 
   @keyframes kinetic-pop {

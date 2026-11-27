@@ -1,4 +1,5 @@
 mod activity;
+pub mod audio;
 mod auth;
 mod commands;
 mod discord_rpc;
@@ -28,6 +29,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -42,6 +44,26 @@ pub fn run() {
             app.manage(media_controls::SmtcHandle::spawn(app.handle()));
 
             app.manage(state);
+
+            // Прогреваем playback_url последнего трека в фоне после холодного старта
+            let warm_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let st = warm_handle.state::<AppState>();
+                let target = { st.player.read().await.current_track.clone() };
+                if let Some(tr) = target {
+                    if tr.source != models::SourceKind::Local && tr.playback_url.is_none() {
+                        let reg = st.registry.read().await;
+                        if let Ok(Some(url)) = reg.resolve_playback_url(tr.source, &tr.id).await {
+                            let mut pl = st.player.write().await;
+                            if let Some(ref mut cur) = pl.current_track {
+                                if cur.id == tr.id && cur.playback_url.is_none() {
+                                    cur.playback_url = Some(url);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             let show_item = MenuItemBuilder::with_id("show", "Открыть Flowly").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Выйти").build(app)?;
@@ -124,6 +146,9 @@ pub fn run() {
             commands::test_source_connection,
             commands::connect_yandex,
             commands::connect_soundcloud,
+            commands::start_soundcloud_oauth,
+            commands::poll_soundcloud_oauth,
+            commands::cancel_soundcloud_oauth,
             commands::disconnect_source,
             commands::get_all_playlists,
             commands::create_local_playlist,
@@ -155,6 +180,16 @@ pub fn run() {
             commands::set_track_cache_enabled,
             commands::report_wave_feedback,
             commands::open_external_url,
+            commands::audio_load_and_play,
+            commands::audio_prepare_next,
+            commands::audio_crossfade,
+            commands::audio_pause,
+            commands::audio_resume,
+            commands::audio_seek,
+            commands::audio_set_volume,
+            commands::audio_set_ducking,
+            commands::audio_set_eq_bands,
+            commands::audio_get_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

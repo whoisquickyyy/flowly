@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::models::{
-    AuthStatus, Playlist, ProviderCapabilities, ProxyConfig, SourceKind, Track,
+    AuthStatus, Playlist, ProviderCapabilities, ProxyConfig, ProxyMode, SourceKind, Track,
 };
 use crate::network::proxy::build_client;
 use crate::providers::{MusicProvider, ProviderError};
@@ -37,7 +37,27 @@ impl SoundCloudProvider {
         }
     }
 
-    async fn resolve_public_client_id(&self) -> Option<String> {
+    fn sc_endpoint(&self, target: &str) -> String {
+        if self.proxy.mode != ProxyMode::Direct {
+            return target.to_string();
+        }
+        let worker = option_env!("FLOWLY_SC_OAUTH_URL")
+            .map(|s| s.trim().trim_end_matches('/'))
+            .filter(|s| !s.is_empty())
+            .unwrap_or("https://flowly-sc-oauth.demashein.workers.dev");
+        let encoded: String = url::form_urlencoded::byte_serialize(target.as_bytes()).collect();
+        format!("{}/sc-proxy?url={}", worker, encoded)
+    }
+
+    pub async fn resolve_public_client_id(&self) -> Option<String> {
+        self.resolve_public_client_id_inner(false).await
+    }
+
+    pub async fn resolve_public_client_id_fresh(&self) -> Option<String> {
+        self.resolve_public_client_id_inner(true).await
+    }
+
+    async fn resolve_public_client_id_inner(&self, ignore_cooldown: bool) -> Option<String> {
         if let Some(ref cid) = self.client_id {
             return Some(cid.clone());
         }
@@ -48,15 +68,15 @@ impl SoundCloudProvider {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if self.auto_fail_until.load(std::sync::atomic::Ordering::Relaxed) > now {
+        if !ignore_cooldown && self.auto_fail_until.load(std::sync::atomic::Ordering::Relaxed) > now {
             return None;
         }
 
         let html = tokio::time::timeout(
-            std::time::Duration::from_secs(4),
+            std::time::Duration::from_secs(6),
             async {
                 self.client
-                    .get("https://soundcloud.com")
+                    .get(self.sc_endpoint("https://soundcloud.com"))
                     .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
                     .send()
                     .await
@@ -90,10 +110,10 @@ impl SoundCloudProvider {
             }
         }
 
-        for js_url in script_urls.into_iter().rev().take(4) {
+        for js_url in script_urls.into_iter().rev().take(12) {
             let Ok(Ok(resp)) = tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                self.client.get(&js_url).send(),
+                std::time::Duration::from_secs(5),
+                self.client.get(self.sc_endpoint(&js_url)).send(),
             )
             .await
             else {
@@ -102,10 +122,11 @@ impl SoundCloudProvider {
             let Ok(js) = resp.text().await else {
                 continue;
             };
-            for needle in ["client_id:\"", "client_id=\""] {
+            for needle in ["client_id:\"", "client_id=\"", "client_id:'", "client_id:'"] {
                 if let Some(idx) = js.find(needle) {
                     let after = &js[idx + needle.len()..];
-                    if let Some(q) = after.find('"') {
+                    let quote = if needle.ends_with('\'') { '\'' } else { '"' };
+                    if let Some(q) = after.find(quote) {
                         let cid = after[..q].trim();
                         if cid.len() >= 20 && cid.len() <= 48 && cid.chars().all(|c| c.is_ascii_alphanumeric()) {
                             *self.auto_client_id.write().await = Some(cid.to_string());
@@ -137,14 +158,44 @@ impl SoundCloudProvider {
         client_id: Option<String>,
     ) -> Result<String, ProviderError> {
         if let Some(ref tok) = oauth_token {
-            let resp = self
-                .client
-                .get("https://api-v2.soundcloud.com/me")
-                .header("Authorization", format!("OAuth {}", tok))
-                .send()
-                .await?
-                .error_for_status()?;
-            let json: Value = resp.json().await?;
+            // Сначала проверяем официальный OAuth 2.1 эндпоинт (Bearer), затем fallback на api-v2 (OAuth)
+            let mut me_json: Option<Value> = None;
+            let mut last_err: Option<ProviderError> = None;
+
+            for (url, auth_val) in [
+                ("https://api.soundcloud.com/me", format!("Bearer {}", tok)),
+                ("https://api.soundcloud.com/me", format!("OAuth {}", tok)),
+                ("https://api-v2.soundcloud.com/me", format!("OAuth {}", tok)),
+                ("https://api-v2.soundcloud.com/me", format!("Bearer {}", tok)),
+            ] {
+                match self
+                    .client
+                    .get(self.sc_endpoint(url))
+                    .header("Authorization", auth_val)
+                    .header("Accept", "application/json")
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
+                    .send()
+                    .await
+                {
+                    Ok(resp) => match resp.error_for_status() {
+                        Ok(ok_r) => match ok_r.json::<Value>().await {
+                            Ok(j) => {
+                                me_json = Some(j);
+                                break;
+                            }
+                            Err(e) => last_err = Some(e.into()),
+                        },
+                        Err(e) => last_err = Some(e.into()),
+                    },
+                    Err(e) => last_err = Some(e.into()),
+                }
+            }
+
+            let json = match me_json {
+                Some(j) => j,
+                None => return Err(last_err.unwrap_or(ProviderError::Unauthorized)),
+            };
+
             let name = json["username"]
                 .as_str()
                 .unwrap_or("SoundCloud User")
@@ -171,7 +222,10 @@ impl SoundCloudProvider {
     }
 
     fn parse_track(t: &Value) -> Option<Track> {
-        let id = t["id"].as_u64().map(|n| n.to_string())?;
+        let id = t["id"]
+            .as_u64()
+            .map(|n| n.to_string())
+            .or_else(|| t["id"].as_str().map(String::from))?;
         let title = t["title"].as_str()?.to_string();
         let artist = t["user"]["username"]
             .as_str()
@@ -219,15 +273,53 @@ impl SoundCloudProvider {
 
     pub async fn fetch_liked_tracks(&self) -> Result<Vec<Track>, ProviderError> {
         if let Some(ref tok) = self.oauth_token {
-            // 1. Попытка через v2 /me/track_likes
-            let mut req = self
-                .client
-                .get("https://api-v2.soundcloud.com/me/track_likes")
-                .query(&[("limit", "50")])
-                .header("Authorization", format!("OAuth {}", tok));
-            if let Some(ref cid) = self.client_id {
-                req = req.query(&[("client_id", cid.as_str())]);
+            // 1. Официальный OAuth 2.1 эндпоинт /me/likes/tracks и /me/favorites (Bearer)
+            for url in [
+                "https://api.soundcloud.com/me/likes/tracks?limit=50",
+                "https://api.soundcloud.com/me/favorites?limit=50",
+            ] {
+                if let Ok(resp) = self
+                    .client
+                    .get(self.sc_endpoint(url))
+                    .header("Authorization", format!("Bearer {}", tok))
+                    .header("Accept", "application/json")
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
+                    .send()
+                    .await
+                {
+                    if let Ok(ok_r) = resp.error_for_status() {
+                        if let Ok(json) = ok_r.json::<Value>().await {
+                            let arr_opt = json.as_array().or_else(|| json["collection"].as_array());
+                            if let Some(arr) = arr_opt {
+                                let tracks: Vec<Track> = arr
+                                    .iter()
+                                    .filter_map(|item| {
+                                        if item["track"].is_object() {
+                                            Self::parse_track(&item["track"])
+                                        } else {
+                                            Self::parse_track(item)
+                                        }
+                                    })
+                                    .collect();
+                                if !tracks.is_empty() {
+                                    return Ok(tracks);
+                                }
+                            }
+                        }
+                    }
+                }
             }
+
+            // 2. Попытка через v2 /me/track_likes (для cookie/OAuth токенов)
+            let v2_likes_url = if let Some(ref cid) = self.client_id {
+                format!("https://api-v2.soundcloud.com/me/track_likes?limit=50&client_id={}", cid)
+            } else {
+                "https://api-v2.soundcloud.com/me/track_likes?limit=50".to_string()
+            };
+            let req = self
+                .client
+                .get(self.sc_endpoint(&v2_likes_url))
+                .header("Authorization", format!("OAuth {}", tok));
             if let Ok(resp) = req.send().await {
                 if let Ok(ok_r) = resp.error_for_status() {
                     if let Ok(json) = ok_r.json::<Value>().await {
@@ -386,6 +478,23 @@ impl SoundCloudProvider {
     pub async fn set_track_like(&self, track_id: &str, liked: bool) -> Result<(), ProviderError> {
         let tok = self.oauth_token.as_ref().ok_or(ProviderError::Unauthorized)?;
         let raw_id = track_id.strip_prefix("sc:").unwrap_or(track_id);
+        let v1_like_url = format!("https://api.soundcloud.com/likes/tracks/{}", raw_id);
+        let req = if liked {
+            self.client.post(&v1_like_url)
+        } else {
+            self.client.delete(&v1_like_url)
+        };
+        if let Ok(resp) = req
+            .header("Authorization", format!("Bearer {}", tok))
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                return Ok(());
+            }
+        }
+
         let url = format!("https://api.soundcloud.com/me/favorites/{}", raw_id);
         let req = if liked {
             self.client.put(&url)
@@ -431,6 +540,51 @@ impl SoundCloudProvider {
 
     pub async fn fetch_playlists(&self) -> Result<Vec<Playlist>, ProviderError> {
         let tok = self.oauth_token.as_ref().ok_or(ProviderError::Unauthorized)?;
+        // 1. Официальный OAuth 2.1 эндпоинт /me/playlists (Bearer)
+        if let Ok(resp) = self
+            .client
+            .get(self.sc_endpoint("https://api.soundcloud.com/me/playlists?limit=25"))
+            .header("Authorization", format!("Bearer {}", tok))
+            .header("Accept", "application/json")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
+            .send()
+            .await
+        {
+            if let Ok(ok_r) = resp.error_for_status() {
+                if let Ok(json) = ok_r.json::<Value>().await {
+                    let arr_opt = json.as_array().or_else(|| json["collection"].as_array());
+                    if let Some(arr) = arr_opt {
+                        let pls: Vec<Playlist> = arr
+                            .iter()
+                            .filter_map(|p| {
+                                let id = p["id"].as_u64()?;
+                                let title = p["title"].as_str()?.to_string();
+                                let artwork = p["artwork_url"]
+                                    .as_str()
+                                    .map(|u| u.replace("-large.", "-t500x500."));
+                                let tracks = p["tracks"]
+                                    .as_array()
+                                    .map(|ts| ts.iter().filter_map(Self::parse_track).collect())
+                                    .unwrap_or_default();
+                                Some(Playlist {
+                                    id: format!("sc-pl:{}", id),
+                                    title,
+                                    description: p["description"].as_str().map(String::from),
+                                    source: Some(SourceKind::SoundCloud),
+                                    is_local: false,
+                                    artwork,
+                                    tracks,
+                                })
+                            })
+                            .collect();
+                        if !pls.is_empty() {
+                            return Ok(pls);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut req = self
             .client
             .get("https://api-v2.soundcloud.com/me/playlists")
@@ -525,19 +679,55 @@ impl MusicProvider for SoundCloudProvider {
     }
 
     async fn search(&self, query: &str) -> Result<Vec<Track>, ProviderError> {
-        let eff_cid = self.resolve_public_client_id().await;
-        let mut req = self
-            .client
-            .get("https://api-v2.soundcloud.com/search/tracks")
-            .query(&[("q", query), ("limit", "20")]);
-
-        if let Some(ref cid) = eff_cid {
-            req = req.query(&[("client_id", cid.as_str())]);
-        }
+        let v1_search = format!(
+            "https://api.soundcloud.com/tracks?q={}&limit=20",
+            url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+        );
         if let Some(ref tok) = self.oauth_token {
-            req = req.header("Authorization", format!("OAuth {}", tok));
-        } else if eff_cid.is_none() {
-            return Err(ProviderError::Unauthorized);
+            if let Ok(resp) = self
+                .client
+                .get(self.sc_endpoint(&v1_search))
+                .header("Authorization", format!("Bearer {}", tok))
+                .header("Accept", "application/json")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
+                .send()
+                .await
+            {
+                if let Ok(ok_r) = resp.error_for_status() {
+                    if let Ok(json) = ok_r.json::<Value>().await {
+                        let arr_opt = json.as_array().or_else(|| json["collection"].as_array());
+                        if let Some(arr) = arr_opt {
+                            let tracks: Vec<Track> = arr.iter().filter_map(Self::parse_track).collect();
+                            if !tracks.is_empty() {
+                                return Ok(tracks);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let eff_cid = self.resolve_public_client_id().await;
+        let v2_search = if let Some(ref cid) = eff_cid {
+            format!(
+                "https://api-v2.soundcloud.com/search/tracks?q={}&limit=20&client_id={}",
+                url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>(),
+                cid
+            )
+        } else {
+            format!(
+                "https://api-v2.soundcloud.com/search/tracks?q={}&limit=20",
+                url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>()
+            )
+        };
+        let mut req = self.client.get(self.sc_endpoint(&v2_search));
+
+        if eff_cid.is_none() {
+            if let Some(ref tok) = self.oauth_token {
+                req = req.header("Authorization", format!("OAuth {}", tok));
+            } else {
+                return Err(ProviderError::Unauthorized);
+            }
         }
 
         let resp = req.send().await?.error_for_status()?;
@@ -549,19 +739,45 @@ impl MusicProvider for SoundCloudProvider {
     }
 
     async fn resolve_playback_url(&self, track_id: &str) -> Result<Option<String>, ProviderError> {
-        let eff_cid = self.resolve_public_client_id().await;
         let raw_id = track_id.strip_prefix("sc:").unwrap_or(track_id);
-        let mut req = self
-            .client
-            .get(format!("https://api-v2.soundcloud.com/tracks/{}", raw_id));
-
-        if let Some(ref cid) = eff_cid {
-            req = req.query(&[("client_id", cid.as_str())]);
-        }
         if let Some(ref tok) = self.oauth_token {
-            req = req.header("Authorization", format!("OAuth {}", tok));
-        } else if eff_cid.is_none() {
-            return Err(ProviderError::Unauthorized);
+            let v1_streams = format!("https://api.soundcloud.com/tracks/{}/streams", raw_id);
+            if let Ok(resp) = self
+                .client
+                .get(self.sc_endpoint(&v1_streams))
+                .header("Authorization", format!("Bearer {}", tok))
+                .header("Accept", "application/json")
+                .send()
+                .await
+            {
+                if let Ok(ok_r) = resp.error_for_status() {
+                    if let Ok(streams) = ok_r.json::<Value>().await {
+                        if let Some(u) = streams["http_mp3_128_url"]
+                            .as_str()
+                            .or_else(|| streams["hls_mp3_128_url"].as_str())
+                            .or_else(|| streams["hls_opus_64_url"].as_str())
+                        {
+                            return Ok(Some(self.sc_endpoint(u)));
+                        }
+                    }
+                }
+            }
+        }
+
+        let eff_cid = self.resolve_public_client_id().await;
+        let v2_track = if let Some(ref cid) = eff_cid {
+            format!("https://api-v2.soundcloud.com/tracks/{}?client_id={}", raw_id, cid)
+        } else {
+            format!("https://api-v2.soundcloud.com/tracks/{}", raw_id)
+        };
+        let mut req = self.client.get(self.sc_endpoint(&v2_track));
+
+        if eff_cid.is_none() {
+            if let Some(ref tok) = self.oauth_token {
+                req = req.header("Authorization", format!("OAuth {}", tok));
+            } else {
+                return Err(ProviderError::Unauthorized);
+            }
         }
 
         let json: Value = req.send().await?.error_for_status()?.json().await?;
@@ -575,15 +791,20 @@ impl MusicProvider for SoundCloudProvider {
             .and_then(|t| t["url"].as_str())
             .ok_or_else(|| ProviderError::Api("Нет доступного аудиопотока".into()))?;
 
-        let mut stream_req = self.client.get(transcoding_url);
-        if let Some(ref cid) = eff_cid {
-            stream_req = stream_req.query(&[("client_id", cid.as_str())]);
-        }
-        if let Some(ref tok) = self.oauth_token {
-            stream_req = stream_req.header("Authorization", format!("OAuth {}", tok));
+        let trans_target = if let Some(ref cid) = eff_cid {
+            let sep = if transcoding_url.contains('?') { '&' } else { '?' };
+            format!("{}{}client_id={}", transcoding_url, sep, cid)
+        } else {
+            transcoding_url.to_string()
+        };
+        let mut stream_req = self.client.get(self.sc_endpoint(&trans_target));
+        if eff_cid.is_none() {
+            if let Some(ref tok) = self.oauth_token {
+                stream_req = stream_req.header("Authorization", format!("OAuth {}", tok));
+            }
         }
 
         let stream_json: Value = stream_req.send().await?.error_for_status()?.json().await?;
-        Ok(stream_json["url"].as_str().map(String::from))
+        Ok(stream_json["url"].as_str().map(|u| self.sc_endpoint(u)))
     }
 }

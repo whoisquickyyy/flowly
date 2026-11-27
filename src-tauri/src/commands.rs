@@ -299,6 +299,30 @@ async fn play_track_inner(
 
 #[tauri::command]
 pub async fn toggle_playback(state: State<'_, AppState>) -> Result<PlayerState, String> {
+    let need_resolve = {
+        let player = state.player.read().await;
+        if let Some(ref tr) = player.current_track {
+            !player.is_playing && tr.source != SourceKind::Local && tr.playback_url.is_none()
+        } else {
+            false
+        }
+    };
+
+    if need_resolve {
+        let target = { state.player.read().await.current_track.clone() };
+        if let Some(tr) = target {
+            let registry = state.registry.read().await;
+            if let Ok(Some(url)) = registry.resolve_playback_url(tr.source, &tr.id).await {
+                let mut player = state.player.write().await;
+                if let Some(ref mut cur) = player.current_track {
+                    if cur.id == tr.id {
+                        cur.playback_url = Some(url);
+                    }
+                }
+            }
+        }
+    }
+
     let mut player = state.player.write().await;
     if player.current_track.is_some() {
         player.is_playing = !player.is_playing;
@@ -754,6 +778,227 @@ pub async fn connect_yandex(
     Ok(registry.all_statuses())
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoundCloudPollResult {
+    pub status: crate::auth::SoundCloudOAuthStatus,
+    pub sources: Option<Vec<SourceStatus>>,
+}
+
+fn generate_sc_session_id() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 16] = rng.gen();
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn generate_pkce_pair() -> (String, String) {
+    use base64::Engine;
+    use rand::Rng;
+    use sha2::{Digest, Sha256};
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let digest = Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    (verifier, challenge)
+}
+
+#[tauri::command]
+pub async fn start_soundcloud_oauth(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    relay_url: Option<String>,
+) -> Result<crate::auth::SoundCloudOAuthStatus, String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let explicit_relay = relay_url
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+    let stored_relay = {
+        let vault = state.vault.read().await;
+        vault.data.soundcloud_oauth_relay.clone()
+    };
+    let default_relay = option_env!("FLOWLY_SC_OAUTH_URL")
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "https://flowly-sc-oauth.demashein.workers.dev".to_string());
+
+    let relay = explicit_relay
+        .clone()
+        .or(stored_relay)
+        .unwrap_or(default_relay);
+
+    if !relay.starts_with("https://") && !relay.starts_with("http://") {
+        return Err("Некорректный URL OAuth-ретранслятора (нужен https:// или http://)".to_string());
+    }
+
+    if let Some(ref r) = explicit_relay {
+        let mut vault = state.vault.write().await;
+        vault.data.soundcloud_oauth_relay = Some(r.clone());
+        let _ = vault.save();
+    }
+
+    let session_id = generate_sc_session_id();
+    let (code_verifier, code_challenge) = generate_pkce_pair();
+
+    let auth_url = {
+        let mut ser = url::form_urlencoded::Serializer::new(String::new());
+        ser.append_pair("session_id", &session_id);
+        ser.append_pair("code_challenge", &code_challenge);
+        format!("{}/auth/start?{}", relay, ser.finish())
+    };
+
+    let status_snapshot = {
+        let mut oauth = state.sc_oauth.write().await;
+        oauth.session_id = Some(session_id);
+        oauth.code_verifier = Some(code_verifier);
+        oauth.relay_url = Some(relay);
+        oauth.pending = true;
+        oauth.authenticated = false;
+        oauth.account_name = None;
+        oauth.auth_url = Some(auth_url.clone());
+        oauth.error = None;
+        oauth.to_status()
+    };
+
+    app.opener()
+        .open_url(&auth_url, None::<&str>)
+        .map_err(|e| format!("Не удалось открыть системный браузер: {}", e))?;
+
+    Ok(status_snapshot)
+}
+
+#[tauri::command]
+pub async fn poll_soundcloud_oauth(
+    state: State<'_, AppState>,
+) -> Result<SoundCloudPollResult, String> {
+    let (pending, session_id, code_verifier, relay_url) = {
+        let guard = state.sc_oauth.read().await;
+        (
+            guard.pending,
+            guard.session_id.clone(),
+            guard.code_verifier.clone(),
+            guard.relay_url.clone(),
+        )
+    };
+
+    if pending {
+        if let (Some(sid), Some(verifier), Some(relay)) = (session_id, code_verifier, relay_url) {
+            let poll_url = {
+                let mut ser = url::form_urlencoded::Serializer::new(String::new());
+                ser.append_pair("session_id", &sid);
+                ser.append_pair("code_verifier", &verifier);
+                format!("{}/session?{}", relay, ser.finish())
+            };
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(6))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+
+            if let Ok(resp) = client.get(&poll_url).send().await {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    match json["status"].as_str() {
+                        Some("ok") => {
+                            if let Some(tok) = json["access_token"]
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from)
+                            {
+                                let worker_username = json["username"]
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(String::from);
+
+                                let verify_res = {
+                                    let mut reg = state.registry.write().await;
+                                    match reg
+                                        .soundcloud
+                                        .verify_credentials(Some(tok.clone()), None)
+                                        .await
+                                    {
+                                        Ok(acc) => Ok(acc),
+                                        Err(e) => {
+                                            if let Some(uname) = worker_username {
+                                                reg.soundcloud.set_credentials(
+                                                    Some(tok.clone()),
+                                                    None,
+                                                    Some(uname.clone()),
+                                                );
+                                                Ok(uname)
+                                            } else {
+                                                Err(e)
+                                            }
+                                        }
+                                    }
+                                };
+                                match verify_res {
+                                    Ok(account) => {
+                                        {
+                                            let mut vault = state.vault.write().await;
+                                            vault.data.soundcloud_token = Some(tok);
+                                            vault.data.soundcloud_account = Some(account.clone());
+                                            vault.data.soundcloud_session_id = Some(sid.clone());
+                                            let _ = vault.save();
+                                        }
+                                        let mut guard = state.sc_oauth.write().await;
+                                        guard.pending = false;
+                                        guard.authenticated = true;
+                                        guard.account_name = Some(account);
+                                        guard.code_verifier = None;
+                                        guard.error = None;
+                                    }
+                                    Err(e) => {
+                                        let mut guard = state.sc_oauth.write().await;
+                                        guard.pending = false;
+                                        guard.authenticated = false;
+                                        guard.code_verifier = None;
+                                        guard.error = Some(e.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        Some("error") => {
+                            let err = json["error"]
+                                .as_str()
+                                .unwrap_or("Ошибка авторизации SoundCloud")
+                                .to_string();
+                            let mut guard = state.sc_oauth.write().await;
+                            guard.pending = false;
+                            guard.code_verifier = None;
+                            guard.error = Some(err);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let status = state.sc_oauth.read().await.to_status();
+    let sources = if status.authenticated {
+        Some(state.registry.read().await.all_statuses())
+    } else {
+        None
+    };
+    Ok(SoundCloudPollResult { status, sources })
+}
+
+#[tauri::command]
+pub async fn cancel_soundcloud_oauth(
+    state: State<'_, AppState>,
+) -> Result<crate::auth::SoundCloudOAuthStatus, String> {
+    let mut oauth = state.sc_oauth.write().await;
+    oauth.pending = false;
+    oauth.code_verifier = None;
+    oauth.auth_url = None;
+    oauth.error = None;
+    Ok(oauth.to_status())
+}
+
 #[tauri::command]
 pub async fn connect_soundcloud(
     state: State<'_, AppState>,
@@ -772,12 +1017,23 @@ pub async fn connect_soundcloud(
             .map_err(|e| e.to_string())?
     };
 
+    let sid = generate_sc_session_id();
     {
         let mut vault = state.vault.write().await;
         vault.data.soundcloud_token = tok;
         vault.data.soundcloud_client_id = cid;
-        vault.data.soundcloud_account = Some(account);
+        vault.data.soundcloud_account = Some(account.clone());
+        vault.data.soundcloud_session_id = Some(sid.clone());
         vault.save()?;
+    }
+    {
+        let mut oauth = state.sc_oauth.write().await;
+        oauth.session_id = Some(sid);
+        oauth.pending = false;
+        oauth.authenticated = true;
+        oauth.account_name = Some(account);
+        oauth.auth_url = None;
+        oauth.error = None;
     }
 
     let registry = state.registry.read().await;
@@ -800,10 +1056,21 @@ pub async fn disconnect_source(
                 vault.data.soundcloud_token = None;
                 vault.data.soundcloud_client_id = None;
                 vault.data.soundcloud_account = None;
+                vault.data.soundcloud_session_id = None;
             }
             SourceKind::Local => {}
         }
         vault.save()?;
+    }
+
+    if source == SourceKind::SoundCloud {
+        let mut oauth = state.sc_oauth.write().await;
+        oauth.session_id = None;
+        oauth.pending = false;
+        oauth.authenticated = false;
+        oauth.account_name = None;
+        oauth.auth_url = None;
+        oauth.error = None;
     }
 
     let mut registry = state.registry.write().await;
@@ -1577,4 +1844,123 @@ pub async fn report_wave_feedback(
 #[tauri::command]
 pub fn set_track_cache_enabled(state: State<'_, AppState>, enabled: bool) {
     state.track_cache.set_enabled(enabled);
+}
+
+fn with_kithara<F, R>(state: &State<'_, AppState>, f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut crate::audio::KitharaEngine) -> Result<R, crate::audio::EngineError>,
+{
+    let mut guard = state
+        .audio_engine
+        .lock()
+        .map_err(|_| "Audio engine mutex poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = crate::audio::KitharaEngine::new().ok();
+    }
+    let engine = guard
+        .as_mut()
+        .ok_or_else(|| "Kithara audio engine unavailable".to_string())?;
+    f(engine).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn audio_load_and_play(state: State<'_, AppState>, url: String) -> Result<(), String> {
+    let eng_arc = state.audio_engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = eng_arc
+            .lock()
+            .map_err(|_| "Audio engine mutex poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = crate::audio::KitharaEngine::new().ok();
+        }
+        let engine = guard
+            .as_mut()
+            .ok_or_else(|| "Kithara audio engine unavailable".to_string())?;
+        engine.load_and_play(&url).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn audio_prepare_next(state: State<'_, AppState>, url: String) -> Result<(), String> {
+    let eng_arc = state.audio_engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut guard = eng_arc
+            .lock()
+            .map_err(|_| "Audio engine mutex poisoned".to_string())?;
+        if guard.is_none() {
+            *guard = crate::audio::KitharaEngine::new().ok();
+        }
+        let engine = guard
+            .as_mut()
+            .ok_or_else(|| "Kithara audio engine unavailable".to_string())?;
+        engine.prepare_next(&url).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn audio_crossfade(
+    state: State<'_, AppState>,
+    duration_secs: f32,
+    curve: crate::audio::CrossfadeCurve,
+    preset: crate::audio::MixPreset,
+    bpm_a: Option<f32>,
+    bpm_b: Option<f32>,
+    key_a: Option<String>,
+    key_b: Option<String>,
+) -> Result<(), String> {
+    with_kithara(&state, |e| {
+        e.crossfade_with_preset(
+            duration_secs,
+            curve,
+            preset,
+            bpm_a,
+            bpm_b,
+            key_a.as_deref(),
+            key_b.as_deref(),
+        )
+    })
+}
+
+#[tauri::command]
+pub fn audio_pause(state: State<'_, AppState>) -> Result<(), String> {
+    with_kithara(&state, |e| e.pause())
+}
+
+#[tauri::command]
+pub fn audio_resume(state: State<'_, AppState>) -> Result<(), String> {
+    with_kithara(&state, |e| e.resume())
+}
+
+#[tauri::command]
+pub fn audio_seek(state: State<'_, AppState>, seconds: f64) -> Result<(), String> {
+    with_kithara(&state, |e| e.seek(seconds))
+}
+
+#[tauri::command]
+pub fn audio_set_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
+    with_kithara(&state, |e| {
+        e.set_volume(volume);
+        Ok(())
+    })
+}
+
+#[tauri::command]
+pub fn audio_set_ducking(state: State<'_, AppState>, ducked: bool) -> Result<(), String> {
+    with_kithara(&state, |e| e.set_ducking(ducked))
+}
+
+#[tauri::command]
+pub fn audio_set_eq_bands(state: State<'_, AppState>, bands: Vec<f32>) -> Result<(), String> {
+    with_kithara(&state, |e| e.sync_eq_bands(&bands))
+}
+
+#[tauri::command]
+pub fn audio_get_status(
+    state: State<'_, AppState>,
+) -> Result<crate::audio::AudioPlaybackStatus, String> {
+    with_kithara(&state, |e| Ok(e.status()))
 }

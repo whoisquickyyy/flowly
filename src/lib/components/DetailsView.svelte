@@ -30,6 +30,7 @@
     Maximize2,
     Minimize2,
     User,
+    Library,
   } from 'lucide-svelte';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import SourceBadge from './SourceBadge.svelte';
@@ -105,8 +106,8 @@
     waveTracks = [],
     waveConfig = { sourceFilter: null, mood: 'mix' },
     enabledSources = ['yandex', 'soundcloud'],
-    mix = { enabled: true, mode: 'auto', preset: 'dj-vocal', durationSec: 6, eqSweep: true },
-    activeDjPreset = 'dj-vocal',
+    mix = { enabled: true, preset: 'auto', curve: 'equal-power', durationSec: 6 },
+    activeDjPreset = 'auto',
     likedTracks = [],
     recentTracks = [],
     localPlaylists = [],
@@ -158,6 +159,34 @@
   let playingSampleMbid = $state<string | null>(null);
   let copied = $state(false);
   let tvIdle = $state(false);
+
+  const collectionTracks = $derived.by(() => {
+    const map = new Map<string, Track>();
+    const add = (list: Track[]) => {
+      for (const t of list) {
+        if (!t?.id) continue;
+        if (enabledSources.length > 0 && !enabledSources.includes(t.source)) continue;
+        if (!map.has(t.id)) map.set(t.id, t);
+      }
+    };
+    add(likedTracks);
+    for (const pl of localPlaylists) {
+      add(pl.tracks);
+    }
+    add(recentTracks);
+    return [...map.values()];
+  });
+
+  function playRandomFromCollection() {
+    if (collectionTracks.length === 0) return;
+    const pool =
+      collectionTracks.length > 1 && track
+        ? collectionTracks.filter((t) => t.id !== track.id)
+        : collectionTracks;
+    const picked = pool[Math.floor(Math.random() * pool.length)] ?? collectionTracks[0];
+    const shuffled = [...collectionTracks].sort(() => Math.random() - 0.5);
+    onPlayTrack(picked, shuffled);
+  }
   let tvFullscreen = $state(false);
   let tvNow = $state(new Date());
   let tvIdleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -260,11 +289,9 @@
   ];
 
   const djPresetLabels: Record<MixPreset, string> = {
-    'dj-vocal': 'Beat + Vocal',
-    'bass-swap': 'Bass Swap',
-    rise: 'Rise',
-    'echo-out': 'Echo Out',
+    auto: 'Auto',
     fade: 'Fade',
+    rise: 'Rise',
   };
 
   const playbackModeInfo = $derived.by(() => {
@@ -574,39 +601,8 @@
 {:else}
 <div class="details-root">
   <section class="sc-stage">
-    <!-- Левая колонка: Моя волна -->
+    <!-- Левая колонка: Моя волна и Медиатека -->
     <aside class="side-panel">
-        <div class="wave-head-row">
-          <div class="panel-head">Волна</div>
-          <div class="wave-head-acts">
-            {#if waveActive}
-              <button
-                type="button"
-                class="wave-gear"
-                onclick={onResetWave}
-                title="Сбросить волну и включить случайный трек из библиотеки"
-                aria-label="Сбросить волну"
-              >
-                <RotateCcw size={12} />
-              </button>
-              <button
-                type="button"
-                class="wave-gear"
-                class:on={showWaveSettings}
-                onclick={() => (showWaveSettings = !showWaveSettings)}
-                title="Настройки волны"
-                aria-label="Настройки волны"
-              >
-                <SlidersHorizontal size={12} />
-              </button>
-              <button type="button" class="wave-go" disabled={waveBusy} onclick={launchWave}>
-                <Sparkles size={11} />
-                <span>{waveBusy ? 'Подбор...' : 'Обновить'}</span>
-              </button>
-            {/if}
-          </div>
-        </div>
-
         {#if !waveActive}
           <div class="wave-stub">
             <div class="wave-stub-icon">
@@ -666,6 +662,33 @@
           </div>
         {:else}
           <div class="wave-stub active-wave">
+            <div class="wave-card-top">
+              <span class="wave-live-pill">
+                <span class="wave-live-dot"></span>
+                Моя волна
+              </span>
+              <div class="wave-head-acts">
+                <button
+                  type="button"
+                  class="wave-gear"
+                  onclick={onResetWave}
+                  title="Сбросить волну"
+                  aria-label="Сбросить волну"
+                >
+                  <RotateCcw size={12} />
+                </button>
+                <button
+                  type="button"
+                  class="wave-gear"
+                  class:on={showWaveSettings}
+                  onclick={() => (showWaveSettings = !showWaveSettings)}
+                  title="Настройки волны"
+                  aria-label="Настройки волны"
+                >
+                  <SlidersHorizontal size={12} />
+                </button>
+              </div>
+            </div>
             <div class="wave-stub-icon" class:spinning={isPlaying}>
               <Radio size={22} />
             </div>
@@ -722,6 +745,33 @@
             </button>
           </div>
         {/if}
+
+        <div class="lib-quick-card">
+          <div class="lib-quick-head">
+            <div class="lib-quick-title">
+              <Library size={14} />
+              <span>Медиатека</span>
+            </div>
+            <span class="lib-quick-count">{collectionTracks.length} тр.</span>
+          </div>
+          <div class="lib-quick-sub">
+            {#if collectionTracks.length > 0}
+              Любимые ({likedTracks.length}) · Плейлисты ({localPlaylists.length})
+            {:else}
+              Лайкните треки или добавьте плейлисты
+            {/if}
+          </div>
+          <button
+            type="button"
+            class="lib-rand-btn"
+            disabled={collectionTracks.length === 0}
+            onclick={playRandomFromCollection}
+            title="Включить случайный трек из вашей коллекции"
+          >
+            <Shuffle size={14} />
+            <span>Случайный трек</span>
+          </button>
+        </div>
       </aside>
 
     <!-- Центральная сцена -->
@@ -1091,7 +1141,7 @@
             <span>3D-сцена</span>
           </button>
           <button type="button" class="dsp-pill" class:on={mix.enabled} onclick={onOpenEqTab}>
-            <span>{mix.enabled ? (mix.mode === 'auto' ? `DJ: ${djPresetLabels[activeDjPreset]}` : `Mix: ${djPresetLabels[mix.preset]}`) : 'Mix Выкл'}</span>
+            <span>{mix.enabled ? `Mix: ${djPresetLabels[mix.preset] ?? djPresetLabels[activeDjPreset]}` : 'Mix Выкл'}</span>
           </button>
         </div>
       </div>
@@ -1308,37 +1358,6 @@
     font-weight: 700;
     color: var(--text-primary);
     padding: 0 4px;
-  }
-
-  .wave-head-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-
-  .wave-go {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 4px 10px;
-    border-radius: 999px;
-    border: none;
-    background: var(--accent);
-    color: #0b0b0e;
-    font-size: 11px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: transform 0.12s ease, opacity 0.15s ease;
-  }
-
-  .wave-go:hover {
-    transform: scale(1.03);
-  }
-
-  .wave-go:disabled {
-    opacity: 0.6;
-    cursor: wait;
   }
 
   .wave-sources {
@@ -2009,10 +2028,35 @@
     justify-content: center;
     text-align: center;
     gap: 10px;
-    padding: 18px 12px;
+    padding: 16px 12px;
     border-radius: 14px;
-    background: rgba(255, 255, 255, 0.02);
-    border: 1px dashed rgba(255, 255, 255, 0.1);
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .wave-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    margin-bottom: 2px;
+  }
+
+  .wave-live-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+
+  .wave-live-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
   }
 
   .wave-stub-icon {
@@ -2726,5 +2770,77 @@
       align-items: center;
       text-align: center;
     }
+  }
+
+  .lib-quick-card {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border-radius: 14px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .lib-quick-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .lib-quick-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--text-primary);
+  }
+
+  .lib-quick-count {
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 10.5px;
+    font-weight: 700;
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--text-secondary);
+  }
+
+  .lib-quick-sub {
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.35;
+  }
+
+  .lib-rand-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.1s ease;
+  }
+
+  .lib-rand-btn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 26%, transparent);
+  }
+
+  .lib-rand-btn:active:not(:disabled) {
+    transform: scale(0.98);
+  }
+
+  .lib-rand-btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
   }
 </style>

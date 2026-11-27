@@ -28,12 +28,26 @@ export interface JamChatMessage {
   ts: number;
 }
 
+export interface PublicJamRoomInfo {
+  roomCode: string;
+  title: string;
+  hostName: string;
+  memberCount: number;
+  currentTrackTitle?: string;
+  currentTrackArtist?: string;
+  currentTrackArtwork?: string;
+  isPrivate: boolean;
+  updatedAt: number;
+}
+
 export interface JamRoomState {
   roomCode: string;
   myId: string;
   isHost: boolean;
   connected: boolean;
   relayUrl: string;
+  isPrivate?: boolean;
+  roomTitle?: string;
   members: JamMember[];
   queue: BlendedTrack[];
   currentTrack: Track | null;
@@ -81,7 +95,8 @@ export function trackMatchKey(t: Track): string {
 export function buildBlendedQueue(
   members: JamMember[],
   maxTracks = 120,
-  excludeKeys?: Set<string>
+  excludeKeys?: Set<string>,
+  shuffleJitter = false
 ): BlendedTrack[] {
   if (members.length === 0) return [];
 
@@ -133,6 +148,8 @@ export function buildBlendedQueue(
     const g = info.track.genre?.trim().toLowerCase() ?? '';
     const genreBoost = g ? (genreCounts.get(g) ?? 0) : 0;
 
+    const jitter = shuffleJitter ? Math.random() * 25 : 0;
+
     if (matchCount >= 2) {
       const namesPreview = info.ownerNames.slice(0, 2).join(' и ');
       const extra = info.ownerNames.length > 2 ? ` +${info.ownerNames.length - 2}` : '';
@@ -140,14 +157,14 @@ export function buildBlendedQueue(
         track: info.track,
         reason: `Совпадение: ${namesPreview}${extra}`,
         matchCount,
-        score: matchCount * 100 + genreBoost,
+        score: matchCount * 100 + genreBoost + jitter,
       });
     } else if (artMatch >= 2) {
       sharedArtists.push({
         track: info.track,
         reason: `Общий артист · ${info.ownerNames[0]}`,
         matchCount: 1,
-        score: artMatch * 40 + genreBoost,
+        score: artMatch * 40 + genreBoost + jitter,
       });
     } else {
       const firstOwnerId = [...info.owners][0];
@@ -157,7 +174,7 @@ export function buildBlendedQueue(
           track: info.track,
           reason: `Из вкусов: ${info.ownerNames[0]}`,
           matchCount: 1,
-          score: genreBoost * 10 + Math.random() * 5,
+          score: genreBoost * 10 + Math.random() * (shuffleJitter ? 30 : 5),
         });
       }
     }

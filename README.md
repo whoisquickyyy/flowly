@@ -1,121 +1,64 @@
-<p align="center">
-  <img src="src-tauri/icons/128x128.png" width="128" alt="Flowly" />
-</p>
+# Flowly (Aura Music) — Архитектура и структура проекта
 
-<h1 align="center">Flowly</h1>
-
-<p align="center">
-  <b>Мультистриминговый музыкальный плеер нового поколения.</b><br>
-  Яндекс Музыка, Spotify, SoundCloud и локальные файлы в одном окне.<br>
-  Умный шафл, Auto-Mix с битматчингом, живая погода, CSS-темы и OTA-обновления.
-</p>
-
-<p align="center">
-  <b>Скачать бесплатно</b><br><br>
-  <a href="https://github.com/whoisquickyyy/flowly/releases/latest">
-    <img src="https://img.shields.io/badge/Windows-FF3B5C?style=for-the-badge&logo=windows&logoColor=white" alt="Скачать для Windows" />
-  </a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/whoisquickyyy/flowly/releases/latest">
-    <img src="https://img.shields.io/github/v/release/whoisquickyyy/flowly?style=flat-square&color=1c1c1f&label=version" alt="Version" />
-  </a>
-  <a href="https://github.com/whoisquickyyy/flowly/releases">
-    <img src="https://img.shields.io/github/downloads/whoisquickyyy/flowly/total?style=flat-square&color=1c1c1f&label=downloads" alt="Downloads" />
-  </a>
-  <a href="https://github.com/whoisquickyyy/flowly/stargazers">
-    <img src="https://img.shields.io/github/stars/whoisquickyyy/flowly?style=flat-square&color=1c1c1f&label=stars" alt="Stars" />
-  </a>
-  <img src="https://img.shields.io/badge/Tauri-2.0-1c1c1f?style=flat-square" alt="Tauri 2" />
-  <img src="https://img.shields.io/badge/Svelte-5-1c1c1f?style=flat-square" alt="Svelte 5" />
-</p>
+Мультистриминговый десктопный музыкальный плеер на **Tauri v2 (Rust)** + **Svelte 5 (Runes)** + **Vite**.  
+Объединяет **Яндекс Музыку**, **SoundCloud**, локальную библиотеку, **«Мою волну»**, **Jam-комнаты**, 10-полосный эквалайзер и реактивные фоновые сцены.
 
 ---
 
-<p align="center">
-  <img src="readme-assets/poster-ru.png" width="100%" alt="Flowly — Мультистриминговый плеер нового поколения" />
-</p>
+## Стек и команды сборки
+
+- **Фронтенд**: Svelte 5 (`$state`, `$derived`, `$effect`), TypeScript, `bits-ui`, `lucide-svelte`, Web Audio API.
+- **Бэкенд**: Rust (Tauri 2), `tokio`, `reqwest` (Direct / SOCKS5 / HTTP прокси + DoH), `lofty` (метаданные локальных треков), `souvlaki` (SMTC), `discord-rich-presence`.
+- **Проверка и сборка**:
+  ```bash
+  npm run check      # svelte-check --tsconfig ./tsconfig.json
+  npm run build      # vite build
+  cd src-tauri && cargo check
+  ```
 
 ---
 
-## Возможности
+## Структура директорий
 
-### Музыка без границ и ограничений
-- **4 источника в одном плеере**: Яндекс Музыка (полная коллекция без лимита в 400 треков), Spotify, SoundCloud и **локальные папки** (`MP3`, `FLAC`, `WAV`, `OGG`, `M4A`, `AAC`, `OPUS` с чтением тегов и обложек).
-- **Split-Tunneling прокси + DoH**: гибкая настройка SOCKS5/HTTP прокси отдельно под каждый сервис и встроенный DNS-over-HTTPS.
-- **Объединённый поиск и Моя Волна**: поиск по всем сервисам сразу, лайки, локальные подборки и «Моя волна» с выбором настроения.
+### Фронтенд (`src/`)
 
-### Звук и DJ-переходы
-- **Два режима шафла**: честный **Обычный шафл** (Fisher-Yates с anti-repeat) и **BPM Flow** (заранее просчитанная волна по темпу с разносом артистов).
-- **Auto-Mix & Beatmatching**: автоматический подбор переходов (`Beat + Vocal`, `Bass Swap`, `Rise`, `Echo Out`, `Fade`) и подгонка темпа (`playbackRate` с сохранением тональности).
-- **Эффекты при ручном скипе**: `Filter Cut`, `Echo Tail`, `Винил (Brake)`, `Air Whoosh`, `Clean Whip` — без задержек и басовой каши.
-- **10-полосный эквалайзер**: встроенные и кастомные пресеты (включая `Gaming`, `Lo-Fi`, `Bass Boost`), нормализация громкости, Bass Boost и 3D-сцена.
+- `src/App.svelte` — главный оркестратор приложения:
+  - Состояние плеера (`player`), две HTMLAudioElement-деки (`audioA` / `audioB`) для бесшовного кроссфейда и предзагрузки.
+  - Обработка Jam-комнаты (WebSocket / Supabase Realtime, `realtime:jam-<code>` и лобби `realtime:jam-lobby`).
+  - Навигация по вкладкам (`details`, `library`, `playlists`, `search`, `recap`, `room`, `equalizer`, `settings`) и карточке артиста (`activeArtist`).
+- `src/lib/audioEngine.ts` — Web Audio API DSP-движок:
+  - Две входные деки (`deckGainA/B`, `deckFilterA/B`) → `preampGain` → 10-полосный параметрический EQ → `bassFilter` → `compressor` → `makeupGain` → **Spatial 3D-матрица (Mid-Side расширение + бинауральная комната)** → `limiter` → `analyser` (FFT).
+  - Кроссфейды `crossfadeTo(target, durationSec, preset, curve)` (`equal-power`, `s-curve`, `linear`, `rise`) и `beatmatchTransition`.
+- `src/lib/api.ts` — типизированная обёртка над `invoke(...)` для всех Tauri-команд.
+- `src/lib/types.ts` — общие TypeScript-интерфейсы (`Track`, `PlayerState`, `AudioEffectsConfig`, `MixConfig`, `ArtistYandexInfo`, `Playlist`, `SourceStatus` и др.).
+- `src/lib/jamRoom.ts` — чистая логика Jam-комнат: генерация кодов, сборка общего микса (`buildBlendedQueue`), типы состояния комнаты и открытого лобби.
+- `src/lib/camelot.ts` — определение BPM/тональности (колесо Камелота) и расчёт гармонического кроссфейда.
+- `src/lib/colorExtract.ts` — извлечение `CoverPalette` из обложки трека.
+- `src/lib/supabase.ts` — профиль Flowly, Supabase Auth и URL для Supabase Realtime.
+- `src/lib/components/`:
+  - `DetailsView.svelte` — главный экран «Сейчас играет», «Моя волна», быстрый блок «Медиатека», тексты песен, сэмплы, TV-режим.
+  - `ArtistView.svelte` — карточка артиста в стиле Яндекс Музыки (Hero-баннер, табы «Обзор / Треки / Альбомы / Синглы и EP / Похожие», встроенный просмотрщик альбома).
+  - `EqualizerPanel.svelte` — 10-полосный EQ, пресеты, настройки Mix & Auto-Mix переходов, Spatial 3D и Bass Boost.
+  - `RoomView.svelte` — интерфейс Jam-комнаты (общие/приватные комнаты, открытое лобби, вклад в микс, чат).
+  - `SettingsView.svelte` — аккаунты сервисов (Яндекс Музыка, SoundCloud OAuth 2.1 через браузер), прокси для SoundCloud и DoH (вкладка «Сеть и DoH»), темы, звук и обновления.
+  - `LibraryView.svelte`, `PlaylistsView.svelte`, `SearchView.svelte`, `RecapView.svelte`, `ReactiveBackground.svelte`, `ui/` (`RadixSelect`, `RadixSlider`, `RadixSwitch`).
 
-### Атмосфера и режимы
-- **Четыре режима сцены**: `Wave Dock`, `Modern Analog`, `TV Mode` (кино-лаунж с часами, погодой и полноэкранным режимом) и компактные виды.
-- **Динамическая тема по времени и погоде**: акцент и эффекты (дождь, снег, гроза, облака, звёзды) подстраиваются под погоду и время суток в твоём городе.
-- **Магазин тем и живой CSS-редактор**: готовые темы (`Cyberpunk Neon`, `Nordic Frost`, `Sakura Velvet`, `Matrix Terminal`, `Sunset Vinyl`) + редактор собственного CSS прямо в настройках.
-- **Режим экономии ОЗУ**: отключает предзагрузку второго трека, чистит буфер неактивной деки и убирает фоновые анимации.
+### Бэкенд (`src-tauri/src/`)
 
-### Интеграции
-- **Синхронизированные тексты**: встроенная поддержка **Spicy Lyrics** (караоке по словам), LRCLIB и текстов Яндекс Музыки.
-- **Детектор активности**: автоматически включает плейлист/эквалайзер для кодинга (VS Code / IntelliJ), игровой пресет (Steam/игры) или ставит паузу при просмотре YouTube.
-- **Discord Rich Presence**: отображает текущий трек, исполнителя, обложку и таймер прямо в профиле Discord.
-- **Симуляция радио**: виртуальный ведущий (`Edge Neural` / локальный `Piper TTS` / системный голос), который объявляет треки и погоду в эфире.
-- **OTA-обновления**: автоматическая проверка, загрузка и установка новых версий с GitHub Releases в один клик.
-
----
-
-## Сборка из исходников
-
-<details>
-<summary><b>Инструкция для разработчиков</b></summary>
-
-### Требования
-- **Node.js** 20+
-- **Rust** stable (`rustup`)
-- Для Windows: WebView2 и MSVC Build Tools
-
-### Запуск в dev-режиме
-```bash
-git clone https://github.com/whoisquickyyy/flowly.git
-cd flowly
-npm install
-npm run tauri dev
-```
-
-### Production-сборка
-```bash
-npm run tauri build
-```
-
-### Проверки
-```bash
-npm run check          # svelte-check (типы TypeScript / Svelte)
-cd src-tauri && cargo check
-```
-
-</details>
-
----
-
-## Стек
-
-| Компонент | Технология |
-|-----------|------------|
-| Оболочка | Tauri 2 (Rust) |
-| Фронтенд | Svelte 5, Vite 8, TypeScript |
-| Аудио | Web Audio API (EQ, фильтры, битматчинг) + локальный HTTP Range-прокси |
-| Локальные теги | `lofty`, `rfd` |
-| Детектор окон | `active-win-pos-rs` |
-| Интеграции | Spicy Lyrics, LRCLIB, Discord RPC, Edge/Piper TTS |
-| CI/CD и OTA | GitHub Actions (`tauri-action`), `tauri-plugin-updater` |
-
----
-
-<p align="center">
-  <a href="https://github.com/whoisquickyyy/flowly/releases/latest">
-    <img src="https://img.shields.io/badge/Скачать_Flowly-FF3B5C?style=for-the-badge&logoColor=white" alt="Скачать Flowly" height="44" />
-  </a>
-</p>
+- `lib.rs` — инициализация Tauri-плагинов (`updater`, `process`, `opener`), системного трея, `AppState`, локального `proxy_server`, SMTC и регистрация `invoke_handler`.
+- `player.rs` — `AppState` (состояние плеера, `ProviderRegistry`, `SecretStore`, `RecapStore`, `TrackCache`, `sc_oauth`).
+- `auth/mod.rs` — `SecretStore` (`secrets.json` в `app_data_dir`), `SoundCloudOAuthState` и `SoundCloudOAuthStatus` (единый источник правды для OAuth-сессии SoundCloud и `sessionId`).
+- `commands.rs` — все `#[tauri::command]` эндпоинты:
+  - Управление плеером, очередью, «Моей волной», лайками, плейлистами, локальными папками (включая фоновый прогрев `playback_url` последнего трека после холодного старта).
+  - Авторизация Яндекс Музыки и SoundCloud (`start_soundcloud_oauth` с PKCE + Cloudflare Worker `relay/soundcloud-oauth-worker.js` и `tauri-plugin-opener`, `poll_soundcloud_oauth` с опросом каждые 700 мс, `cancel_soundcloud_oauth`, `connect_soundcloud`).
+- `providers/`:
+  - `mod.rs` — `ProviderRegistry` (агрегация поиска, библиотеки, волны и стриминга по источникам).
+  - `yandex.rs` — клиент Яндекс Музыки (поиск, волна, альбомы, `brief-info` артиста, тексты, обложки).
+  - `soundcloud.rs` — клиент SoundCloud (официальный OAuth 2.1 `api.soundcloud.com` с `Bearer`-токеном + fallback на `api-v2`, автоматический `client_id`, лайки, плейлисты, поиск, стримы).
+- `relay/` — внешние ретрансляторы:
+  - `soundcloud-oauth-worker.js` + `wrangler-sc.toml` — Cloudflare Worker (KV `SC_SESSIONS`) для SoundCloud OAuth 2.1 PKCE и проксирования API/стримов SoundCloud (`/sc-proxy`), благодаря чему SoundCloud работает в режиме `Direct` без настройки прокси/VPN.
+  - `worker.js` + `server.mjs` — WebSocket Relay для Jam-комнат.
+- `proxy_server.rs` — локальный HTTP-прокси (`127.0.0.1:<port>`) для стриминга удалённых треков через настроенный прокси/DoH и отдачи локальных файлов (`/local`).
+- `network/` — сборка `reqwest::Client` с SOCKS5/HTTP прокси и DoH-резолвером.
+- `audio/` — зарезервированный модуль `kithara_engine.rs` (на данный момент воспроизведение и DSP работают через Web Audio API в `src/lib/audioEngine.ts`).
+- `lyrics.rs`, `recap.rs`, `samples.rs`, `radio_host.rs`, `discord_rpc.rs`, `media_controls.rs`, `local_library.rs`, `track_cache.rs` — вспомогательные подсистемы.

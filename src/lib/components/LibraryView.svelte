@@ -715,10 +715,10 @@
 
   .track-row {
     display: grid;
-    grid-template-columns: 28px 42px 1.6fr 1.1fr 140px 56px 64px;
+    grid-template-columns: 28px 44px 1.6fr 1.1fr 140px 56px 64px;
     align-items: center;
     gap: 12px;
-    padding: 8px 10px;
+    padding: clamp(8px, 0.7vw, 11px) 12px;
     border-radius: var(--radius-sm);
     border: 1px solid transparent;
     cursor: pointer;
@@ -867,8 +867,8 @@
 
   .cards-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
-    gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(clamp(160px, 13vw, 204px), 1fr));
+    gap: clamp(14px, 1.3vw, 20px);
   }
 
   .lib-card {

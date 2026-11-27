@@ -34,6 +34,8 @@
     Download,
     RefreshCw,
     Sparkles,
+    PanelLeftClose,
+    PanelLeftOpen,
   } from 'lucide-svelte';
 
   import DetailsView from './lib/components/DetailsView.svelte';
@@ -59,6 +61,7 @@
     type JamChatMessage,
     type JamMember,
     type JamRoomState,
+    type PublicJamRoomInfo,
   } from './lib/jamRoom';
   import { audioEngine } from './lib/audioEngine';
   import { getTrackAudioFeatures, getHarmonicCrossfadeSec } from './lib/camelot';
@@ -220,6 +223,15 @@
   let sbSession = $state<SupabaseSession | null>(null);
   let sbProfile = $state<FlowlyProfile | null>(sb.getCachedProfile());
   let showAccountModal = $state(false);
+  let railExpanded = $state(
+    typeof localStorage !== 'undefined' && localStorage.getItem('flowly_rail_expanded') === '1'
+  );
+  function toggleRail() {
+    railExpanded = !railExpanded;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('flowly_rail_expanded', railExpanded ? '1' : '0');
+    }
+  }
   let showOnboarding = $state(
     typeof localStorage !== 'undefined' && localStorage.getItem('flowly_onboarding_done') !== '1'
   );
@@ -227,11 +239,17 @@
     (() => {
       try {
         const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('flowly_mix_config') : null;
-        if (raw) return JSON.parse(raw);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          const preset = parsed?.preset === 'fade' || parsed?.preset === 'rise' || parsed?.preset === 'auto' ? parsed.preset : 'auto';
+          const curve = parsed?.curve === 's-curve' || parsed?.curve === 'linear' || parsed?.curve === 'equal-power' ? parsed.curve : 'equal-power';
+          const durationSec = typeof parsed?.durationSec === 'number' ? Math.max(1, Math.min(12, parsed.durationSec)) : 6;
+          return { enabled: parsed?.enabled !== false, preset, curve, durationSec };
+        }
       } catch {
         // ignore
       }
-      return { enabled: true, mode: 'auto', preset: 'fade', durationSec: 6, eqSweep: true };
+      return { enabled: true, preset: 'auto', curve: 'equal-power', durationSec: 6 };
     })()
   );
 
@@ -335,19 +353,7 @@
     }
   }
 
-  let activeDjPreset = $state<MixPreset>('dj-vocal');
-  const djPresetPool: MixPreset[] = ['dj-vocal', 'bass-swap', 'rise', 'echo-out', 'dj-vocal', 'fade'];
-
-  function pickDjTransitionPreset(): MixPreset {
-    if (mixConfig.mode !== 'auto') {
-      activeDjPreset = mixConfig.preset;
-      return mixConfig.preset;
-    }
-    const candidates = djPresetPool.filter((p) => p !== activeDjPreset);
-    const chosen = candidates[Math.floor(Math.random() * candidates.length)] ?? 'dj-vocal';
-    activeDjPreset = chosen;
-    return chosen;
-  }
+  let activeDjPreset = $state<MixPreset>('auto');
 
   let waveActive = $state(false);
   let waveTracks = $state<Track[]>([]);
@@ -390,12 +396,8 @@
 
   function effectiveCrossfadeSec(nextTrack?: Track | null): number {
     if (!mixConfig.enabled) return 0;
-    if (waveActive) {
-      // В «Моей волне» без Auto-DJ — короткий простой кроссфейд
-      return mixConfig.mode === 'manual' ? Math.min(5, Math.max(2, mixConfig.durationSec)) : 3;
-    }
-    const base = mixConfig.mode === 'auto' ? 6 : mixConfig.durationSec;
-    if (mixConfig.mode === 'auto' && player.current_track && nextTrack) {
+    const base = Math.max(1, Math.min(12, mixConfig.durationSec));
+    if (mixConfig.preset === 'auto' && player.current_track && nextTrack) {
       return getHarmonicCrossfadeSec(player.current_track, nextTrack, base, true);
     }
     return base;
@@ -1065,10 +1067,7 @@
       isNaturalEndTransition = false;
 
       const xfTargetSec = naturalEnd ? effectiveCrossfadeSec(player.current_track) : 0;
-      const manualStyle = mixConfig.manualTransition ?? 'filter-cut';
-      const canSwapDecks = Boolean(lastLoadedUrl) && Boolean(url) && Boolean(prevDeck && !prevDeck.paused);
-      const shouldCrossfade = canSwapDecks && xfTargetSec > 0;
-      const shouldManualTransition = canSwapDecks && !naturalEnd && manualStyle !== 'off';
+      const canCrossfade = Boolean(lastLoadedUrl) && Boolean(url) && mixConfig.enabled && xfTargetSec > 0;
 
       const outgoingTrackForMix = lastTrackForMix;
       lastTrackForMix = player.current_track ?? null;
@@ -1077,7 +1076,7 @@
 
       if (url) {
         const targetDeck: 'A' | 'B' =
-          shouldCrossfade || shouldManualTransition ? (activeDeck === 'A' ? 'B' : 'A') : activeDeck;
+          canCrossfade && prevDeck && !prevDeck.paused ? (activeDeck === 'A' ? 'B' : 'A') : activeDeck;
         const outgoingDeck: 'A' | 'B' = targetDeck === 'A' ? 'B' : 'A';
         clearDeckTimers(targetDeck);
         activeDeck = targetDeck;
@@ -1091,58 +1090,33 @@
         if (outgoing) outgoing.volume = toAudioVolume(player.volume);
 
         let cleanupSec = 0;
-        let deferredOutgoingStop = false;
-        if (shouldCrossfade) {
+        if (canCrossfade && prevDeck && !prevDeck.paused) {
           cleanupSec = xfTargetSec;
-          const chosenPreset = waveActive ? 'fade' : pickDjTransitionPreset();
-          audioEngine.crossfadeTo(targetDeck, xfTargetSec, chosenPreset, waveActive ? false : mixConfig.eqSweep);
-          if (!waveActive && outgoingTrackForMix && player.current_track) {
+          let chosenPreset: MixPreset = mixConfig.preset;
+          let chosenCurve = mixConfig.curve;
+
+          if (mixConfig.preset === 'auto' && outgoingTrackForMix && player.current_track) {
             const bpmOut = getTrackAudioFeatures(outgoingTrackForMix).bpm;
             const bpmIn = getTrackAudioFeatures(player.current_track).bpm;
-            audioEngine.beatmatchTransition(incoming, bpmOut, bpmIn, xfTargetSec);
+            if (Math.abs(bpmOut - bpmIn) < 8) {
+              chosenPreset = 'fade';
+              chosenCurve = 'equal-power';
+              audioEngine.beatmatchTransition(incoming, bpmOut, bpmIn, xfTargetSec);
+            } else {
+              chosenPreset = 'rise';
+              chosenCurve = 's-curve';
+              audioEngine.cancelBeatmatch(incoming);
+            }
           } else {
             audioEngine.cancelBeatmatch(incoming);
           }
-        } else if (shouldManualTransition) {
-          deferredOutgoingStop = true;
-          audioEngine.cancelBeatmatch(incoming);
-          audioEngine.holdManualSkipIncoming(targetDeck);
-          let done = false;
-          const runHandoff = () => {
-            if (done) return;
-            done = true;
-            incoming.removeEventListener('playing', runHandoff);
-            clearTimeout(fallbackTimer);
-            deckFadeInCleanups[targetDeck] = null;
-            const outTailSec = audioEngine.handoffManualSkip(targetDeck, manualStyle, outgoing);
-            clearDeckTimers(outgoingDeck);
-            if (outgoing && !outgoing.paused) {
-              if (outTailSec <= 0) {
-                outgoing.pause();
-                outgoing.removeAttribute('src');
-                if (ramSaverEnabled) outgoing.load();
-              } else {
-                deckCleanupTimers[outgoingDeck] = setTimeout(() => {
-                  deckCleanupTimers[outgoingDeck] = null;
-                  if (activeDeck === targetDeck && !outgoing.paused) {
-                    outgoing.pause();
-                    outgoing.removeAttribute('src');
-                    if (ramSaverEnabled) outgoing.load();
-                  }
-                }, (outTailSec + 0.08) * 1000);
-              }
-            }
-          };
-          const fallbackTimer = setTimeout(runHandoff, 1200);
-          incoming.addEventListener('playing', runHandoff, { once: true });
-          deckFadeInCleanups[targetDeck] = () => {
-            done = true;
-            incoming.removeEventListener('playing', runHandoff);
-            clearTimeout(fallbackTimer);
-          };
+
+          activeDjPreset = chosenPreset;
+          audioEngine.crossfadeTo(targetDeck, xfTargetSec, chosenPreset, chosenCurve);
         } else {
+          activeDjPreset = mixConfig.preset;
           audioEngine.cancelBeatmatch(incoming);
-          audioEngine.crossfadeTo(targetDeck, 0, mixConfig.preset, false);
+          audioEngine.crossfadeTo(targetDeck, 0, mixConfig.preset, mixConfig.curve);
         }
 
         if (player.is_playing) {
@@ -1157,21 +1131,20 @@
             }
           }
         }
-        if (!deferredOutgoingStop) {
-          if (cleanupSec <= 0 && outgoing && !outgoing.paused) {
-            clearDeckTimers(outgoingDeck);
-            outgoing.pause();
-            outgoing.removeAttribute('src');
-          } else if (cleanupSec > 0 && outgoing) {
-            clearDeckTimers(outgoingDeck);
-            deckCleanupTimers[outgoingDeck] = setTimeout(() => {
-              deckCleanupTimers[outgoingDeck] = null;
-              if (activeDeck === targetDeck && !outgoing.paused) {
-                outgoing.pause();
-                outgoing.removeAttribute('src');
-              }
-            }, (cleanupSec + 0.15) * 1000);
-          }
+
+        if (cleanupSec <= 0 && outgoing && !outgoing.paused) {
+          clearDeckTimers(outgoingDeck);
+          outgoing.pause();
+          outgoing.removeAttribute('src');
+        } else if (cleanupSec > 0 && outgoing) {
+          clearDeckTimers(outgoingDeck);
+          deckCleanupTimers[outgoingDeck] = setTimeout(() => {
+            deckCleanupTimers[outgoingDeck] = null;
+            if (activeDeck === targetDeck && !outgoing.paused) {
+              outgoing.pause();
+              outgoing.removeAttribute('src');
+            }
+          }, (cleanupSec + 0.15) * 1000);
         }
       } else {
         clearDeckTimers('A');
@@ -1210,10 +1183,6 @@
     }
     const token = ++switchToken;
     await audioEngine.resume();
-    const mStyle = mixConfig.manualTransition ?? 'filter-cut';
-    if (player.is_playing && mStyle !== 'off') {
-      audioEngine.prepareManualSkipDuck(activeDeck, mStyle);
-    }
     crossfadeTriggeredForId = null;
     if (queue !== undefined) {
       waveActive = false;
@@ -1310,11 +1279,6 @@
       api.reportWaveFeedback(player.current_track, positive);
     }
     const token = ++switchToken;
-    const mStyle = mixConfig.manualTransition ?? 'filter-cut';
-    if (player.is_playing && !isNaturalEndTransition && mStyle !== 'off') {
-      audioEngine.resume();
-      audioEngine.prepareManualSkipDuck(activeDeck, mStyle);
-    }
     try {
       const prevLen = player.queue.length;
       const next = await api.nextTrack();
@@ -1339,6 +1303,8 @@
     isHost: false,
     connected: false,
     relayUrl: 'supabase',
+    isPrivate: false,
+    roomTitle: '',
     members: [],
     queue: [],
     currentTrack: null,
@@ -1347,6 +1313,11 @@
     skipVotes: [],
     statusText: '',
   });
+  let publicJamRooms = $state<PublicJamRoomInfo[]>([]);
+  let jamLobbyWs: WebSocket | null = null;
+  let jamLobbyPhxTimer: ReturnType<typeof setInterval> | null = null;
+  let jamLobbyAnnounceTimer: ReturnType<typeof setInterval> | null = null;
+  let jamLobbyRef = 1;
   let jamWs: WebSocket | null = null;
   let jamHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let jamPhxHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -1485,14 +1456,17 @@
   }
 
   function jamRebuildBlend() {
+    if (!jamRoom.isHost && jamRoom.connected) {
+      sendJamMsg({ type: 'request_rebuild' });
+      return;
+    }
     const members = [...jamMemberMap.values()];
-    const blended = buildBlendedQueue(members);
+    const blended = buildBlendedQueue(members, 120, undefined, true);
     jamRoom.members = members;
     jamRoom.queue = blended;
+    jamRoom.statusText = 'Микс пересобран';
     if (jamRoom.isHost) {
       hostBroadcastState();
-    } else {
-      sendJamMsg({ type: 'request_rebuild' });
     }
   }
 
@@ -1523,13 +1497,163 @@
     void refillJamQueueIfNeeded();
   }
 
+  function sendLobbyMsg(msg: Record<string, unknown>) {
+    if (!jamLobbyWs || jamLobbyWs.readyState !== WebSocket.OPEN) return;
+    jamLobbyWs.send(
+      JSON.stringify({
+        topic: 'realtime:jam-lobby',
+        event: 'broadcast',
+        payload: {
+          type: 'broadcast',
+          event: 'jam_lobby',
+          payload: msg,
+        },
+        ref: String(jamLobbyRef++),
+      })
+    );
+  }
+
+  function buildPublicRoomInfo(): PublicJamRoomInfo | null {
+    if (!jamRoom.connected || !jamRoom.isHost || jamRoom.isPrivate || !jamRoom.roomCode) return null;
+    const hostName = jamRoom.members.find((m) => m.isHost)?.name || 'Хост';
+    return {
+      roomCode: jamRoom.roomCode,
+      title: jamRoom.roomTitle?.trim() || `Комната ${hostName}`,
+      hostName,
+      memberCount: jamRoom.members.length,
+      currentTrackTitle: jamRoom.currentTrack?.title,
+      currentTrackArtist: jamRoom.currentTrack?.artist,
+      currentTrackArtwork: jamRoom.currentTrack?.artwork,
+      isPrivate: false,
+      updatedAt: Date.now(),
+    };
+  }
+
+  function broadcastPublicRoom() {
+    const info = buildPublicRoomInfo();
+    if (info) sendLobbyMsg({ type: 'lobby_announce', room: info });
+  }
+
+  function ensureJamLobbySocket() {
+    if (jamLobbyWs && (jamLobbyWs.readyState === WebSocket.OPEN || jamLobbyWs.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    const ws = new WebSocket(sb.getSupabaseRealtimeWsUrl());
+    jamLobbyWs = ws;
+    let joinedLobby = false;
+
+    ws.onopen = () => {
+      if (jamLobbyWs !== ws) return;
+      ws.send(
+        JSON.stringify({
+          topic: 'realtime:jam-lobby',
+          event: 'phx_join',
+          payload: { config: { broadcast: { self: false } } },
+          ref: String(jamLobbyRef++),
+        })
+      );
+      if (jamLobbyPhxTimer === null) {
+        jamLobbyPhxTimer = setInterval(() => {
+          if (jamLobbyWs && jamLobbyWs.readyState === WebSocket.OPEN) {
+            jamLobbyWs.send(
+              JSON.stringify({
+                topic: 'phoenix',
+                event: 'heartbeat',
+                payload: {},
+                ref: String(jamLobbyRef++),
+              })
+            );
+          }
+        }, 25_000);
+      }
+      if (jamLobbyAnnounceTimer === null) {
+        jamLobbyAnnounceTimer = setInterval(() => {
+          const now = Date.now();
+          publicJamRooms = publicJamRooms.filter((r) => now - r.updatedAt < 25_000);
+          broadcastPublicRoom();
+        }, 6000);
+      }
+    };
+
+    ws.onmessage = (ev) => {
+      if (jamLobbyWs !== ws) return;
+      try {
+        const raw = JSON.parse(ev.data);
+        if (raw.event === 'phx_reply' && raw.topic === 'realtime:jam-lobby' && raw.payload?.status === 'ok' && !joinedLobby) {
+          joinedLobby = true;
+          sendLobbyMsg({ type: 'lobby_ping' });
+          broadcastPublicRoom();
+          return;
+        }
+        if (raw.event !== 'broadcast') return;
+        const msg = raw.payload?.payload;
+        if (!msg) return;
+        if (msg.type === 'lobby_announce' && msg.room) {
+          const room = msg.room as PublicJamRoomInfo;
+          if (!room.roomCode || room.roomCode === jamRoom.roomCode) return;
+          const next = publicJamRooms.filter((r) => r.roomCode !== room.roomCode);
+          publicJamRooms = [{ ...room, updatedAt: Date.now() }, ...next].sort((a, b) => b.updatedAt - a.updatedAt);
+        } else if (msg.type === 'lobby_remove' && msg.roomCode) {
+          publicJamRooms = publicJamRooms.filter((r) => r.roomCode !== msg.roomCode);
+        } else if (msg.type === 'lobby_ping') {
+          broadcastPublicRoom();
+        }
+      } catch {
+        // ignore lobby parse errors
+      }
+    };
+
+    ws.onclose = () => {
+      if (jamLobbyWs !== ws) return;
+      jamLobbyWs = null;
+      if (jamLobbyPhxTimer) {
+        clearInterval(jamLobbyPhxTimer);
+        jamLobbyPhxTimer = null;
+      }
+      if (jamLobbyAnnounceTimer) {
+        clearInterval(jamLobbyAnnounceTimer);
+        jamLobbyAnnounceTimer = null;
+      }
+    };
+  }
+
+  function closeJamLobbySocket() {
+    if (jamLobbyWs) {
+      const old = jamLobbyWs;
+      jamLobbyWs = null;
+      old.close();
+    }
+    if (jamLobbyPhxTimer) {
+      clearInterval(jamLobbyPhxTimer);
+      jamLobbyPhxTimer = null;
+    }
+    if (jamLobbyAnnounceTimer) {
+      clearInterval(jamLobbyAnnounceTimer);
+      jamLobbyAnnounceTimer = null;
+    }
+  }
+
+  $effect(() => {
+    const needLobby = activeTab === 'room' || (jamRoom.connected && jamRoom.isHost && !jamRoom.isPrivate);
+    if (needLobby) {
+      ensureJamLobbySocket();
+      if (jamRoom.connected && jamRoom.isHost && !jamRoom.isPrivate) {
+        broadcastPublicRoom();
+      }
+    } else {
+      closeJamLobbySocket();
+    }
+  });
+
   function openJamSocket(
     code: string,
     isHost: boolean,
     name: string,
     relayUrl: string,
     tasteLabel: string,
-    tracks: Track[]
+    tracks: Track[],
+    isPrivate = false,
+    roomTitle = ''
   ) {
     leaveJamRoom();
     const myMember: JamMember = {
@@ -1545,6 +1669,7 @@
     };
     jamMemberMap = new Map([[myMember.id, myMember]]);
     const initialQueue = isHost ? buildBlendedQueue([myMember]) : [];
+    const initialTrack = isHost ? initialQueue[0]?.track ?? null : null;
 
     jamRoom = {
       ...jamRoom,
@@ -1552,14 +1677,24 @@
       isHost,
       connected: false,
       relayUrl,
+      isPrivate,
+      roomTitle: roomTitle.trim(),
       members: [myMember],
       queue: initialQueue,
-      currentTrack: isHost ? initialQueue[0]?.track ?? null : null,
-      isPlaying: false,
+      currentTrack: initialTrack,
+      isPlaying: Boolean(isHost && initialTrack),
       positionSec: 0,
       skipVotes: [],
+      chat: [],
+      syncStatus: undefined,
       statusText: relayUrl === 'supabase' ? 'Подключение к Supabase Realtime...' : 'Подключение к Relay...',
     };
+
+    if (isHost && initialTrack) {
+      void playRoomTrackLocally(initialTrack, true, 0);
+    } else if (!isHost && player.is_playing) {
+      void api.togglePlayback().then(applyStatePreservingPosition).catch(() => {});
+    }
 
     const isSb = relayUrl === 'supabase';
     const wsUrl = isSb
@@ -1567,8 +1702,18 @@
       : `${relayUrl}${relayUrl.includes('?') ? '&' : '?'}room=${encodeURIComponent(code)}`;
     const ws = new WebSocket(wsUrl);
     jamWs = ws;
+    let joinSent = false;
+
+    const sendJoinOnce = () => {
+      if (jamWs !== ws || ws.readyState !== WebSocket.OPEN) return;
+      if (!joinSent) {
+        joinSent = true;
+        sendJamMsg({ type: 'join', member: myMember });
+      }
+    };
 
     ws.onopen = () => {
+      if (jamWs !== ws) return;
       if (isSb) {
         ws.send(
           JSON.stringify({
@@ -1595,7 +1740,15 @@
       }
       jamRoom.connected = true;
       jamRoom.statusText = isHost ? 'Комната создана' : 'Подключено к комнате';
-      setTimeout(() => sendJamMsg({ type: 'join', member: myMember }), isSb ? 250 : 0);
+      if (!isSb) {
+        sendJoinOnce();
+      } else {
+        setTimeout(sendJoinOnce, 800);
+      }
+      if (isHost && !isPrivate) {
+        ensureJamLobbySocket();
+        setTimeout(() => broadcastPublicRoom(), 400);
+      }
       if (isHost && jamHeartbeatTimer === null) {
         jamHeartbeatTimer = setInterval(() => {
           if (jamRoom.connected && jamRoom.isHost && jamRoom.currentTrack) {
@@ -1612,8 +1765,13 @@
     };
 
     ws.onmessage = async (ev) => {
+      if (jamWs !== ws) return;
       try {
         const raw = JSON.parse(ev.data);
+        if (isSb && raw.event === 'phx_reply' && raw.topic === `realtime:jam-${code}` && raw.payload?.status === 'ok') {
+          sendJoinOnce();
+          return;
+        }
         const msg = isSb
           ? raw.event === 'broadcast'
             ? raw.payload?.payload
@@ -1627,9 +1785,13 @@
             jamRoom.members = [...jamMemberMap.values()];
             jamRoom.queue = buildBlendedQueue(jamRoom.members);
             if (!jamRoom.currentTrack && jamRoom.queue[0]) {
-              jamRoom.currentTrack = jamRoom.queue[0].track;
+              const first = jamRoom.queue[0].track;
+              jamRoom.currentTrack = first;
+              jamRoom.isPlaying = true;
+              void playRoomTrackLocally(first, true, 0);
             }
             hostBroadcastState();
+            if (!jamRoom.isPrivate) broadcastPublicRoom();
           }
         } else if (msg.type === 'update_taste' && msg.member) {
           const m = msg.member as JamMember;
@@ -1644,8 +1806,9 @@
             jamRoom.queue = buildBlendedQueue(jamRoom.members);
             jamRoom.skipVotes = jamRoom.skipVotes.filter((id) => id !== msg.memberId);
             hostBroadcastState();
+            if (!jamRoom.isPrivate) broadcastPublicRoom();
           }
-        } else if (msg.type === 'room_state') {
+        } else if (msg.type === 'room_state' && !jamRoom.isHost) {
           jamRoom.members = msg.members ?? [];
           jamMemberMap = new Map(jamRoom.members.map((m: JamMember) => [m.id, m]));
           jamRoom.queue = msg.queue ?? [];
@@ -1658,24 +1821,16 @@
             jamRoom.isPlaying = Boolean(msg.isPlaying);
             await playRoomTrackLocally(incomingTrack, Boolean(msg.isPlaying), driftPos);
           }
-        } else if (msg.type === 'sync_play' && msg.track) {
+        } else if (msg.type === 'sync_play' && msg.track && !jamRoom.isHost) {
           const tr = msg.track as Track;
           jamRoom.currentTrack = tr;
           jamRoom.isPlaying = Boolean(msg.isPlaying);
           jamRoom.skipVotes = [];
           await playRoomTrackLocally(tr, Boolean(msg.isPlaying), msg.positionSec ?? 0);
-        } else if (msg.type === 'sync_toggle') {
+        } else if (msg.type === 'sync_toggle' && !jamRoom.isHost) {
           jamRoom.isPlaying = Boolean(msg.isPlaying);
           if (player.is_playing !== jamRoom.isPlaying) {
             applyStatePreservingPosition(await api.togglePlayback());
-          }
-        } else if (msg.type === 'vote_skip' && msg.memberId) {
-          if (!jamRoom.skipVotes.includes(msg.memberId)) {
-            jamRoom.skipVotes = [...jamRoom.skipVotes, msg.memberId];
-          }
-          const needed = Math.max(1, Math.ceil(jamRoom.members.length / 2));
-          if (jamRoom.isHost && jamRoom.skipVotes.length >= needed) {
-            jamAdvanceNext();
           }
         } else if (msg.type === 'request_rebuild' && jamRoom.isHost) {
           jamRebuildBlend();
@@ -1712,10 +1867,13 @@
     };
 
     ws.onerror = () => {
+      if (jamWs !== ws) return;
       jamRoom.statusText = 'Ошибка подключения к Relay. Проверьте URL или запустите relay/server.mjs';
     };
 
     ws.onclose = () => {
+      if (jamWs !== ws) return;
+      jamWs = null;
       jamRoom.connected = false;
       if (jamHeartbeatTimer) {
         clearInterval(jamHeartbeatTimer);
@@ -1728,8 +1886,15 @@
     };
   }
 
-  function createJamRoom(name: string, relayUrl: string, tasteLabel: string, tracks: Track[]) {
-    openJamSocket(generateRoomCode(), true, name, relayUrl, tasteLabel, tracks);
+  function createJamRoom(
+    name: string,
+    relayUrl: string,
+    tasteLabel: string,
+    tracks: Track[],
+    isPrivate = false,
+    roomTitle = ''
+  ) {
+    openJamSocket(generateRoomCode(), true, name, relayUrl, tasteLabel, tracks, isPrivate, roomTitle);
   }
 
   function joinJamRoom(code: string, name: string, relayUrl: string, tasteLabel: string, tracks: Track[]) {
@@ -1737,10 +1902,14 @@
   }
 
   function leaveJamRoom() {
+    if (jamRoom.isHost && !jamRoom.isPrivate && jamRoom.roomCode) {
+      sendLobbyMsg({ type: 'lobby_remove', roomCode: jamRoom.roomCode });
+    }
     if (jamWs) {
       sendJamMsg({ type: 'leave', memberId: jamRoom.myId });
-      jamWs.close();
+      const oldWs = jamWs;
       jamWs = null;
+      oldWs.close();
     }
     if (jamHeartbeatTimer) {
       clearInterval(jamHeartbeatTimer);
@@ -1750,10 +1919,25 @@
       clearInterval(jamPhxHeartbeatTimer);
       jamPhxHeartbeatTimer = null;
     }
-    jamRoom.connected = false;
-    jamRoom.members = [];
-    jamRoom.queue = [];
-    jamRoom.skipVotes = [];
+    jamMemberMap.clear();
+    jamPlayedKeys.clear();
+    jamRoom = {
+      ...jamRoom,
+      roomCode: '',
+      isHost: false,
+      connected: false,
+      isPrivate: false,
+      roomTitle: '',
+      members: [],
+      queue: [],
+      currentTrack: null,
+      isPlaying: false,
+      positionSec: 0,
+      skipVotes: [],
+      chat: [],
+      syncStatus: undefined,
+      statusText: '',
+    };
   }
 
   function updateJamTaste(tasteLabel: string, tracks: Track[]) {
@@ -1768,6 +1952,7 @@
   }
 
   function jamPlayTrack(track: Track) {
+    if (!jamRoom.isHost) return;
     jamRoom.currentTrack = track;
     jamRoom.isPlaying = true;
     jamRoom.skipVotes = [];
@@ -1779,24 +1964,19 @@
       positionSec: 0,
       sentAtMs: Date.now(),
     });
+    if (!jamRoom.isPrivate) broadcastPublicRoom();
   }
 
   async function jamTogglePlay() {
+    if (!jamRoom.isHost) return;
     await handleToggle();
     jamRoom.isPlaying = player.is_playing;
     sendJamMsg({ type: 'sync_toggle', isPlaying: player.is_playing });
   }
 
   function jamSkip() {
-    if (jamRoom.isHost) {
-      // Хост может скипать мгновенно без опроса
-      jamAdvanceNext();
-      return;
-    }
-    if (!jamRoom.skipVotes.includes(jamRoom.myId)) {
-      jamRoom.skipVotes = [...jamRoom.skipVotes, jamRoom.myId];
-    }
-    sendJamMsg({ type: 'vote_skip', memberId: jamRoom.myId });
+    if (!jamRoom.isHost) return;
+    jamAdvanceNext();
   }
 
   async function cyclePlaybackMode() {
@@ -1833,11 +2013,6 @@
       return;
     }
     const token = ++switchToken;
-    const mStyle = mixConfig.manualTransition ?? 'filter-cut';
-    if (player.is_playing && mStyle !== 'off') {
-      audioEngine.resume();
-      audioEngine.prepareManualSkipDuck(activeDeck, mStyle);
-    }
     try {
       const next = await api.prevTrack();
       if (token !== switchToken) return;
@@ -2273,75 +2448,107 @@
 
   <!-- Тело: узкий icon-rail слева + основная область -->
   <div class="body-frame">
-    <nav class="icon-rail" aria-label="Основная навигация">
+    <nav class="icon-rail" class:expanded={railExpanded} aria-label="Основная навигация">
+      <button
+        type="button"
+        class="rail-btn rail-toggle"
+        onclick={toggleRail}
+        data-tip={railExpanded ? 'Свернуть меню' : 'Развернуть меню'}
+        aria-label={railExpanded ? 'Свернуть меню' : 'Развернуть меню'}
+      >
+        <span class="rail-icon">
+          {#if railExpanded}
+            <PanelLeftClose size={17} />
+          {:else}
+            <PanelLeftOpen size={17} />
+          {/if}
+        </span>
+        <span class="rail-label">Свернуть</span>
+      </button>
+
+      <div class="rail-divider"></div>
+
       <button
         type="button"
         class="rail-btn"
         class:active={!activeArtist && activeTab === 'details'}
         onclick={() => goTab('details')}
-        title="Сейчас играет"
+        data-tip="Сейчас играет"
       >
-        <Disc3 size={18} />
+        <span class="rail-icon"><Disc3 size={18} /></span>
+        <span class="rail-label">Сейчас играет</span>
       </button>
       <button
         type="button"
         class="rail-btn"
         class:active={!activeArtist && activeTab === 'library'}
         onclick={() => goTab('library')}
-        title="Библиотека"
+        data-tip="Библиотека"
       >
-        <Library size={18} />
-      </button>
-      <button
-        type="button"
-        class="rail-btn"
-        class:active={!activeArtist && activeTab === 'search'}
-        onclick={() => goTab('search')}
-        title="Поиск"
-      >
-        <Search size={18} />
+        <span class="rail-icon"><Library size={18} /></span>
+        <span class="rail-label">Библиотека</span>
       </button>
       <button
         type="button"
         class="rail-btn"
         class:active={!activeArtist && activeTab === 'playlists'}
         onclick={() => goTab('playlists')}
-        title="Плейлисты"
+        data-tip="Плейлисты"
       >
-        <ListMusic size={18} />
+        <span class="rail-icon"><ListMusic size={18} /></span>
+        <span class="rail-label">Плейлисты</span>
       </button>
+      <button
+        type="button"
+        class="rail-btn"
+        class:active={!activeArtist && activeTab === 'search'}
+        onclick={() => goTab('search')}
+        data-tip="Поиск"
+      >
+        <span class="rail-icon"><Search size={18} /></span>
+        <span class="rail-label">Поиск</span>
+      </button>
+
+      <div class="rail-divider"></div>
+
       <button
         type="button"
         class="rail-btn"
         class:active={!activeArtist && activeTab === 'recap'}
         onclick={() => goTab('recap')}
-        title="Итоги дня / недели / месяца"
+        data-tip="Итоги прослушивания"
       >
-        <BarChart3 size={18} />
+        <span class="rail-icon"><BarChart3 size={18} /></span>
+        <span class="rail-label">Итоги</span>
       </button>
       <button
         type="button"
         class="rail-btn"
         class:active={!activeArtist && activeTab === 'room'}
         onclick={() => goTab('room')}
-        title="Общая комната (Jam)"
+        data-tip="Общая комната (Jam)"
       >
-        <Radio size={18} />
-        {#if jamRoom.connected}
-          <span class="rail-dot"></span>
-        {/if}
+        <span class="rail-icon">
+          <Radio size={18} />
+          {#if jamRoom.connected}
+            <span class="rail-dot"></span>
+          {/if}
+        </span>
+        <span class="rail-label">Jam-комната</span>
       </button>
       <button
         type="button"
         class="rail-btn"
         class:active={!activeArtist && activeTab === 'equalizer'}
         onclick={() => goTab('equalizer')}
-        title="Эквалайзер и DSP"
+        data-tip="Эквалайзер и DSP"
       >
-        <Sliders size={18} />
+        <span class="rail-icon"><Sliders size={18} /></span>
+        <span class="rail-label">Эквалайзер</span>
       </button>
 
       <div class="rail-spacer"></div>
+      <div class="rail-divider"></div>
 
       <button
         type="button"
@@ -2351,15 +2558,18 @@
           settingsInitialTab = 'account';
           goTab('settings');
         }}
-        title={sbProfile ? `${sbProfile.username}#${sbProfile.tag}` : 'Профиль Flowly'}
+        data-tip={sbProfile ? `${sbProfile.username}#${sbProfile.tag}` : 'Профиль Flowly'}
       >
-        {#if sbProfile?.avatar_url}
-          <img class="rail-avatar" src={sbProfile.avatar_url} alt={sbProfile.username} />
-        {:else if sbProfile}
-          <span class="rail-initial">{sbProfile.username.slice(0, 1).toUpperCase()}</span>
-        {:else}
-          <User size={18} />
-        {/if}
+        <span class="rail-icon">
+          {#if sbProfile?.avatar_url}
+            <img class="rail-avatar" src={sbProfile.avatar_url} alt={sbProfile.username} />
+          {:else if sbProfile}
+            <span class="rail-initial">{sbProfile.username.slice(0, 1).toUpperCase()}</span>
+          {:else}
+            <User size={18} />
+          {/if}
+        </span>
+        <span class="rail-label">{sbProfile ? sbProfile.username : 'Профиль'}</span>
       </button>
 
       <button
@@ -2370,9 +2580,10 @@
           if (settingsInitialTab === 'account') settingsInitialTab = 'services';
           goTab('settings');
         }}
-        title="Настройки и сервисы"
+        data-tip="Настройки и сервисы"
       >
-        <Settings size={18} />
+        <span class="rail-icon"><Settings size={18} /></span>
+        <span class="rail-label">Настройки</span>
       </button>
     </nav>
 
@@ -2408,6 +2619,7 @@
           }}
           onPlayTrack={handlePlayTrack}
           onToggleLike={handleToggleLike}
+          onOpenArtist={handleOpenArtist}
         />
       {/if}
 
@@ -2495,9 +2707,14 @@
       {:else if !activeArtist && activeTab === 'playlists'}
         <PlaylistsView
           playlists={playlists.filter((p) => !p.source || enabledSources.includes(p.source))}
+          currentTrackId={player.current_track?.id ?? null}
+          isPlaying={player.is_playing}
+          {likedIds}
           onCreatePlaylist={handleCreatePlaylist}
           onPlayTrack={handlePlayTrack}
           onRemoveTrack={handleRemoveFromPlaylist}
+          onToggleLike={handleToggleLike}
+          onOpenArtist={handleOpenArtist}
         />
       {:else if !activeArtist && activeTab === 'recap'}
         {#await import('./lib/components/RecapView.svelte') then { default: RecapView }}
@@ -2513,6 +2730,7 @@
         {#await import('./lib/components/RoomView.svelte') then { default: RoomView }}
           <RoomView
             room={jamRoom}
+            publicRooms={publicJamRooms}
             {likedTracks}
             playlists={playlists}
             defaultName={sbProfile?.username || sources.find((s) => s.auth.connected)?.auth.account_name || ''}
@@ -3084,21 +3302,21 @@
     position: relative;
     z-index: 20;
     flex-shrink: 0;
-    height: 46px;
-    padding: 0 12px 0 16px;
+    height: clamp(50px, 5.4vh, 60px);
+    padding: 0 16px 0 18px;
     border-bottom: 1px solid var(--border-subtle);
     background: rgba(11, 11, 14, 0.88);
     display: grid;
-    grid-template-columns: 200px 1fr 200px;
+    grid-template-columns: clamp(190px, 18vw, 270px) 1fr clamp(190px, 18vw, 270px);
     align-items: center;
-    gap: 12px;
+    gap: 14px;
   }
 
   .brand {
     display: flex;
     align-items: center;
-    gap: 9px;
-    font-size: 14px;
+    gap: 10px;
+    font-size: clamp(14.5px, 1.1vw, 17px);
     font-weight: 700;
     letter-spacing: -0.02em;
     color: var(--text-primary);
@@ -3113,7 +3331,7 @@
 
   .ota-pill {
     margin-left: 6px;
-    padding: 3px 9px;
+    padding: 4px 10px;
     border-radius: 999px;
     border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
     background: color-mix(in srgb, var(--accent) 18%, transparent);
@@ -3126,12 +3344,12 @@
   .top-search {
     justify-self: center;
     width: 100%;
-    max-width: 380px;
+    max-width: clamp(380px, 34vw, 560px);
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 12px;
-    border-radius: 10px;
+    gap: 9px;
+    padding: 7px 14px;
+    border-radius: 11px;
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
     color: var(--text-secondary);
@@ -3142,7 +3360,7 @@
     border: none;
     background: transparent;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: clamp(12.5px, 0.92vw, 14px);
     outline: none;
   }
 
@@ -3150,14 +3368,14 @@
     justify-self: end;
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
   }
 
   .win-btn {
-    width: 28px;
-    height: 24px;
+    width: clamp(28px, 2.1vw, 32px);
+    height: clamp(26px, 2vw, 30px);
     border: none;
-    border-radius: 6px;
+    border-radius: 7px;
     background: transparent;
     color: var(--text-secondary);
     display: grid;
@@ -3184,45 +3402,140 @@
   }
 
   .icon-rail {
-    width: 56px;
+    position: relative;
+    z-index: 20;
+    width: clamp(60px, 4.5vw, 68px);
     flex-shrink: 0;
     border-right: 1px solid var(--border-subtle);
-    background: rgba(19, 19, 24, 0.72);
-    padding: 12px 8px;
+    background: rgba(16, 16, 21, 0.78);
+    backdrop-filter: blur(14px);
+    padding: 10px 9px;
     display: flex;
     flex-direction: column;
-    align-items: center;
-    gap: 6px;
+    align-items: stretch;
+    gap: 5px;
+    transition: width 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .icon-rail.expanded {
+    width: clamp(196px, 14.5vw, 226px);
+  }
+
+  .rail-divider {
+    height: 1px;
+    margin: 4px 6px;
+    background: rgba(255, 255, 255, 0.07);
+    flex-shrink: 0;
   }
 
   .rail-btn {
     position: relative;
-    width: 38px;
-    height: 38px;
-    border-radius: var(--radius-sm);
+    width: 100%;
+    height: clamp(38px, 3vw, 42px);
+    border-radius: 10px;
     border: none;
+    outline: none;
     background: transparent;
     color: var(--text-secondary);
-    display: grid;
-    place-items: center;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+    padding: 0;
     cursor: pointer;
-    transition: background 0.14s ease, color 0.14s ease;
+    transition: background 0.14s ease, color 0.14s ease, transform 0.12s ease;
+  }
+
+  .icon-rail.expanded .rail-btn {
+    justify-content: flex-start;
+    gap: 11px;
+    padding: 0 11px;
+  }
+
+  .rail-btn:focus {
+    outline: none;
+  }
+
+  .rail-btn:focus-visible {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
   }
 
   .rail-btn:hover {
-    background: var(--bg-elevated);
+    background: rgba(255, 255, 255, 0.07);
     color: var(--text-primary);
   }
 
+  .rail-btn:active {
+    transform: scale(0.97);
+  }
+
   .rail-btn.active {
-    background: color-mix(in srgb, var(--accent) 18%, var(--bg-elevated));
+    background: color-mix(in srgb, var(--accent) 16%, rgba(255, 255, 255, 0.04));
     color: var(--accent);
+  }
+
+  .rail-btn.active::before {
+    content: '';
+    position: absolute;
+    left: -9px;
+    top: 9px;
+    bottom: 9px;
+    width: 3px;
+    border-radius: 0 4px 4px 0;
+    background: var(--accent);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
+  }
+
+  .rail-toggle {
+    color: var(--text-muted);
+    height: 32px;
+  }
+
+  .rail-icon {
+    position: relative;
+    width: 20px;
+    height: 20px;
+    display: grid;
+    place-items: center;
+    flex-shrink: 0;
+  }
+
+  .rail-label {
+    display: none;
+    font-size: clamp(12.5px, 0.92vw, 13.5px);
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .icon-rail.expanded .rail-label {
+    display: block;
+  }
+
+  .icon-rail:not(.expanded) .rail-btn[data-tip]:hover::after {
+    content: attr(data-tip);
+    position: absolute;
+    left: calc(100% + 10px);
+    top: 50%;
+    transform: translateY(-50%);
+    padding: 5px 10px;
+    border-radius: 8px;
+    background: rgba(18, 18, 24, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    color: var(--text-primary);
+    font-size: 11.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+    pointer-events: none;
+    z-index: 60;
   }
 
   .rail-dot {
     position: absolute;
-    top: 6px;
-    right: 6px;
+    top: -2px;
+    right: -3px;
     width: 7px;
     height: 7px;
     border-radius: 50%;
@@ -3323,8 +3636,8 @@
     bottom: 16px;
     transform: translateX(-50%);
     z-index: 40;
-    width: min(860px, calc(100vw - 104px));
-    padding: 10px 16px 8px;
+    width: min(clamp(820px, 64vw, 1080px), calc(100vw - 104px));
+    padding: 11px 18px 9px;
     border-radius: 18px;
     border: 1px solid rgba(255, 255, 255, 0.11);
     background: color-mix(in srgb, var(--bg-surface, #131318) 92%, #1a1b24);
