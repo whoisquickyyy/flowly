@@ -160,7 +160,7 @@
   let availableUpdateDate = $state<string | null>(null);
   let showUpdateModal = $state(false);
   let showWhatsNewModal = $state(false);
-  let whatsNewVersion = $state('0.1.1');
+  let whatsNewVersion = $state('0.1.2');
   let whatsNewNotes = $state('');
   let whatsNewDate = $state<string | null>(null);
   let installingOta = $state(false);

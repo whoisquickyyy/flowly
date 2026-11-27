@@ -1597,7 +1597,7 @@
         <FlowlyLogo size={38} />
         <div>
           <h3>Flowly</h3>
-          <span class="about-settings-ver">Версия 0.1.1 · Desktop Music Client</span>
+          <span class="about-settings-ver">Версия 0.1.2 · Desktop Music Client</span>
         </div>
       </div>
       <button type="button" class="btn-sm" onclick={onOpenWhatsNew}>
