@@ -278,7 +278,11 @@
     return Math.pow(norm, 2.0);
   }
 
-  function setMusicDucking(ducked: boolean, factor = 0.58) {
+  function calcRadioVoiceVolume(audioVol: number): number {
+    return Math.max(0.28, Math.min(0.88, audioVol * 1.65 + 0.12));
+  }
+
+  function setMusicDucking(ducked: boolean, factor = 0.26) {
     const targetVol = (ducked ? factor : 1.0) * toAudioVolume(player.volume);
     const cur = getActiveAudio();
     if (cur) cur.volume = Math.max(0, Math.min(1, targetVol));
@@ -302,7 +306,7 @@
       }
 
       setMusicDucking(true);
-      const voiceVol = Math.max(0.05, Math.min(1, toAudioVolume(player.volume) * 1.18));
+      const voiceVol = calcRadioVoiceVolume(toAudioVolume(player.volume));
       if (res.audioDataUrl && radioAudioEl) {
         radioAudioEl.src = res.audioDataUrl;
         radioAudioEl.volume = voiceVol;
@@ -1978,7 +1982,7 @@
     if (audioA) audioA.volume = audioVol;
     if (audioB) audioB.volume = audioVol;
     if (radioAudioEl && !radioAudioEl.paused) {
-      radioAudioEl.volume = Math.max(0.05, Math.min(1, audioVol * 1.18));
+      radioAudioEl.volume = calcRadioVoiceVolume(audioVol);
     }
     audioEngine.resume();
 
