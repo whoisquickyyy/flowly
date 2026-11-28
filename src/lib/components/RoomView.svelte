@@ -1342,105 +1342,16 @@
     background: rgba(255, 255, 255, 0.03);
   }
 
-  .public-rooms-card {
-    padding: 16px 18px;
-    border-radius: 16px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-subtle);
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
 
-  .pub-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
 
-  .pub-title {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 13.5px;
-    font-weight: 700;
-    color: var(--text-primary);
-  }
 
-  .pub-count {
-    padding: 2px 8px;
-    border-radius: 999px;
-    font-size: 11px;
-    font-weight: 700;
-    background: rgba(255, 255, 255, 0.07);
-    color: var(--text-secondary);
-  }
 
-  .pub-empty {
-    font-size: 12.5px;
-    color: var(--text-muted);
-  }
 
-  .pub-list {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
 
-  .pub-room-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 10px 12px;
-    border-radius: 12px;
-    background: rgba(255, 255, 255, 0.035);
-    border: 1px solid var(--border-subtle);
-  }
 
-  .pub-art {
-    width: 40px;
-    height: 40px;
-    border-radius: 8px;
-    object-fit: cover;
-    flex-shrink: 0;
-  }
 
-  .pub-art-placeholder {
-    display: grid;
-    place-items: center;
-    background: rgba(255, 255, 255, 0.07);
-    color: var(--text-secondary);
-  }
 
-  .pub-meta {
-    flex: 1;
-    min-width: 0;
-  }
 
-  .pub-name {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    font-weight: 700;
-    color: var(--text-primary);
-  }
 
-  .pub-code {
-    padding: 2px 6px;
-    border-radius: 6px;
-    font-size: 10.5px;
-    font-weight: 600;
-    background: rgba(255, 255, 255, 0.07);
-    color: var(--text-secondary);
-    letter-spacing: 0.04em;
-  }
 
-  .pub-sub {
-    font-size: 11.5px;
-    color: var(--text-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
 </style>
