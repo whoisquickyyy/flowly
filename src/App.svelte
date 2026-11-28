@@ -1897,6 +1897,12 @@
     };
 
     if (jamTransportKind === 'mashiro') {
+      // Идентичность: генерируем сид-фразу если её нет в keyring
+      const hasSeed = await relayApi.seedExists();
+      if (!hasSeed) {
+        const phrase = await relayApi.seedNew(12);
+        console.info('[jam] сид-фраза сгенерирована');
+      }
       console.info('[jam] mashiro: подключаемся к', jamServerAddr, 'invite:', jamInvite || '(генерируется сервером)');
       let status: import('./lib/jamTransport').RelayStatus;
       try {
