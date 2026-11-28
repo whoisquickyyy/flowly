@@ -168,6 +168,12 @@ pub fn together_relay_status(state: State<'_, RelayState>) -> RelayStatus {
 }
 
 #[tauri::command]
+/// Сгенерировать новый код-приглашение (6 слов bip39)
+pub fn together_relay_invite_new() -> String {
+    together_crypto::invite::words()
+}
+
+#[tauri::command]
 pub fn together_relay_seed_exists() -> Result<bool, String> {
     Ok(keys::load()?.is_some())
 }

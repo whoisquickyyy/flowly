@@ -1955,7 +1955,7 @@
     }
   });
 
-  function createJamRoom(
+  async function createJamRoom(
     name: string,
     tracks: Track[],
     serverAddr: string,
@@ -1964,6 +1964,19 @@
   ) {
     jamTransportKind = 'mashiro';
     jamServerAddr = serverAddr;
+    // Код обязателен: из него выводится ключ комнаты для E2E-шифрования.
+    // Если пусто — генерируем 6 слов bip39 через крипто-модуль.
+    if (!invite.trim()) {
+      try {
+        invite = await api.relayInviteNew();
+      } catch {
+        invite = Array.from({ length: 6 }, () =>
+          ['crisp', 'voyage', 'sample', 'fever', 'mimic', 'rally', 'gentle', 'orbit'][
+            Math.floor(Math.random() * 8)
+          ],
+        ).join(' ');
+      }
+    }
     jamInvite = invite;
     jamLanPort = lanPort;
     void jamConnect(generateRoomCode(), true, name, tracks);
@@ -1981,7 +1994,7 @@
     jamInvite = invite;
     jamLanPort = lanPort;
     jamLanTarget = transport === 'lan' ? target : '';
-    void jamConnect(target, false, name, tracks);
+    void jamConnect(transport === 'mashiro' ? jamInvite : target, false, name, tracks);
   }
 
   function handleDeleteRoom() {

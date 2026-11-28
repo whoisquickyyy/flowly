@@ -89,6 +89,10 @@ export async function relayServerRunning(): Promise<boolean> {
   return invoke<boolean>('relay_server_running').catch(() => false);
 }
 
+export async function relayInviteNew(): Promise<string> {
+  return invoke<string>('together_relay_invite_new');
+}
+
 export async function relayServerLocalIp(): Promise<string | null> {
   return invoke<string | null>('relay_server_local_ip');
 }

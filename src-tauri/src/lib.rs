@@ -204,6 +204,7 @@ pub fn run() {
             together::relay::commands::together_relay_handoff,
             together::relay::commands::together_relay_status,
             together::relay::commands::together_relay_seed_exists,
+            together::relay::commands::together_relay_invite_new,
             together::relay::commands::together_relay_seed_show,
             together::relay::commands::together_relay_seed_set,
             together::relay::commands::together_relay_seed_new,
