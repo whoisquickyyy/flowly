@@ -1859,6 +1859,7 @@
     peers: { id: number; nick: string }[];
   }) {
     if (!st.connected) return;
+    console.info('[jam transport] connected:', JSON.stringify(st));
     jamRoom.connected = true;
     jamRoom.isHost = st.isHost;
     jamRoom.myId = String(st.selfId);
