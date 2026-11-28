@@ -137,20 +137,28 @@
     }
   }
 
+  let embeddedRelayStarting = false;
+
   async function toggleEmbeddedRelay() {
+    if (embeddedRelayStarting) return;
+    embeddedRelayStarting = true;
+
     if (embeddedRelay) {
       embeddedRelay = false;
-      void api.relayServerStop().catch(() => {});
+      await relayApi.serverStop().catch(() => {});
+      embeddedRelayStarting = false;
       return;
     }
+
     try {
       const info = await relayApi.serverStart(lanPort);
       const ip = (await relayApi.serverLocalIp()) ?? '127.0.0.1';
       mashiroAddr = `ws://${ip}:${info.port}/ws`;
       embeddedRelay = true;
     } catch (e) {
-      console.error('встроенный релей:', e);
+      console.error('[embedded relay] ошибка запуска:', e);
     }
+    embeddedRelayStarting = false;
   }
 
   async function handleCreate() {
@@ -255,15 +263,14 @@
           </div>
         </div>
         {#if transport === 'mashiro'}
-          <label class="preset-pill embed-toggle" class:active={embeddedRelay}>
-            <input
-              type="checkbox"
-              bind:checked={embeddedRelay}
-              onchange={toggleEmbeddedRelay}
-              style="display:none"
-            />
-            <span>{embeddedRelay ? 'Релей поднят внутри Flowly' : 'Поднять релей внутри Flowly'}</span>
-          </label>
+          <button
+            type="button"
+            class="preset-pill"
+            class:active={embeddedRelay}
+            onclick={toggleEmbeddedRelay}
+          >
+            {embeddedRelay ? 'Релей запущен в этом окне' : 'Поднять релей в этом окне'}
+          </button>
           <label class="field">
             <span>Адрес релея (wss://...)</span>
             <input
