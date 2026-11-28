@@ -27,23 +27,23 @@
 
   interface Props {
     room: JamRoomState;
-    publicRooms?: PublicJamRoomInfo[];
     likedTracks: Track[];
     playlists: Playlist[];
     defaultName: string;
     onCreateRoom: (
       name: string,
-      relayUrl: string,
-      tasteLabel: string,
-      tracks: Track[],
-      isPrivate: boolean,
-      roomTitle: string
+      transport: 'mashiro' | 'lan',
+      serverAddr: string,
+      invite: string,
+      lanPort: number,
+      tracks: Track[]
     ) => void;
     onJoinRoom: (
-      code: string,
+      target: string,
       name: string,
-      relayUrl: string,
-      tasteLabel: string,
+      transport: 'mashiro' | 'lan',
+      invite: string,
+      lanPort: number,
       tracks: Track[]
     ) => void;
     onLeaveRoom: () => void;
@@ -57,7 +57,6 @@
 
   let {
     room,
-    publicRooms = [],
     likedTracks,
     playlists,
     defaultName,
@@ -78,11 +77,11 @@
   let joinCode = $state('');
   let roomTitle = $state('');
   let isPrivateRoom = $state(false);
-  let relayUrl = $state(
-    typeof localStorage !== 'undefined'
-      ? localStorage.getItem('flowly_jam_relay') || 'supabase'
-      : 'supabase'
-  );
+  let transport = $state<'mashiro' | 'lan'>('mashiro');
+  let mashiroAddr = $state('wss://your-relay.example/ws');
+  let inviteCode = $state('');
+  let lanPort = $state(7331);
+  let lanHost = $state('192.168.0.100:7331');
   let tasteSource = $state<'liked' | 'recap' | string>('liked');
   let copied = $state(false);
   let loadingTaste = $state(false);
@@ -141,20 +140,16 @@
 
   async function handleCreate() {
     const cleanName = displayName.trim() || 'Хост';
-    const targetRelay = relayUrl.trim() || 'supabase';
-    saveRelay(targetRelay);
     const taste = await resolveTasteBundle();
-    onCreateRoom(cleanName, targetRelay, taste.label, taste.tracks, isPrivateRoom, roomTitle.trim());
+    onCreateRoom(cleanName, transport, mashiroAddr.trim(), inviteCode.trim(), lanPort, taste.tracks);
   }
 
   async function handleJoinByCode(rawCode: string) {
-    const code = rawCode.trim().toUpperCase();
+    const code = rawCode.trim();
     if (!code) return;
     const cleanName = displayName.trim() || 'Гость';
-    const targetRelay = relayUrl.trim() || 'supabase';
-    saveRelay(targetRelay);
     const taste = await resolveTasteBundle();
-    onJoinRoom(code, cleanName, targetRelay, taste.label, taste.tracks);
+    onJoinRoom(code, cleanName, transport, code, lanPort, taste.tracks);
   }
 
   async function handleJoin() {
@@ -221,29 +216,42 @@
             <button
               type="button"
               class="preset-pill"
-              class:active={relayUrl === 'supabase'}
-              onclick={() => saveRelay('supabase')}
+              class:active={transport === 'mashiro'}
+              onclick={() => (transport = 'mashiro')}
             >
-              Supabase Realtime (из коробки)
+              Релей mashiro (интернет)
             </button>
             <button
               type="button"
               class="preset-pill"
-              class:active={relayUrl !== 'supabase'}
-              onclick={() => saveRelay('ws://127.0.0.1:8787')}
+              class:active={transport === 'lan'}
+              onclick={() => (transport = 'lan')}
             >
-              Свой WebSocket Relay
+              Локальная сеть / Radmin
             </button>
           </div>
         </div>
-        {#if relayUrl !== 'supabase'}
+        {#if transport === 'mashiro'}
           <label class="field">
-            <span>WebSocket Relay URL</span>
+            <span>Адрес релея (wss://...)</span>
             <input
               type="text"
-              bind:value={relayUrl}
-              placeholder="wss://flowly-jam-relay.workers.dev или ws://127.0.0.1:8787"
+              bind:value={mashiroAddr}
+              placeholder="wss://your-relay.example/ws"
             />
+          </label>
+          <label class="field">
+            <span>Код-приглашение (пусто — создаст новая комната)</span>
+            <input
+              type="text"
+              bind:value={inviteCode}
+              placeholder="voyage sample crisp fever mimic rally"
+            />
+          </label>
+        {:else}
+          <label class="field">
+            <span>Порт комнаты (по умолчанию 7331)</span>
+            <input type="number" bind:value={lanPort} min={1} max={65535} />
           </label>
         {/if}
       </div>
@@ -300,7 +308,11 @@
             handleJoin();
           }}
         >
-          <input type="text" bind:value={joinCode} placeholder="Код комнаты (FLOW-XXXX)" />
+          <input
+            type="text"
+            bind:value={joinCode}
+            placeholder={transport === 'mashiro' ? 'Код-приглашение' : 'Адрес хоста (192.168.x.x:7331)'}
+          />
           <button type="submit" class="btn-secondary" disabled={loadingTaste || !joinCode.trim()}>
             Войти
           </button>
@@ -312,53 +324,6 @@
       </div>
     </div>
 
-    <!-- Открытые (общие) комнаты -->
-    <div class="public-rooms-card">
-      <div class="pub-head">
-        <div class="pub-title">
-          <Globe size={15} />
-          <span>Открытые комнаты</span>
-        </div>
-        <span class="pub-count">{publicRooms.length}</span>
-      </div>
-      {#if publicRooms.length === 0}
-        <div class="pub-empty">
-          Пока нет активных общих комнат. Создайте свою с типом «Общая», и она появится здесь.
-        </div>
-      {:else}
-        <div class="pub-list">
-          {#each publicRooms as pub (pub.roomCode)}
-            <div class="pub-room-row">
-              {#if pub.currentTrackArtwork}
-                <img class="pub-art" src={pub.currentTrackArtwork} alt={pub.title} />
-              {:else}
-                <div class="pub-art pub-art-placeholder"><Radio size={16} /></div>
-              {/if}
-              <div class="pub-meta">
-                <div class="pub-name">
-                  <span>{pub.title}</span>
-                  <span class="pub-code">{pub.roomCode}</span>
-                </div>
-                <div class="pub-sub">
-                  Хост: {pub.hostName} · {pub.memberCount} уч.
-                  {#if pub.currentTrackTitle}
-                    · Сейчас: {pub.currentTrackArtist} — {pub.currentTrackTitle}
-                  {/if}
-                </div>
-              </div>
-              <button
-                type="button"
-                class="btn-secondary"
-                disabled={loadingTaste}
-                onclick={() => handleJoinByCode(pub.roomCode)}
-              >
-                Войти
-              </button>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
   {:else}
     <!-- Активная комната -->
     <div class="active-top">
@@ -425,7 +390,15 @@
           />
         </div>
         {#if room.isHost}
-          <button type="button" class="btn-sm" onclick={onRebuildBlend} title="Пересобрать общий микс">
+          <button
+            type="button"
+            class="btn-sm"
+            onclick={async () => {
+              const taste = await resolveTasteBundle();
+              onRebuildBlend(taste.tracks);
+            }}
+            title="Пересобрать микс из свежих треков источника"
+          >
             <RefreshCw size={13} />
             <span>Пересобрать микс</span>
           </button>

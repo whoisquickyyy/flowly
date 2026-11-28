@@ -62,7 +62,6 @@
     type JamChatMessage,
     type JamMember,
     type JamRoomState,
-    type PublicJamRoomInfo,
   } from './lib/jamRoom';
   import { DRIFT_LIMIT, HEARTBEAT_MS, PUSH_DEBOUNCE, RESEND_MS, buildState, expectedPosition, findStartIndex } from './lib/jamSync';
   import type { JamStatePayload } from './lib/jamSync';
@@ -864,6 +863,7 @@
   });
 
   onMount(async () => {
+    bindJamTransportListeners();
     if (api.isTauri()) {
       getCurrentWindow().show().catch(() => {});
     }
@@ -1329,6 +1329,30 @@
     }
   }
 
+  function handleCreateRoomJam(
+    name: string,
+    transport: 'mashiro' | 'lan',
+    serverAddr: string,
+    invite: string,
+    lanPort: number,
+    tracks: Track[]
+  ) {
+    jamTransport = transport;
+    createJamRoom(name, tracks, serverAddr, invite, lanPort);
+  }
+
+  function handleJoinRoomJam(
+    target: string,
+    name: string,
+    transport: 'mashiro' | 'lan',
+    invite: string,
+    lanPort: number,
+    tracks: Track[]
+  ) {
+    jamTransport = transport;
+    joinJamRoom(target, name, transport, invite, lanPort, tracks);
+  }
+
   async function handleStartWave(sourceFilter: import('./lib/types').SourceKind | null) {
     const token = ++switchToken;
     await audioEngine.resume();
@@ -1489,7 +1513,7 @@
     myId: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `u-${Date.now()}`,
     isHost: false,
     connected: false,
-    relayUrl: 'supabase',
+    transport: 'mashiro' as 'mashiro' | 'lan',
     isPrivate: false,
     roomTitle: '',
     members: [],
@@ -1500,14 +1524,11 @@
     skipVotes: [],
     statusText: '',
   });
-  let publicJamRooms = $state<PublicJamRoomInfo[]>([]);
-  let jamLobbyWs: WebSocket | null = null;
-  let jamLobbyPhxTimer: ReturnType<typeof setInterval> | null = null;
-  let jamLobbyAnnounceTimer: ReturnType<typeof setInterval> | null = null;
-  let jamLobbyRef = 1;
-  let jamWs: WebSocket | null = null;
-  let jamHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  let jamPhxHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let jamTransportKind = $state<'mashiro' | 'lan'>('mashiro');
+  let jamServerAddr = $state('');
+  let jamInvite = $state('');
+  let jamLanPort = $state(7331);
+  let jamLanTarget = $state('');
   let jamPhxRef = 1;
   let jamMemberMap = new Map<string, JamMember>();
   let jamPlayedKeys = new Set<string>();
@@ -1519,6 +1540,7 @@
   let jamLastPushMs = 0;
   let jamLastReady: boolean | null = null;
   let jamLastState: JamStatePayload | null = null;
+  let jamTransport = $state<'mashiro' | 'lan'>('mashiro');
   let jamSyncTimer: ReturnType<typeof setInterval> | null = null;
   let jamPushTimer: ReturnType<typeof setTimeout> | null = null;
   let jamRefillBusy = false;
@@ -1567,7 +1589,6 @@
         // Оставляем небольшой хвост истории, но не даём очереди расти бесконечно
         const baseQueue = curIdx > 15 ? jamRoom.queue.slice(curIdx - 5) : jamRoom.queue;
         jamRoom.queue = [...baseQueue, ...picked];
-        jamBroadcastMeta();
       }
     } finally {
       jamRefillBusy = false;
@@ -1589,32 +1610,20 @@
       ts: Date.now(),
     };
     jamRoom.chat = [...(jamRoom.chat ?? []).slice(-49), msg];
-    sendJamMsg({ type: 'chat', message: msg });
+    sendJamMsg({ kind: 'note', text: clean });
   }
 
-  function sendJamMsg(msg: Record<string, unknown>) {
-    if (!jamWs || jamWs.readyState !== WebSocket.OPEN) return;
-    if (jamRoom.relayUrl === 'supabase') {
-      jamWs.send(
-        JSON.stringify({
-          topic: `realtime:jam-${jamRoom.roomCode}`,
-          event: 'broadcast',
-          payload: {
-            type: 'broadcast',
-            event: 'jam_msg',
-            payload: msg,
-          },
-          ref: String(jamPhxRef++),
-        })
-      );
+  function sendJamMsg(payload: JamSyncPayload | Record<string, unknown>) {
+    if (jamTransportKind === 'mashiro') {
+      void relayApi.send(payload).catch(() => {});
     } else {
-      jamWs.send(JSON.stringify(msg));
+      void lanApi.send(payload).catch(() => {});
     }
   }
 
   async function playRoomTrackLocally(track: Track, shouldPlay: boolean, posSec = 0) {
     await audioEngine.resume();
-    const queueTracks = jamRoom.queue.map((q) => q.track);
+    const queueTracks = player.queue.length > 0 ? player.queue : jamRoom.queue.map((q) => q.track);
     let targetTrack = track;
     const isSrcConnected = sources.some((s) => s.source === track.source && s.auth.connected);
     if (!isSrcConnected) {
@@ -1653,16 +1662,6 @@
         },
         withQueue,
       ),
-    });
-  }
-
-  // Метаданные состава комнаты (участники/голоса) — на сменах состава
-  function jamBroadcastMeta() {
-    if (!jamRoom.isHost || !jamRoom.connected) return;
-    sendJamMsg({
-      type: 'room_meta',
-      members: jamRoom.members,
-      skipVotes: jamRoom.skipVotes,
     });
   }
 
@@ -1743,22 +1742,27 @@
     });
   }
 
-  function jamRebuildBlend() {
-    if (!jamRoom.isHost && jamRoom.connected) {
-      sendJamMsg({ type: 'request_rebuild' });
+  // Пересборка микса: свежая порция из источника хоста, исключая всё прослушанное
+  function jamRebuildBlend(freshTracks?: Track[]) {
+    if (!jamRoom.isHost || !jamRoom.connected) return;
+    const played = new Set(jamPlayedKeys);
+    const current = jamRoom.currentTrack ? trackMatchKey(jamRoom.currentTrack) : '';
+    if (current) played.add(current);
+
+    const pool = (freshTracks ?? []).filter((t) => !played.has(trackMatchKey(t)));
+    if (pool.length === 0) {
+      jamRoom.statusText = 'Новых треков в источнике нет — добавьте лайков или смените источник';
       return;
     }
-    const members = [...jamMemberMap.values()];
-    const blended = buildBlendedQueue(members, 120, undefined, true);
-    jamRoom.members = members;
-    jamRoom.queue = blended;
-    jamRoom.statusText = 'Микс пересобран';
-    if (jamRoom.isHost) {
-      jamPushState(true);
-    }
+
+    jamRoom.queue = pool
+      .slice(0, 120)
+      .map((t) => ({ track: t, reason: 'Микс хоста', matchCount: 1, score: 0 }) as BlendedTrack);
+    jamRoom.statusText = `Микс пересобран: ${jamRoom.queue.length} новых треков`;
+    jamPushState(true);
   }
 
-  function jamAdvanceNext() {
+  function jamAdvanceNext() {  function jamAdvanceNext() {
     if (jamRoom.queue.length === 0) return;
     const curIdx = jamRoom.currentTrack
       ? jamRoom.queue.findIndex((q) => q.track.id === jamRoom.currentTrack?.id)
@@ -1778,390 +1782,199 @@
     void refillJamQueueIfNeeded();
   }
 
-  function sendLobbyMsg(msg: Record<string, unknown>) {
-    if (!jamLobbyWs || jamLobbyWs.readyState !== WebSocket.OPEN) return;
-    jamLobbyWs.send(
-      JSON.stringify({
-        topic: 'realtime:jam-lobby',
-        event: 'broadcast',
-        payload: {
-          type: 'broadcast',
-          event: 'jam_lobby',
-          payload: msg,
-        },
-        ref: String(jamLobbyRef++),
-      })
+  let jamListenersBound = false;
+
+  // Слушатели транспорта Together — регистрируются один раз
+  function bindJamTransportListeners() {
+    if (jamListenersBound) return;
+    jamListenersBound = true;
+    void onRelayMessage((m) => jamHandleTransportMessage(m));
+    void onTogetherMessage((m) => jamHandleTransportMessage(m));
+    void onRelayStatus((st) =>
+      jamApplyTransportStatus({
+        connected: st.connected,
+        isHost: st.selfId !== 0 && st.selfId === st.host,
+        selfId: st.selfId,
+        room: st.room,
+        peers: st.peers,
+      }),
     );
+    void onTogetherStatus((st) =>
+      jamApplyTransportStatus({
+        connected: st.mode !== 'off',
+        isHost: st.mode === 'host',
+        selfId: st.selfId,
+        room: jamLanTarget || `:${st.port}`,
+        peers: st.peers,
+      }),
+    );
+    void onRelayJoined(() => {
+      if (jamRoom.isHost) jamPushState(true);
+    });
+    void onRelayClosed(({ reason }) => {
+      jamRoom.connected = false;
+      jamRoom.statusText = reason;
+    });
+    void onTogetherClosed(({ reason }) => {
+      jamRoom.connected = false;
+      jamRoom.statusText = reason;
+    });
   }
 
-  function buildPublicRoomInfo(): PublicJamRoomInfo | null {
-    if (!jamRoom.connected || !jamRoom.isHost || jamRoom.isPrivate || !jamRoom.roomCode) return null;
-    const hostName = jamRoom.members.find((m) => m.isHost)?.name || 'Хост';
-    return {
-      roomCode: jamRoom.roomCode,
-      title: jamRoom.roomTitle?.trim() || `Комната ${hostName}`,
-      hostName,
-      memberCount: jamRoom.members.length,
-      currentTrackTitle: jamRoom.currentTrack?.title,
-      currentTrackArtist: jamRoom.currentTrack?.artist,
-      currentTrackArtwork: jamRoom.currentTrack?.artwork,
-      isPrivate: false,
-      updatedAt: Date.now(),
-    };
-  }
+  function jamHandleTransportMessage(m: { from: number; nick: string; payload: JamSyncPayload | null }) {
+    const payload = m.payload;
+    if (!payload) return;
 
-  function broadcastPublicRoom() {
-    const info = buildPublicRoomInfo();
-    if (info) sendLobbyMsg({ type: 'lobby_announce', room: info });
-  }
-
-  function ensureJamLobbySocket() {
-    if (jamLobbyWs && (jamLobbyWs.readyState === WebSocket.OPEN || jamLobbyWs.readyState === WebSocket.CONNECTING)) {
+    if (payload.kind === 'state') {
+      if (!jamRoom.isHost) void jamReceiveState(payload);
       return;
     }
-    const ws = new WebSocket(sb.getSupabaseRealtimeWsUrl());
-    jamLobbyWs = ws;
-    let joinedLobby = false;
-
-    ws.onopen = () => {
-      if (jamLobbyWs !== ws) return;
-      ws.send(
-        JSON.stringify({
-          topic: 'realtime:jam-lobby',
-          event: 'phx_join',
-          payload: { config: { broadcast: { self: false } } },
-          ref: String(jamLobbyRef++),
-        })
-      );
-      if (jamLobbyPhxTimer === null) {
-        jamLobbyPhxTimer = setInterval(() => {
-          if (jamLobbyWs && jamLobbyWs.readyState === WebSocket.OPEN) {
-            jamLobbyWs.send(
-              JSON.stringify({
-                topic: 'phoenix',
-                event: 'heartbeat',
-                payload: {},
-                ref: String(jamLobbyRef++),
-              })
-            );
-          }
-        }, 25_000);
-      }
-      if (jamLobbyAnnounceTimer === null) {
-        jamLobbyAnnounceTimer = setInterval(() => {
-          const now = Date.now();
-          publicJamRooms = publicJamRooms.filter((r) => now - r.updatedAt < 25_000);
-          broadcastPublicRoom();
-        }, 6000);
-      }
-    };
-
-    ws.onmessage = (ev) => {
-      if (jamLobbyWs !== ws) return;
-      try {
-        const raw = JSON.parse(ev.data);
-        if (raw.event === 'phx_reply' && raw.topic === 'realtime:jam-lobby' && raw.payload?.status === 'ok' && !joinedLobby) {
-          joinedLobby = true;
-          sendLobbyMsg({ type: 'lobby_ping' });
-          broadcastPublicRoom();
-          return;
-        }
-        if (raw.event !== 'broadcast') return;
-        const msg = raw.payload?.payload;
-        if (!msg) return;
-        if (msg.type === 'lobby_announce' && msg.room) {
-          const room = msg.room as PublicJamRoomInfo;
-          if (!room.roomCode || room.roomCode === jamRoom.roomCode) return;
-          const next = publicJamRooms.filter((r) => r.roomCode !== room.roomCode);
-          publicJamRooms = [{ ...room, updatedAt: Date.now() }, ...next].sort((a, b) => b.updatedAt - a.updatedAt);
-        } else if (msg.type === 'lobby_remove' && msg.roomCode) {
-          publicJamRooms = publicJamRooms.filter((r) => r.roomCode !== msg.roomCode);
-        } else if (msg.type === 'lobby_ping') {
-          broadcastPublicRoom();
-        }
-      } catch {
-        // ignore lobby parse errors
-      }
-    };
-
-    ws.onclose = () => {
-      if (jamLobbyWs !== ws) return;
-      jamLobbyWs = null;
-      if (jamLobbyPhxTimer) {
-        clearInterval(jamLobbyPhxTimer);
-        jamLobbyPhxTimer = null;
-      }
-      if (jamLobbyAnnounceTimer) {
-        clearInterval(jamLobbyAnnounceTimer);
-        jamLobbyAnnounceTimer = null;
-      }
-    };
-  }
-
-  function closeJamLobbySocket() {
-    if (jamLobbyWs) {
-      const old = jamLobbyWs;
-      jamLobbyWs = null;
-      old.close();
+    if (payload.kind === 'ready') {
+      if (jamRoom.isHost) jamSetWaiting(String(m.from), m.nick, !payload.ready);
+      return;
     }
-    if (jamLobbyPhxTimer) {
-      clearInterval(jamLobbyPhxTimer);
-      jamLobbyPhxTimer = null;
-    }
-    if (jamLobbyAnnounceTimer) {
-      clearInterval(jamLobbyAnnounceTimer);
-      jamLobbyAnnounceTimer = null;
+    if (payload.kind === 'note') {
+      const msg: JamChatMessage = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        senderId: String(m.from),
+        senderName: m.nick,
+        text: payload.text,
+        ts: Date.now(),
+      };
+      jamRoom.chat = [...(jamRoom.chat ?? []).slice(-49), msg];
     }
   }
 
-  $effect(() => {
-    const needLobby = activeTab === 'room' || (jamRoom.connected && jamRoom.isHost && !jamRoom.isPrivate);
-    if (needLobby) {
-      ensureJamLobbySocket();
-      if (jamRoom.connected && jamRoom.isHost && !jamRoom.isPrivate) {
-        broadcastPublicRoom();
-      }
-    } else {
-      closeJamLobbySocket();
-    }
-  });
+  function jamApplyTransportStatus(st: {
+    connected: boolean;
+    isHost: boolean;
+    selfId: number;
+    room: string;
+    peers: { id: number; nick: string }[];
+  }) {
+    if (!st.connected) return;
+    jamRoom.connected = true;
+    jamRoom.isHost = st.isHost;
+    jamRoom.myId = String(st.selfId);
+    jamRoom.members = st.peers.map((p) => ({
+      id: String(p.id),
+      name: p.nick,
+      isHost: p.id === st.host,
+      tasteLabel: 'участник',
+      trackCount: 0,
+    }));
+  }
 
-  function openJamSocket(
+  async function jamConnect(
     code: string,
     isHost: boolean,
     name: string,
-    relayUrl: string,
-    tasteLabel: string,
-    tracks: Track[],
-    isPrivate = false,
-    roomTitle = ''
+    tracks: Track[]
   ) {
-    leaveJamRoom();
-    const myMember: JamMember = {
-      id: jamRoom.myId,
-      name,
-      avatarUrl: sbProfile?.avatar_url || undefined,
-      tag: sbProfile?.tag || undefined,
-      role: sbProfile?.role,
-      isHost,
-      tasteLabel,
-      trackCount: tracks.length,
-      tracks,
-    };
-    jamMemberMap = new Map([[myMember.id, myMember]]);
-    const initialQueue = isHost ? buildBlendedQueue([myMember]) : [];
-    const initialTrack = isHost ? initialQueue[0]?.track ?? null : null;
-
     jamRoom = {
       ...jamRoom,
       roomCode: code,
       isHost,
       connected: false,
-      relayUrl,
-      isPrivate,
-      roomTitle: roomTitle.trim(),
-      members: [myMember],
-      queue: initialQueue,
-      currentTrack: initialTrack,
-      isPlaying: Boolean(isHost && initialTrack),
+      members: [
+        { id: '0', name, isHost, tasteLabel: 'хост', trackCount: tracks.length },
+      ],
+      queue: isHost ? tracks.map((t) => ({ track: t, reason: 'Очередь хоста', matchCount: 1, score: 0 })) : [],
+      currentTrack: null,
+      isPlaying: false,
       positionSec: 0,
       skipVotes: [],
       chat: [],
-      syncStatus: undefined,
-      statusText: relayUrl === 'supabase' ? 'Подключение к Supabase Realtime...' : 'Подключение к Relay...',
+      statusText: 'Подключение...',
     };
 
-    if (isHost && initialTrack) {
-      void playRoomTrackLocally(initialTrack, true, 0);
-    } else if (!isHost && player.is_playing) {
+    if (jamTransportKind === 'mashiro') {
+      const status = isHost
+        ? await relayApi.create(jamServerAddr, name, jamInvite || undefined)
+        : await relayApi.join(jamServerAddr, name, jamInvite);
+      jamApplyTransportStatus({
+        connected: true,
+        isHost: status.selfId !== 0 && status.selfId === status.host,
+        selfId: status.selfId,
+        room: status.room,
+        peers: status.peers,
+      });
+      jamRoom.statusText = isHost ? 'Комната создана' : 'Подключено к релею';
+    } else {
+      const status = isHost
+        ? await lanApi.host(name, jamLanPort)
+        : await lanApi.join(jamLanTarget || code, name);
+      jamApplyTransportStatus({
+        connected: true,
+        isHost: status.mode === 'host',
+        selfId: status.selfId,
+        room: jamLanTarget || `:${status.port}`,
+        peers: status.peers,
+      });
+      jamRoom.statusText = isHost ? 'Комната поднята в локальной сети' : 'Подключено к хосту';
+    }
+
+    if (isHost) {
+      const queueTracks = jamRoom.queue.map((q) => q.track);
+      const first = queueTracks[0] ?? null;
+      if (first) {
+        jamRoom.currentTrack = first;
+        jamRoom.isPlaying = true;
+        void playRoomTrackLocally(first, true, 0).then(() => jamPushState(true));
+      } else {
+        jamPushState(false);
+      }
+    } else if (player.is_playing) {
       void api.togglePlayback().then(applyStatePreservingPosition).catch(() => {});
     }
 
-    const isSb = relayUrl === 'supabase';
-    const wsUrl = isSb
-      ? sb.getSupabaseRealtimeWsUrl()
-      : `${relayUrl}${relayUrl.includes('?') ? '&' : '?'}room=${encodeURIComponent(code)}`;
-    const ws = new WebSocket(wsUrl);
-    jamWs = ws;
-    let joinSent = false;
-
-    const sendJoinOnce = () => {
-      if (jamWs !== ws || ws.readyState !== WebSocket.OPEN) return;
-      if (!joinSent) {
-        joinSent = true;
-        sendJamMsg({ type: 'join', member: myMember });
-      }
-    };
-
-    ws.onopen = () => {
-      if (jamWs !== ws) return;
-      if (isSb) {
-        ws.send(
-          JSON.stringify({
-            topic: `realtime:jam-${code}`,
-            event: 'phx_join',
-            payload: { config: { broadcast: { self: false } } },
-            ref: String(jamPhxRef++),
-          })
-        );
-        if (jamPhxHeartbeatTimer === null) {
-          jamPhxHeartbeatTimer = setInterval(() => {
-            if (jamWs && jamWs.readyState === WebSocket.OPEN) {
-              jamWs.send(
-                JSON.stringify({
-                  topic: 'phoenix',
-                  event: 'heartbeat',
-                  payload: {},
-                  ref: String(jamPhxRef++),
-                })
-              );
-            }
-          }, 25_000);
-        }
-      }
-      jamRoom.connected = true;
-      jamRoom.statusText = isHost ? 'Комната создана' : 'Подключено к комнате';
-      if (!isSb) {
-        sendJoinOnce();
-      } else {
-        setTimeout(sendJoinOnce, 800);
-      }
-      if (isHost && !isPrivate) {
-        ensureJamLobbySocket();
-        setTimeout(() => broadcastPublicRoom(), 400);
-      }
-      if (jamSyncTimer === null) {
-        jamSyncTimer = setInterval(() => {
-          if (!jamRoom.connected) return;
-          if (jamRoom.isHost) {
-            // Полный пуш состояния раз в RESEND_MS (позиция подравняет гостей)
-            if (Date.now() - jamLastPushMs > RESEND_MS) jamPushState(false);
-            return;
-          }
-          jamReportReady();
-        }, HEARTBEAT_MS);
-      }
-    };
-
-    ws.onmessage = async (ev) => {
-      if (jamWs !== ws) return;
-      try {
-        const raw = JSON.parse(ev.data);
-        if (isSb && raw.event === 'phx_reply' && raw.topic === `realtime:jam-${code}` && raw.payload?.status === 'ok') {
-          sendJoinOnce();
+    if (jamSyncTimer === null) {
+      jamSyncTimer = setInterval(() => {
+        if (!jamRoom.connected) return;
+        if (jamRoom.isHost) {
+          if (Date.now() - jamLastPushMs > RESEND_MS) jamPushState(false);
           return;
         }
-        const msg = isSb
-          ? raw.event === 'broadcast'
-            ? raw.payload?.payload
-            : null
-          : raw;
-        if (!msg) return;
-        if (msg.type === 'join' && msg.member) {
-          const m = msg.member as JamMember;
-          jamMemberMap.set(m.id, m);
-          if (jamRoom.isHost) {
-            jamRoom.members = [...jamMemberMap.values()];
-            jamRoom.queue = buildBlendedQueue(jamRoom.members);
-            if (!jamRoom.currentTrack && jamRoom.queue[0]) {
-              const first = jamRoom.queue[0].track;
-              jamRoom.currentTrack = first;
-              jamRoom.isPlaying = true;
-              void playRoomTrackLocally(first, true, 0);
-            }
-            jamPushState(true);
-            if (!jamRoom.isPrivate) broadcastPublicRoom();
-          }
-        } else if (msg.type === 'update_taste' && msg.member) {
-          const m = msg.member as JamMember;
-          jamMemberMap.set(m.id, m);
-          if (jamRoom.isHost) {
-            jamRebuildBlend();
-          }
-        } else if (msg.type === 'leave' && msg.memberId) {
-          jamMemberMap.delete(msg.memberId);
-          if (jamRoom.isHost) {
-            jamRoom.members = [...jamMemberMap.values()];
-            jamRoom.queue = buildBlendedQueue(jamRoom.members);
-            jamRoom.skipVotes = jamRoom.skipVotes.filter((id) => id !== msg.memberId);
-            jamBroadcastMeta();
-            jamPushState(true); // новичок зеркалит очередь хоста целиком
-            if (!jamRoom.isPrivate) broadcastPublicRoom();
-          }
-        } else if (msg.type === 'room_meta' && !jamRoom.isHost) {
-          jamRoom.members = msg.members ?? [];
-          jamMemberMap = new Map(jamRoom.members.map((m: JamMember) => [m.id, m]));
-          jamRoom.skipVotes = msg.skipVotes ?? [];
-        } else if (msg.type === 'jam_state' && !jamRoom.isHost && msg.payload) {
-          await jamReceiveState(msg.payload as JamStatePayload);
-        } else if (msg.type === 'jam_ready' && jamRoom.isHost && msg.payload) {
-          const rp = msg.payload as { ready: boolean };
-          jamSetWaiting(String(msg.memberId ?? ''), String(msg.nick ?? 'Участник'), !rp.ready);
-        } else if (msg.type === 'request_rebuild' && jamRoom.isHost) {
-          jamRebuildBlend();
-        } else if (msg.type === 'chat' && msg.message) {
-          const chatMsg = msg.message as JamChatMessage;
-          jamRoom.chat = [...(jamRoom.chat ?? []).slice(-49), chatMsg];
-        } else if (msg.type === 'heartbeat' && !jamRoom.isHost) {
-          jamLastHostHeartbeatMs = Date.now();
-          if (msg.trackId && jamRoom.currentTrack?.id === msg.trackId) {
-            if (player.is_playing !== Boolean(msg.isPlaying)) {
-              jamRoom.isPlaying = Boolean(msg.isPlaying);
-              applyStatePreservingPosition(await api.togglePlayback());
-            }
-            const expected =
-              (msg.positionSec ?? 0) +
-              (msg.isPlaying ? Math.max(0, (Date.now() - (msg.sentAtMs ?? Date.now())) / 1000) : 0);
-            const drift = Math.abs(player.position_sec - expected);
-            if (drift > 0.45) {
-              jamRoom.syncStatus = 'catching-up';
-              if (Date.now() - jamLastAlignMs > 2500) {
-                jamLastAlignMs = Date.now();
-                const cur = getActiveAudio();
-                if (cur) cur.currentTime = expected;
-                player.position_sec = Math.floor(expected);
-              }
-            } else {
-              jamRoom.syncStatus = 'synced';
-            }
-          }
-        }
-      } catch {
-        // ignore parse errors
-      }
-    };
-
-    ws.onerror = () => {
-      if (jamWs !== ws) return;
-      jamRoom.statusText = 'Ошибка подключения к Relay. Проверьте URL или запустите relay/server.mjs';
-    };
-
-    ws.onclose = () => {
-      if (jamWs !== ws) return;
-      jamWs = null;
-      jamRoom.connected = false;
-      if (jamSyncTimer) {
-        clearInterval(jamSyncTimer);
-        jamSyncTimer = null;
-      }
-      jamWaiting.clear();
-      jamHolding = false;
-      if (jamPhxHeartbeatTimer) {
-        clearInterval(jamPhxHeartbeatTimer);
-        jamPhxHeartbeatTimer = null;
-      }
-    };
+        jamReportReady();
+      }, HEARTBEAT_MS);
+    }
   }
+
+  $effect(() => {
+    // Локдаун: в комнате разрешена только главная вкладка
+    if (jamRoom.connected && activeTab !== 'details') {
+      activeTab = 'details';
+      activeArtist = null;
+    }
+  });
 
   function createJamRoom(
     name: string,
-    relayUrl: string,
-    tasteLabel: string,
     tracks: Track[],
-    isPrivate = false,
-    roomTitle = ''
+    serverAddr: string,
+    invite: string,
+    lanPort: number
   ) {
-    openJamSocket(generateRoomCode(), true, name, relayUrl, tasteLabel, tracks, isPrivate, roomTitle);
+    jamTransportKind = 'mashiro';
+    jamServerAddr = serverAddr;
+    jamInvite = invite;
+    jamLanPort = lanPort;
+    void jamConnect(generateRoomCode(), true, name, tracks);
+  }
+
+  function joinJamRoom(
+    target: string,
+    name: string,
+    transport: 'mashiro' | 'lan',
+    invite: string,
+    lanPort: number,
+    tracks: Track[]
+  ) {
+    jamTransportKind = transport;
+    jamInvite = invite;
+    jamLanPort = lanPort;
+    jamLanTarget = transport === 'lan' ? target : '';
+    void jamConnect(target, false, name, tracks);
   }
 
   function joinJamRoom(code: string, name: string, relayUrl: string, tasteLabel: string, tracks: Track[]) {
@@ -2169,14 +1982,10 @@
   }
 
   function leaveJamRoom() {
-    if (jamRoom.isHost && !jamRoom.isPrivate && jamRoom.roomCode) {
-      sendLobbyMsg({ type: 'lobby_remove', roomCode: jamRoom.roomCode });
-    }
-    if (jamWs) {
-      sendJamMsg({ type: 'leave', memberId: jamRoom.myId });
-      const oldWs = jamWs;
-      jamWs = null;
-      oldWs.close();
+    if (jamTransportKind === 'mashiro') {
+      void relayApi.leave().catch(() => {});
+    } else {
+      void lanApi.leave().catch(() => {});
     }
     if (jamSyncTimer) {
       clearInterval(jamSyncTimer);
@@ -3111,12 +2920,11 @@
         {#await import('./lib/components/RoomView.svelte') then { default: RoomView }}
           <RoomView
             room={jamRoom}
-            publicRooms={publicJamRooms}
             {likedTracks}
             playlists={playlists}
             defaultName={sbProfile?.username || sources.find((s) => s.auth.connected)?.auth.account_name || ''}
-            onCreateRoom={createJamRoom}
-            onJoinRoom={joinJamRoom}
+            onCreateRoom={handleCreateRoomJam}
+            onJoinRoom={handleJoinRoomJam}
             onLeaveRoom={leaveJamRoom}
             onUpdateTaste={updateJamTaste}
             onPlayTrack={jamPlayTrack}

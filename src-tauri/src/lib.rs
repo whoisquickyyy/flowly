@@ -1,5 +1,6 @@
 mod activity;
 mod auth;
+pub mod together;
 mod commands;
 mod discord_rpc;
 mod local_library;
@@ -41,7 +42,8 @@ pub fn run() {
             let track_cache = state.track_cache.clone();
             tauri::async_runtime::spawn(proxy_server::run_proxy_server(listener, Arc::clone(&registry), track_cache));
             app.manage(media_controls::SmtcHandle::spawn(app.handle()));
-
+            app.manage(together::state::TogetherState::default());
+            app.manage(together::relay::RelayState::default());
             app.manage(state);
 
             // Прогреваем playback_url последнего трека в фоне после холодного старта
@@ -183,6 +185,26 @@ pub fn run() {
             commands::set_track_cache_enabled,
             commands::report_wave_feedback,
             commands::open_external_url,
+            together::commands::together_host,
+            together::commands::together_join,
+            together::commands::together_leave,
+            together::commands::together_send,
+            together::commands::together_status,
+            together::commands::together_peer_address,
+            together::commands::together_log_path,
+            together::relay::commands::together_relay_create,
+            together::relay::commands::together_relay_join,
+            together::relay::commands::together_relay_leave,
+            together::relay::commands::together_relay_send,
+            together::relay::commands::together_relay_handoff,
+            together::relay::commands::together_relay_status,
+            together::relay::commands::together_relay_seed_exists,
+            together::relay::commands::together_relay_seed_show,
+            together::relay::commands::together_relay_seed_set,
+            together::relay::commands::together_relay_seed_new,
+            together::relay::commands::together_relay_seed_forget,
+            together::relay::commands::together_relay_identity,
+            together::relay::commands::together_relay_invite,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
