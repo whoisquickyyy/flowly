@@ -64,7 +64,9 @@
     type JamRoomState,
   } from './lib/jamRoom';
   import { DRIFT_LIMIT, HEARTBEAT_MS, PUSH_DEBOUNCE, RESEND_MS, buildState, expectedPosition, findStartIndex } from './lib/jamSync';
+  import { relayApi, lanApi, onRelayMessage, onTogetherMessage, onRelayStatus, onTogetherStatus, onRelayJoined, onRelayClosed, onTogetherClosed } from './lib/jamTransport';
   import type { JamStatePayload } from './lib/jamSync';
+  import type { JamSyncPayload } from './lib/jamSync';
   import { audioEngine } from './lib/audioEngine';
   import { getTrackAudioFeatures, getHarmonicCrossfadeSec, camelotCompatibility, LiveAudioAnalyzer } from './lib/camelot';
   import { extractCoverPalette, type CoverPalette } from './lib/colorExtract';
@@ -1513,7 +1515,6 @@
     myId: typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `u-${Date.now()}`,
     isHost: false,
     connected: false,
-    transport: 'mashiro' as 'mashiro' | 'lan',
     isPrivate: false,
     roomTitle: '',
     members: [],
@@ -1762,7 +1763,7 @@
     jamPushState(true);
   }
 
-  function jamAdvanceNext() {  function jamAdvanceNext() {
+  function jamAdvanceNext() {
     if (jamRoom.queue.length === 0) return;
     const curIdx = jamRoom.currentTrack
       ? jamRoom.queue.findIndex((q) => q.track.id === jamRoom.currentTrack?.id)
@@ -1850,6 +1851,7 @@
     isHost: boolean;
     selfId: number;
     room: string;
+    host?: number;
     peers: { id: number; nick: string }[];
   }) {
     if (!st.connected) return;
@@ -1859,9 +1861,10 @@
     jamRoom.members = st.peers.map((p) => ({
       id: String(p.id),
       name: p.nick,
-      isHost: p.id === st.host,
+      isHost: p.id === (st.host ?? st.selfId),
       tasteLabel: 'участник',
       trackCount: 0,
+      tracks: [],
     }));
   }
 
@@ -1877,7 +1880,7 @@
       isHost,
       connected: false,
       members: [
-        { id: '0', name, isHost, tasteLabel: 'хост', trackCount: tracks.length },
+        { id: '0', name, isHost, tasteLabel: 'хост', trackCount: tracks.length, tracks },
       ],
       queue: isHost ? tracks.map((t) => ({ track: t, reason: 'Очередь хоста', matchCount: 1, score: 0 })) : [],
       currentTrack: null,
@@ -1977,11 +1980,7 @@
     void jamConnect(target, false, name, tracks);
   }
 
-  function joinJamRoom(code: string, name: string, relayUrl: string, tasteLabel: string, tracks: Track[]) {
-    openJamSocket(code, false, name, relayUrl, tasteLabel, tracks);
-  }
-
-  function leaveJamRoom() {
+function leaveJamRoom() {
     if (jamTransportKind === 'mashiro') {
       void relayApi.leave().catch(() => {});
     } else {
@@ -1993,10 +1992,6 @@
     }
     jamWaiting.clear();
     jamHolding = false;
-    if (jamPhxHeartbeatTimer) {
-      clearInterval(jamPhxHeartbeatTimer);
-      jamPhxHeartbeatTimer = null;
-    }
     jamMemberMap.clear();
     jamPlayedKeys.clear();
     jamRoom = {
@@ -2035,7 +2030,6 @@
     jamRoom.isPlaying = true;
     jamRoom.skipVotes = [];
     void playRoomTrackLocally(track, true, 0).then(() => jamPushState(true));
-    if (!jamRoom.isPrivate) broadcastPublicRoom();
   }
 
   async function jamTogglePlay() {

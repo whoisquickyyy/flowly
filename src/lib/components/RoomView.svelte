@@ -51,7 +51,7 @@
     onPlayTrack: (track: Track) => void;
     onTogglePlay: () => void;
     onSkip: () => void;
-    onRebuildBlend: () => void;
+    onRebuildBlend: (freshTracks?: Track[]) => void;
     onSendChat?: (text: string) => void;
   }
 
@@ -107,12 +107,6 @@
     }
   });
 
-  function saveRelay(url: string) {
-    relayUrl = url;
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem('flowly_jam_relay', url);
-    }
-  }
 
   async function resolveTasteBundle(): Promise<{ label: string; tracks: Track[] }> {
     loadingTaste = true;

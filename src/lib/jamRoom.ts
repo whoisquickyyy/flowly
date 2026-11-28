@@ -45,7 +45,6 @@ export interface JamRoomState {
   myId: string;
   isHost: boolean;
   connected: boolean;
-  relayUrl: string;
   isPrivate?: boolean;
   roomTitle?: string;
   members: JamMember[];
