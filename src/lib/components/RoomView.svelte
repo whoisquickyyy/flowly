@@ -596,62 +596,7 @@
       </div>
     {/if}
 
-    <!-- Общая смешанная очередь -->
-    <div class="queue-card">
-      <div class="q-head">
-        <span>Общий микс ({room.queue.length} треков)</span>
-        {#if room.statusText}
-          <span class="q-status">{room.statusText}</span>
-        {/if}
-      </div>
-
-      {#if room.queue.length === 0}
-        <div class="q-empty">
-          Добавьте треки или дождитесь подключения друзей — микс соберётся автоматически.
-        </div>
-      {:else}
-        <div class="q-list">
-          {#each room.queue as item, idx (item.track.id + idx)}
-            {@const active = room.currentTrack?.id === item.track.id}
-            {#if room.isHost}
-              <button
-                type="button"
-                class="q-row"
-                class:active
-                class:matched={item.matchCount >= 2}
-                onclick={() => onPlayTrack(item.track)}
-              >
-                <span class="q-idx">{idx + 1}</span>
-                <img src={item.track.artwork} alt={item.track.title} />
-                <div class="q-meta">
-                  <div class="q-title">{item.track.title}</div>
-                  <div class="q-sub">{item.track.artist}</div>
-                </div>
-                <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
-                <SourceBadge source={item.track.source} showLabel={false} />
-              </button>
-            {:else}
-              <div
-                class="q-row readonly"
-                class:active
-                class:matched={item.matchCount >= 2}
-              >
-                <span class="q-idx">{idx + 1}</span>
-                <img src={item.track.artwork} alt={item.track.title} />
-                <div class="q-meta">
-                  <div class="q-title">{item.track.title}</div>
-                  <div class="q-sub">{item.track.artist}</div>
-                </div>
-                <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
-                <SourceBadge source={item.track.source} showLabel={false} />
-              </div>
-            {/if}
-          {/each}
-        </div>
-      {/if}
-    </div>
-
-    <!-- Чат комнаты -->
+        <!-- Чат комнаты -->
     <div class="chat-card">
       <div class="q-head">
         <span style="display:inline-flex;align-items:center;gap:6px;"><MessageCircle size={14} /> Чат комнаты</span>
