@@ -77,6 +77,22 @@ export async function topUpWave(): Promise<PlayerState> {
   return invoke<PlayerState>('top_up_wave');
 }
 
+export async function relayServerStart(port: number): Promise<{ address: string; port: number }> {
+  return invoke('relay_server_start', { port });
+}
+
+export async function relayServerStop(): Promise<void> {
+  return invoke<void>('relay_server_stop').catch(() => {});
+}
+
+export async function relayServerRunning(): Promise<boolean> {
+  return invoke<boolean>('relay_server_running').catch(() => false);
+}
+
+export async function relayServerLocalIp(): Promise<string | null> {
+  return invoke<string | null>('relay_server_local_ip');
+}
+
 export type StationKind = 'deep_cuts' | 'fresh_drops' | 'same_artist';
 
 export async function startStation(kind: StationKind): Promise<PlayerState> {

@@ -44,6 +44,7 @@ pub fn run() {
             app.manage(media_controls::SmtcHandle::spawn(app.handle()));
             app.manage(together::state::TogetherState::default());
             app.manage(together::relay::RelayState::default());
+            app.manage(together::server_embed::RelayServerState::default());
             app.manage(state);
 
             // Прогреваем playback_url последнего трека в фоне после холодного старта
@@ -192,6 +193,10 @@ pub fn run() {
             together::commands::together_status,
             together::commands::together_peer_address,
             together::commands::together_log_path,
+            together::server_embed::relay_server_start,
+            together::server_embed::relay_server_stop,
+            together::server_embed::relay_server_running,
+            together::server_embed::relay_server_local_ip,
             together::relay::commands::together_relay_create,
             together::relay::commands::together_relay_join,
             together::relay::commands::together_relay_leave,

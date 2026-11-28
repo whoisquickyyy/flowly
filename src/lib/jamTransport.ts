@@ -74,6 +74,11 @@ export const relayApi = {
   leave: () => invoke<void>('together_relay_leave'),
   send: (payload: unknown) => invoke<void>('together_relay_send', { payload }),
   handoff: (to: number) => invoke<void>('together_relay_handoff', { to }),
+  serverStart: (port: number) =>
+    invoke<{ address: string; port: number }>('relay_server_start', { port }),
+  serverStop: () => invoke<void>('relay_server_stop'),
+  serverRunning: () => invoke<boolean>('relay_server_running'),
+  serverLocalIp: () => invoke<string | null>('relay_server_local_ip'),
   status: () => invoke<RelayStatus>('together_relay_status'),
   seedExists: () => invoke<boolean>('together_relay_seed_exists'),
   seedShow: () => invoke<string | null>('together_relay_seed_show'),

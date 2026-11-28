@@ -25,6 +25,7 @@
   import { ROLE_BADGES } from '../supabase';
   import type { Playlist, Track } from '../types';
   import * as api from '../api';
+  import { relayApi } from '../jamTransport';
 
   interface Props {
     room: JamRoomState;
@@ -85,6 +86,7 @@
   let inviteCode = $state('');
   let lanPort = $state(7331);
   let lanHost = $state('192.168.0.100:7331');
+  let embeddedRelay = $state(false);
   let tasteSource = $state<'liked' | 'recap' | string>('liked');
   let copied = $state(false);
   let loadingTaste = $state(false);
@@ -132,6 +134,22 @@
       return { label: 'Мне нравится', tracks: pickDiverseSample(likedTracks, 160) };
     } finally {
       loadingTaste = false;
+    }
+  }
+
+  async function toggleEmbeddedRelay() {
+    if (embeddedRelay) {
+      embeddedRelay = false;
+      void api.relayServerStop().catch(() => {});
+      return;
+    }
+    try {
+      const info = await relayApi.serverStart(lanPort);
+      const ip = (await relayApi.serverLocalIp()) ?? '127.0.0.1';
+      mashiroAddr = `ws://${ip}:${info.port}/ws`;
+      embeddedRelay = true;
+    } catch (e) {
+      console.error('встроенный релей:', e);
     }
   }
 
@@ -237,6 +255,15 @@
           </div>
         </div>
         {#if transport === 'mashiro'}
+          <label class="preset-pill embed-toggle" class:active={embeddedRelay}>
+            <input
+              type="checkbox"
+              bind:checked={embeddedRelay}
+              onchange={toggleEmbeddedRelay}
+              style="display:none"
+            />
+            <span>{embeddedRelay ? 'Релей поднят внутри Flowly' : 'Поднять релей внутри Flowly'}</span>
+          </label>
           <label class="field">
             <span>Адрес релея (wss://...)</span>
             <input

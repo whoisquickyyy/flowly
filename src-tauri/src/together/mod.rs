@@ -1,5 +1,6 @@
 pub mod commands;
 pub mod relay;
+pub mod server_embed;
 pub mod state;
 
 mod guest;
