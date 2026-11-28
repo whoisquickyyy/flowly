@@ -64,6 +64,8 @@
     type JamRoomState,
     type PublicJamRoomInfo,
   } from './lib/jamRoom';
+  import { DRIFT_LIMIT, HEARTBEAT_MS, PUSH_DEBOUNCE, RESEND_MS, buildState, expectedPosition, findStartIndex } from './lib/jamSync';
+  import type { JamStatePayload } from './lib/jamSync';
   import { audioEngine } from './lib/audioEngine';
   import { getTrackAudioFeatures, getHarmonicCrossfadeSec, camelotCompatibility, LiveAudioAnalyzer } from './lib/camelot';
   import { extractCoverPalette, type CoverPalette } from './lib/colorExtract';
@@ -410,6 +412,18 @@
 
   // Авто: выбирает эффект и длительность перехода по темпу и тональности
   // (вся палитра: Beatmatch / Rise / Muffle; момент — старт на бите уходящего)
+  $effect(() => {
+    // Хост рассылает состояние при локальных изменениях (трек/пауза);
+    // позиция уезжает heartbeat-пульсом раз в RESEND_MS
+    const trackId = player.current_track?.id;
+    const isPlaying = player.is_playing;
+    if (!jamRoom.connected || !jamRoom.isHost || jamApplying || advanceInFlight) return;
+    void trackId;
+    void isPlaying;
+    if (jamPushTimer) clearTimeout(jamPushTimer);
+    jamPushTimer = setTimeout(() => jamPushState(false), PUSH_DEBOUNCE);
+  });
+
   function pickAutoTransition(
     outgoing: Track,
     incoming: Track,
@@ -1497,6 +1511,16 @@
   let jamPhxRef = 1;
   let jamMemberMap = new Map<string, JamMember>();
   let jamPlayedKeys = new Set<string>();
+  // Синхронизация (порт Together из yandex-music-client)
+  let jamApplying = false;
+  let jamHolding = false;
+  let jamResumeAfterHold = false;
+  let jamWaiting = new Map<string, string>();
+  let jamLastPushMs = 0;
+  let jamLastReady: boolean | null = null;
+  let jamLastState: JamStatePayload | null = null;
+  let jamSyncTimer: ReturnType<typeof setInterval> | null = null;
+  let jamPushTimer: ReturnType<typeof setTimeout> | null = null;
   let jamRefillBusy = false;
   let jamLastAlignMs = 0;
   let jamLastHostHeartbeatMs = 0;
@@ -1543,7 +1567,7 @@
         // Оставляем небольшой хвост истории, но не даём очереди расти бесконечно
         const baseQueue = curIdx > 15 ? jamRoom.queue.slice(curIdx - 5) : jamRoom.queue;
         jamRoom.queue = [...baseQueue, ...picked];
-        hostBroadcastState();
+        jamBroadcastMeta();
       }
     } finally {
       jamRefillBusy = false;
@@ -1614,17 +1638,108 @@
     }
   }
 
-  function hostBroadcastState() {
-    if (!jamRoom.isHost) return;
+  // Хост рассылает состояние воспроизведения (порт StatePayload из Together)
+  function jamPushState(withQueue = true) {
+    if (!jamRoom.isHost || !jamRoom.connected) return;
+    jamLastPushMs = Date.now();
     sendJamMsg({
-      type: 'room_state',
+      type: 'jam_state',
+      payload: buildState(
+        {
+          currentTrack: jamRoom.currentTrack,
+          queue: jamRoom.queue.map((q) => q.track),
+          positionSec: getActiveAudio()?.currentTime ?? player.position_sec,
+          isPlaying: player.is_playing,
+        },
+        withQueue,
+      ),
+    });
+  }
+
+  // Метаданные состава комнаты (участники/голоса) — на сменах состава
+  function jamBroadcastMeta() {
+    if (!jamRoom.isHost || !jamRoom.connected) return;
+    sendJamMsg({
+      type: 'room_meta',
       members: jamRoom.members,
-      queue: jamRoom.queue,
-      currentTrack: jamRoom.currentTrack,
-      isPlaying: jamRoom.isPlaying,
-      positionSec: player.position_sec,
       skipVotes: jamRoom.skipVotes,
-      sentAtMs: Date.now(),
+    });
+  }
+
+  function jamSetWaiting(memberId: string, nick: string, waiting: boolean) {
+    if (waiting) jamWaiting.set(memberId, nick);
+    else jamWaiting.delete(memberId);
+
+    // Ready-gating: хост ставит всех на паузу, пока гости грузят трек
+    if (jamWaiting.size > 0 && !jamHolding) {
+      jamHolding = true;
+      jamResumeAfterHold = player.is_playing;
+      void (async () => {
+        if (player.is_playing) applyStatePreservingPosition(await api.togglePlayback());
+        jamPushState(false);
+      })();
+      jamRoom.statusText = `Ждём загрузку у ${nick}`;
+    } else if (jamWaiting.size === 0 && jamHolding) {
+      jamHolding = false;
+      void (async () => {
+        if (jamResumeAfterHold && !player.is_playing) applyStatePreservingPosition(await api.togglePlayback());
+        jamPushState(false);
+      })();
+      jamRoom.statusText = 'Все загрузились, продолжаем';
+    }
+  }
+
+  // Гость: применяет состояние хоста с коррекцией дрифта
+  async function jamReceiveState(payload: JamStatePayload) {
+    if (jamApplying || !payload.trackId) return;
+    jamLastState = payload;
+    jamApplying = true;
+    try {
+      const target = expectedPosition(payload);
+      if (player.current_track?.id !== payload.trackId) {
+        // Новый трек: репортим загрузку и зеркалим очередь хоста целиком
+        jamLastReady = null;
+        if (payload.queue.length) {
+          jamRoom.queue = payload.queue.map(
+            (t) => ({ track: t, reason: 'Из очереди хоста', matchCount: 1, score: 0 }) as BlendedTrack,
+          );
+        }
+        const queueTracks = jamRoom.queue.map((q) => q.track);
+        const startIdx = findStartIndex(queueTracks, payload.index, payload.trackId);
+        const startTrack = queueTracks[startIdx] ?? payload.track!;
+        await playRoomTrackLocally(startTrack, !payload.paused, target);
+      } else {
+        // Дрифт-коррекция: расхождение больше лимита — seek
+        if (Math.abs(player.position_sec - target) > DRIFT_LIMIT) {
+          const cur = getActiveAudio();
+          if (cur) cur.currentTime = target;
+          player.position_sec = Math.floor(target);
+        }
+        if (payload.paused === player.is_playing) {
+          applyStatePreservingPosition(await api.togglePlayback());
+        }
+      }
+    } catch (e) {
+      console.error('[jam] не удалось синхронизироваться:', e);
+    } finally {
+      jamApplying = false;
+    }
+    jamReportReady();
+  }
+
+  function jamReportReady() {
+    if (jamRoom.isHost || !jamRoom.connected) return;
+    const targetId = jamLastState?.trackId ?? null;
+    const ready =
+      player.current_track?.id === targetId &&
+      (jamLastState?.paused || player.is_playing);
+    if (jamLastReady === ready) return;
+    jamLastReady = ready;
+    sendJamMsg({
+      type: 'jam_ready',
+      memberId: jamRoom.myId,
+      nick: jamMemberMap.get(jamRoom.myId)?.name || sbProfile?.username || 'Участник',
+      payload: { kind: 'ready', trackId: targetId, ready },
     });
   }
 
@@ -1639,7 +1754,7 @@
     jamRoom.queue = blended;
     jamRoom.statusText = 'Микс пересобран';
     if (jamRoom.isHost) {
-      hostBroadcastState();
+      jamPushState(true);
     }
   }
 
@@ -1659,14 +1774,7 @@
     jamRoom.isPlaying = true;
     jamRoom.positionSec = 0;
     jamRoom.skipVotes = [];
-    playRoomTrackLocally(nextItem.track, true, 0);
-    sendJamMsg({
-      type: 'sync_play',
-      track: nextItem.track,
-      isPlaying: true,
-      positionSec: 0,
-      sentAtMs: Date.now(),
-    });
+    void playRoomTrackLocally(nextItem.track, true, 0).then(() => jamPushState(true));
     void refillJamQueueIfNeeded();
   }
 
@@ -1922,18 +2030,16 @@
         ensureJamLobbySocket();
         setTimeout(() => broadcastPublicRoom(), 400);
       }
-      if (isHost && jamHeartbeatTimer === null) {
-        jamHeartbeatTimer = setInterval(() => {
-          if (jamRoom.connected && jamRoom.isHost && jamRoom.currentTrack) {
-            sendJamMsg({
-              type: 'heartbeat',
-              trackId: jamRoom.currentTrack.id,
-              positionSec: player.position_sec,
-              isPlaying: player.is_playing,
-              sentAtMs: Date.now(),
-            });
+      if (jamSyncTimer === null) {
+        jamSyncTimer = setInterval(() => {
+          if (!jamRoom.connected) return;
+          if (jamRoom.isHost) {
+            // Полный пуш состояния раз в RESEND_MS (позиция подравняет гостей)
+            if (Date.now() - jamLastPushMs > RESEND_MS) jamPushState(false);
+            return;
           }
-        }, 3000);
+          jamReportReady();
+        }, HEARTBEAT_MS);
       }
     };
 
@@ -1963,7 +2069,7 @@
               jamRoom.isPlaying = true;
               void playRoomTrackLocally(first, true, 0);
             }
-            hostBroadcastState();
+            jamPushState(true);
             if (!jamRoom.isPrivate) broadcastPublicRoom();
           }
         } else if (msg.type === 'update_taste' && msg.member) {
@@ -1978,33 +2084,19 @@
             jamRoom.members = [...jamMemberMap.values()];
             jamRoom.queue = buildBlendedQueue(jamRoom.members);
             jamRoom.skipVotes = jamRoom.skipVotes.filter((id) => id !== msg.memberId);
-            hostBroadcastState();
+            jamBroadcastMeta();
+            jamPushState(true); // новичок зеркалит очередь хоста целиком
             if (!jamRoom.isPrivate) broadcastPublicRoom();
           }
-        } else if (msg.type === 'room_state' && !jamRoom.isHost) {
+        } else if (msg.type === 'room_meta' && !jamRoom.isHost) {
           jamRoom.members = msg.members ?? [];
           jamMemberMap = new Map(jamRoom.members.map((m: JamMember) => [m.id, m]));
-          jamRoom.queue = msg.queue ?? [];
           jamRoom.skipVotes = msg.skipVotes ?? [];
-          const incomingTrack = msg.currentTrack as Track | null;
-          const driftPos =
-            (msg.positionSec ?? 0) + (msg.isPlaying ? Math.max(0, (Date.now() - (msg.sentAtMs ?? Date.now())) / 1000) : 0);
-          if (incomingTrack && incomingTrack.id !== jamRoom.currentTrack?.id) {
-            jamRoom.currentTrack = incomingTrack;
-            jamRoom.isPlaying = Boolean(msg.isPlaying);
-            await playRoomTrackLocally(incomingTrack, Boolean(msg.isPlaying), driftPos);
-          }
-        } else if (msg.type === 'sync_play' && msg.track && !jamRoom.isHost) {
-          const tr = msg.track as Track;
-          jamRoom.currentTrack = tr;
-          jamRoom.isPlaying = Boolean(msg.isPlaying);
-          jamRoom.skipVotes = [];
-          await playRoomTrackLocally(tr, Boolean(msg.isPlaying), msg.positionSec ?? 0);
-        } else if (msg.type === 'sync_toggle' && !jamRoom.isHost) {
-          jamRoom.isPlaying = Boolean(msg.isPlaying);
-          if (player.is_playing !== jamRoom.isPlaying) {
-            applyStatePreservingPosition(await api.togglePlayback());
-          }
+        } else if (msg.type === 'jam_state' && !jamRoom.isHost && msg.payload) {
+          await jamReceiveState(msg.payload as JamStatePayload);
+        } else if (msg.type === 'jam_ready' && jamRoom.isHost && msg.payload) {
+          const rp = msg.payload as { ready: boolean };
+          jamSetWaiting(String(msg.memberId ?? ''), String(msg.nick ?? 'Участник'), !rp.ready);
         } else if (msg.type === 'request_rebuild' && jamRoom.isHost) {
           jamRebuildBlend();
         } else if (msg.type === 'chat' && msg.message) {
@@ -2048,10 +2140,12 @@
       if (jamWs !== ws) return;
       jamWs = null;
       jamRoom.connected = false;
-      if (jamHeartbeatTimer) {
-        clearInterval(jamHeartbeatTimer);
-        jamHeartbeatTimer = null;
+      if (jamSyncTimer) {
+        clearInterval(jamSyncTimer);
+        jamSyncTimer = null;
       }
+      jamWaiting.clear();
+      jamHolding = false;
       if (jamPhxHeartbeatTimer) {
         clearInterval(jamPhxHeartbeatTimer);
         jamPhxHeartbeatTimer = null;
@@ -2084,10 +2178,12 @@
       jamWs = null;
       oldWs.close();
     }
-    if (jamHeartbeatTimer) {
-      clearInterval(jamHeartbeatTimer);
-      jamHeartbeatTimer = null;
+    if (jamSyncTimer) {
+      clearInterval(jamSyncTimer);
+      jamSyncTimer = null;
     }
+    jamWaiting.clear();
+    jamHolding = false;
     if (jamPhxHeartbeatTimer) {
       clearInterval(jamPhxHeartbeatTimer);
       jamPhxHeartbeatTimer = null;
@@ -2129,14 +2225,7 @@
     jamRoom.currentTrack = track;
     jamRoom.isPlaying = true;
     jamRoom.skipVotes = [];
-    playRoomTrackLocally(track, true, 0);
-    sendJamMsg({
-      type: 'sync_play',
-      track,
-      isPlaying: true,
-      positionSec: 0,
-      sentAtMs: Date.now(),
-    });
+    void playRoomTrackLocally(track, true, 0).then(() => jamPushState(true));
     if (!jamRoom.isPrivate) broadcastPublicRoom();
   }
 
@@ -2144,7 +2233,7 @@
     if (!jamRoom.isHost) return;
     await handleToggle();
     jamRoom.isPlaying = player.is_playing;
-    sendJamMsg({ type: 'sync_toggle', isPlaying: player.is_playing });
+    jamPushState(false);
   }
 
   function jamSkip() {
