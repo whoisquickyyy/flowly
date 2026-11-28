@@ -1896,9 +1896,18 @@
     };
 
     if (jamTransportKind === 'mashiro') {
-      const status = isHost
-        ? await relayApi.create(jamServerAddr, name, jamInvite || undefined)
-        : await relayApi.join(jamServerAddr, name, jamInvite);
+      console.info('[jam] mashiro: подключаемся к', jamServerAddr, 'invite:', jamInvite || '(генерируется сервером)');
+      let status: import('./lib/jamTransport').RelayStatus;
+      try {
+        status = isHost
+          ? await relayApi.create(jamServerAddr, name, jamInvite || undefined)
+          : await relayApi.join(jamServerAddr, name, jamInvite);
+        console.info('[jam] relay_create/join вернул:', JSON.stringify(status));
+      } catch (e) {
+        console.error('[jam] relay_create/join ошибка:', e);
+        jamRoom.statusText = `Ошибка подключения: ${e}`;
+        return;
+      }
       jamApplyTransportStatus({
         connected: true,
         isHost: status.selfId !== 0 && status.selfId === status.host,
