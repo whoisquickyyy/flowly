@@ -1965,7 +1965,7 @@
 
   $effect(() => {
     // Локдаун: в комнате разрешена только главная вкладка
-    if (jamRoom.connected && activeTab !== 'details') {
+    if (jamRoom.connected && activeTab !== 'details' && activeTab !== 'room') {
       activeTab = 'details';
       activeArtist = null;
     }
