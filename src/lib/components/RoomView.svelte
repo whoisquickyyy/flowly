@@ -17,7 +17,8 @@
     MessageCircle,
     Send,
     Wifi,
-  } from 'lucide-svelte';
+  
+    XCircle,} from 'lucide-svelte';
   import SourceBadge from './SourceBadge.svelte';
   import RadixSelect, { type SelectOption } from './ui/RadixSelect.svelte';
   import { pickDiverseSample, type JamRoomState, type PublicJamRoomInfo } from '../jamRoom';
@@ -47,6 +48,7 @@
       tracks: Track[]
     ) => void;
     onLeaveRoom: () => void;
+    onDeleteRoom?: () => void;
     onUpdateTaste: (tasteLabel: string, tracks: Track[]) => void;
     onPlayTrack: (track: Track) => void;
     onTogglePlay: () => void;
@@ -63,6 +65,7 @@
     onCreateRoom,
     onJoinRoom,
     onLeaveRoom,
+    onDeleteRoom = () => {},
     onUpdateTaste,
     onPlayTrack,
     onTogglePlay,
@@ -179,10 +182,18 @@
       </div>
     </div>
     {#if room.connected}
-      <button type="button" class="leave-btn" onclick={onLeaveRoom}>
-        <LogOut size={14} />
-        <span>Выйти</span>
-      </button>
+      <div class="room-exit-row">
+        {#if room.isHost}
+          <button type="button" class="leave-btn" onclick={onDeleteRoom}>
+            <XCircle size={14} />
+            <span>Удалить комнату</span>
+          </button>
+        {/if}
+        <button type="button" class="leave-btn" onclick={onLeaveRoom}>
+          <LogOut size={14} />
+          <span>Выйти</span>
+        </button>
+      </div>
     {/if}
   </div>
 
@@ -428,6 +439,94 @@
           </div>
         </div>
       {/each}
+    </div>
+
+    <!-- Сейчас играет в комнате -->
+    {#if room.currentTrack}
+      {@const cur = room.currentTrack}
+      <div class="now-sync-card">
+        <img src={cur.artwork} alt={cur.title} />
+        <div class="now-meta">
+          <span class="now-tag">Сейчас играет в комнате</span>
+          <div class="now-title">{cur.title}</div>
+          <div class="now-artist">{cur.artist}</div>
+        </div>
+        <div class="now-actions">
+          {#if room.isHost}
+            <button type="button" class="btn-circle" onclick={onTogglePlay} aria-label="Пауза / Плей">
+              {#if room.isPlaying}
+                <Pause size={16} fill="currentColor" />
+              {:else}
+                <Play size={16} fill="currentColor" />
+              {/if}
+            </button>
+            <button type="button" class="btn-skip" onclick={onSkip}>
+              <SkipForward size={14} />
+              <span>Скип</span>
+            </button>
+          {:else}
+            <span class="host-only-pill">
+              <Crown size={12} />
+              <span>Управляет хост</span>
+            </span>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
+    <!-- Общая смешанная очередь -->
+    <div class="queue-card">
+      <div class="q-head">
+        <span>Общий микс ({room.queue.length} треков)</span>
+        {#if room.statusText}
+          <span class="q-status">{room.statusText}</span>
+        {/if}
+      </div>
+
+      {#if room.queue.length === 0}
+        <div class="q-empty">
+          Добавьте треки или дождитесь подключения друзей — микс соберётся автоматически.
+        </div>
+      {:else}
+        <div class="q-list">
+          {#each room.queue as item, idx (item.track.id + idx)}
+            {@const active = room.currentTrack?.id === item.track.id}
+            {#if room.isHost}
+              <button
+                type="button"
+                class="q-row"
+                class:active
+                class:matched={item.matchCount >= 2}
+                onclick={() => onPlayTrack(item.track)}
+              >
+                <span class="q-idx">{idx + 1}</span>
+                <img src={item.track.artwork} alt={item.track.title} />
+                <div class="q-meta">
+                  <div class="q-title">{item.track.title}</div>
+                  <div class="q-sub">{item.track.artist}</div>
+                </div>
+                <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
+                <SourceBadge source={item.track.source} showLabel={false} />
+              </button>
+            {:else}
+              <div
+                class="q-row readonly"
+                class:active
+                class:matched={item.matchCount >= 2}
+              >
+                <span class="q-idx">{idx + 1}</span>
+                <img src={item.track.artwork} alt={item.track.title} />
+                <div class="q-meta">
+                  <div class="q-title">{item.track.title}</div>
+                  <div class="q-sub">{item.track.artist}</div>
+                </div>
+                <span class="q-reason" class:gold={item.matchCount >= 2}>{item.reason}</span>
+                <SourceBadge source={item.track.source} showLabel={false} />
+              </div>
+            {/if}
+          {/each}
+        </div>
+      {/if}
     </div>
 
     <!-- Сейчас играет в комнате -->

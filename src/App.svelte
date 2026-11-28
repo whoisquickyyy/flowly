@@ -1835,6 +1835,10 @@
       return;
     }
     if (payload.kind === 'note') {
+      if (payload.text.includes('Хост закрыл комнату')) {
+        leaveJamRoom();
+        return;
+      }
       const msg: JamChatMessage = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         senderId: String(m.from),
@@ -1980,7 +1984,18 @@
     void jamConnect(target, false, name, tracks);
   }
 
-function leaveJamRoom() {
+  function handleDeleteRoom() {
+    if (!jamRoom.isHost || !jamRoom.connected) return;
+    sendJamMsg({ kind: 'note', text: 'Хост закрыл комнату — до встречи!' });
+    void (async () => {
+      await new Promise((r) => setTimeout(r, 150));
+      leaveJamRoom();
+      jamRoom.roomCode = '';
+      jamRoom.statusText = 'Комната закрыта';
+    })();
+  }
+
+  function leaveJamRoom() {
     if (jamTransportKind === 'mashiro') {
       void relayApi.leave().catch(() => {});
     } else {
@@ -2920,6 +2935,7 @@ function leaveJamRoom() {
             onCreateRoom={handleCreateRoomJam}
             onJoinRoom={handleJoinRoomJam}
             onLeaveRoom={leaveJamRoom}
+            onDeleteRoom={handleDeleteRoom}
             onUpdateTaste={updateJamTaste}
             onPlayTrack={jamPlayTrack}
             onTogglePlay={jamTogglePlay}
