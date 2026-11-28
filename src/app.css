@@ -70,3 +70,25 @@ input:not([type='range']):focus-visible {
 input[type='range']:focus-visible {
   outline: none;
 }
+
+/* Появление вкладок. Важно: БЕЗ transform — transform на корне вьюхи создаёт
+   containing block для position: fixed потомков (плавающие панели DetailsView
+   и дока ломаются), поэтому анимируем только opacity. */
+@keyframes tabIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.tab-enter {
+  animation: tabIn 200ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-enter {
+    animation: none;
+  }
+}

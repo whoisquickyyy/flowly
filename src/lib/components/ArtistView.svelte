@@ -142,7 +142,7 @@
   }
 </script>
 
-<section class="artist-view">
+<section class="artist-view tab-enter">
   <div class="artist-top">
     <button type="button" class="back-btn" onclick={onBack}>
       <ArrowLeft size={15} />

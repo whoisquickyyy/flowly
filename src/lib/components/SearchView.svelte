@@ -208,7 +208,7 @@
   }
 </script>
 
-<section class="search-view">
+<section class="search-view tab-enter">
   <form
     class="search-bar"
     onsubmit={(e) => {

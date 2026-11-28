@@ -15,7 +15,6 @@ import type {
   PlayerState,
   Playlist,
   ProxyConfig,
-  ShuffleMode,
   SourceKind,
   SourceStatus,
   Track,
@@ -62,8 +61,30 @@ export async function togglePlayback(): Promise<PlayerState> {
   return invoke<PlayerState>('toggle_playback');
 }
 
-export async function nextTrack(): Promise<PlayerState> {
-  return invoke<PlayerState>('next_track');
+export async function nextTrack(manual = false): Promise<PlayerState> {
+  return invoke<PlayerState>('next_track', { manual });
+}
+
+export async function revalidatePlaybackUrl(track: Track): Promise<string | null> {
+  return invoke<string | null>('revalidate_playback_url', { track });
+}
+
+export async function warmUpNextTracks(count = 3): Promise<void> {
+  return invoke<void>('warm_up_next_tracks', { count }).catch(() => {});
+}
+
+export async function topUpWave(): Promise<PlayerState> {
+  return invoke<PlayerState>('top_up_wave');
+}
+
+export type StationKind = 'deep_cuts' | 'fresh_drops' | 'same_artist';
+
+export async function startStation(kind: StationKind): Promise<PlayerState> {
+  return invoke<PlayerState>('start_station', { kind });
+}
+
+export async function rotorTrackStarted(track: Track): Promise<void> {
+  return invoke<void>('rotor_track_started', { track }).catch(() => {});
 }
 
 export async function prevTrack(): Promise<PlayerState> {
@@ -80,10 +101,6 @@ export async function setVolume(volume: number): Promise<PlayerState> {
 
 export async function toggleShuffle(): Promise<PlayerState> {
   return invoke<PlayerState>('toggle_shuffle');
-}
-
-export async function setShuffleMode(mode: ShuffleMode): Promise<PlayerState> {
-  return invoke<PlayerState>('set_shuffle_mode', { mode });
 }
 
 export async function cycleRepeat(): Promise<PlayerState> {
@@ -326,73 +343,12 @@ export async function setTrackCacheEnabled(enabled: boolean): Promise<void> {
   await invoke('set_track_cache_enabled', { enabled }).catch(() => {});
 }
 
-export async function reportWaveFeedback(track: Track, positive: boolean): Promise<void> {
+export async function reportWaveFeedback(
+  track: Track,
+  positive: boolean,
+  playedSec?: number,
+): Promise<void> {
   if (!isTauri()) return;
-  await invoke('report_wave_feedback', { track, positive }).catch(() => {});
+  await invoke('report_wave_feedback', { track, positive, playedSec: playedSec ?? null }).catch(() => {});
 }
 
-export async function audioLoadAndPlay(url: string): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_load_and_play', { url });
-}
-
-export async function audioPrepareNext(url: string): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_prepare_next', { url });
-}
-
-export async function audioCrossfade(params: {
-  durationSecs: number;
-  curve: 'equal-power' | 's-curve' | 'linear';
-  preset: 'auto' | 'fade' | 'rise';
-  bpmA?: number | null;
-  bpmB?: number | null;
-  keyA?: string | null;
-  keyB?: string | null;
-}): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_crossfade', {
-    durationSecs: params.durationSecs,
-    curve: params.curve,
-    preset: params.preset,
-    bpmA: params.bpmA ?? null,
-    bpmB: params.bpmB ?? null,
-    keyA: params.keyA ?? null,
-    keyB: params.keyB ?? null,
-  });
-}
-
-export async function audioPause(): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_pause').catch(() => {});
-}
-
-export async function audioResume(): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_resume').catch(() => {});
-}
-
-export async function audioSeek(seconds: number): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_seek', { seconds }).catch(() => {});
-}
-
-export async function audioSetVolume(volume: number): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_set_volume', { volume }).catch(() => {});
-}
-
-export async function audioSetDucking(ducked: boolean): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_set_ducking', { ducked }).catch(() => {});
-}
-
-export async function audioSetEqBands(bands: number[]): Promise<void> {
-  if (!isTauri()) return;
-  await invoke('audio_set_eq_bands', { bands }).catch(() => {});
-}
-
-export async function audioGetStatus(): Promise<{ position: number; duration: number; is_playing: boolean } | null> {
-  if (!isTauri()) return null;
-  return invoke<{ position: number; duration: number; is_playing: boolean }>('audio_get_status').catch(() => null);
-}

@@ -1,12 +1,13 @@
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use reqwest::Client;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-use crate::models::SourceKind;
-use crate::providers::{MusicProvider, ProviderRegistry};
+use crate::models::{ProxyMode, SourceKind};
+use crate::providers::{sc_worker_endpoint, MusicProvider, ProviderRegistry};
 
 pub fn bind_proxy_listener() -> std::io::Result<(std::net::TcpListener, u16)> {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -123,6 +124,30 @@ pub async fn run_proxy_server(
                 return;
             };
 
+            // URL на доменах SoundCloud (в т.ч. обложки с source=image):
+            // в Direct-режиме напрямую они недоступны — как и весь SC-трафик
+            // отправляем их через Worker. Ключ кэша остаётся исходным URL.
+            let is_sc_host = url::Url::parse(&url)
+                .ok()
+                .map(|u| {
+                    let h = u.host_str().unwrap_or("").to_ascii_lowercase();
+                    h == "sndcdn.com"
+                        || h.ends_with(".sndcdn.com")
+                        || h == "soundcloud.com"
+                        || h.ends_with(".soundcloud.com")
+                })
+                .unwrap_or(false);
+            let fetch_url = if is_sc_host && source_str.as_deref() != Some("soundcloud") {
+                let r = reg.read().await;
+                if r.soundcloud.proxy_config().mode == ProxyMode::Direct {
+                    sc_worker_endpoint(&url)
+                } else {
+                    url.clone()
+                }
+            } else {
+                url.clone()
+            };
+
             if let Some((cached_path, _mime)) = cache.get_cached(&url) {
                 serve_local_file(&cached_path.to_string_lossy(), range_header.as_deref(), &mut writer).await;
                 return;
@@ -133,16 +158,55 @@ pub async fn run_proxy_server(
                 match source_str.as_deref() {
                     Some("yandex") => r.yandex.client().clone(),
                     Some("soundcloud") => r.soundcloud.client().clone(),
+                    // Обложки SoundCloud приходят с source=image на URL sndcdn.com
+                    _ if is_sc_host => r.soundcloud.client().clone(),
                     _ => fb,
                 }
             };
 
-            let mut req = client.get(&url);
-            if let Some(ref rng) = range_header {
-                req = req.header("Range", rng);
+            // SoundCloud HLS: все треки теперь отдаются m3u8-плейлистами (fMP4-сегменты),
+            // которые <audio> проиграть не может. Собираем init + сегменты в цельный MP4.
+            if url.to_lowercase().contains(".m3u8") {
+                let wrap_via_worker = {
+                    let r = reg.read().await;
+                    source_str.as_deref() == Some("soundcloud")
+                        && r.soundcloud.proxy_config().mode == ProxyMode::Direct
+                };
+                if serve_hls_as_mp4(
+                    &client,
+                    &url,
+                    wrap_via_worker,
+                    range_header.as_deref(),
+                    &cache,
+                    &mut writer,
+                )
+                .await
+                {
+                    return;
+                }
+                // Плейлист не разобрался — падаем в обычную стриминговую ветку ниже.
             }
 
-            let Ok(mut upstream) = req.send().await else {
+            // Первичный GET: до 3 попыток (нестабильный CDN/прокси не роняют трек сразу)
+            let mut upstream = None;
+            for attempt in 0..3u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                }
+                let mut req = client.get(&fetch_url);
+                if let Some(ref rng) = range_header {
+                    req = req.header("Range", rng);
+                }
+                match req.send().await {
+                    Ok(r) => {
+                        upstream = Some(r);
+                        break;
+                    }
+                    Err(_) if attempt < 2 => continue,
+                    Err(_) => {}
+                }
+            }
+            let Some(mut upstream) = upstream else {
                 let _ = writer
                     .write_all(b"HTTP/1.1 502 Bad Gateway\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n")
                     .await;
@@ -181,7 +245,7 @@ pub async fn run_proxy_server(
             }
 
             let should_cache = status.as_u16() == 200 && range_header.is_none() && cache.is_enabled();
-            let mut cache_buf: Vec<u8> = if should_cache { Vec::new() } else { Vec::new() };
+            let mut cache_buf: Vec<u8> = Vec::new();
             let mut cache_ok = should_cache;
 
             while let Ok(Some(chunk)) = upstream.chunk().await {
@@ -207,6 +271,194 @@ pub async fn run_proxy_server(
 
 #[allow(dead_code)]
 fn _ensure_source_kind_used(_: SourceKind) {}
+
+/// Скачивает один HLS-сегмент целиком. Обрыв соединения — не повод терять всю
+/// сборку: до 3 попыток с бэкоффом.
+async fn fetch_segment(client: &Client, url: String) -> Option<Vec<u8>> {
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+        }
+        if let Some(resp) = client.get(&url).send().await.ok() {
+            if let Ok(ok_r) = resp.error_for_status() {
+                if let Ok(b) = ok_r.bytes().await {
+                    return Some(b.to_vec());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Загружает HLS-плейлист (VOD), скачивает init-сегмент и все медиа-сегменты
+/// и склеивает их в цельный MP4 (fMP4-фрагменты конкатенируются корректно).
+/// Используется и прокси-сервером (отдача клиенту), и фоновым прогревом
+/// следующих треков (warm_up_next_tracks).
+pub(crate) async fn assemble_hls_mp4(
+    client: &Client,
+    playlist_url: &str,
+    wrap_via_worker: bool,
+) -> Option<Vec<u8>> {
+    // 1. Плейлист (маленький текстовый файл), 2 попытки
+    let mut text = String::new();
+    for attempt in 0..2u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        if let Some(resp) = client.get(playlist_url).send().await.ok() {
+            if let Ok(t) = resp.text().await {
+                text = t;
+                break;
+            }
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    if !text.trim_start().starts_with("#EXTM3U") {
+        return None;
+    }
+
+    // 2. Разбор плейлиста: EXT-X-MAP (init.mp4) + абсолютные URL сегментов
+    let base = url::Url::parse(playlist_url).ok()?;
+    let mut init_url: Option<String> = None;
+    let mut segments: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("#EXT-X-MAP:URI=\"") {
+            if let Some(u) = rest.split('"').next() {
+                init_url = Some(u.to_string());
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            if let Ok(abs) = base.join(line) {
+                segments.push(abs.to_string());
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+
+    // 3. В Direct-режиме сегменты тоже должны идти через Worker
+    let wrap = |u: &str| -> String {
+        if wrap_via_worker {
+            sc_worker_endpoint(u)
+        } else {
+            u.to_string()
+        }
+    };
+
+    let mut fetch_urls: Vec<String> = Vec::with_capacity(segments.len() + 1);
+    if let Some(init) = &init_url {
+        fetch_urls.push(wrap(init));
+    }
+    fetch_urls.extend(segments.iter().map(|s| wrap(s)));
+
+    // 4. Параллельная загрузка сегментов (buffered сохраняет порядок)
+    let parts: Vec<Option<Vec<u8>>> =
+        futures_util::stream::iter(fetch_urls.into_iter().map(|u| fetch_segment(client, u)))
+            .buffered(8)
+            .collect()
+            .await;
+
+    if parts.iter().any(|p| p.is_none()) {
+        return None;
+    }
+
+    // 5. Склейка init.mp4 + data*.m4s -> валидный MP4
+    let mut buf: Vec<u8> = Vec::new();
+    for part in parts.into_iter().flatten() {
+        buf.extend_from_slice(&part);
+    }
+    if buf.len() < 1024 {
+        return None;
+    }
+    Some(buf)
+}
+
+/// Загружает HLS-плейлист (VOD), собирает цельный MP4 и отдаёт клиенту
+/// с поддержкой Range. Результат кэшируется под ключом playlist_url.
+/// Возвращает true, если ответ полностью отдан клиенту.
+#[allow(clippy::too_many_arguments)]
+async fn serve_hls_as_mp4(
+    client: &Client,
+    playlist_url: &str,
+    wrap_via_worker: bool,
+    range_header: Option<&str>,
+    cache: &crate::track_cache::TrackCache,
+    writer: &mut tokio::net::tcp::WriteHalf<'_>,
+) -> bool {
+    let Some(buf) = assemble_hls_mp4(client, playlist_url, wrap_via_worker).await else {
+        return false;
+    };
+
+    // Кэш (дедуп при повторном воспроизведении; лимиты внутри store_bytes)
+    cache.store_bytes(playlist_url, "audio/mp4", &buf).await;
+
+    // Отдача с Range-поддержкой
+    serve_bytes(&buf, "audio/mp4", range_header, writer).await;
+    true
+}
+
+/// Отдаёт буфер памяти как HTTP-ответ с поддержкой Range (аналог serve_local_file).
+async fn serve_bytes(
+    data: &[u8],
+    mime: &str,
+    range_header: Option<&str>,
+    writer: &mut tokio::net::tcp::WriteHalf<'_>,
+) {
+    let total_len = data.len() as u64;
+    if total_len == 0 {
+        let _ = writer
+            .write_all(b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        return;
+    }
+
+    let (start, end, is_partial) = if let Some(rng) = range_header {
+        if let Some(spec) = rng.strip_prefix("bytes=") {
+            let mut parts = spec.split('-');
+            let s = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            let e = parts
+                .next()
+                .and_then(|v| if v.is_empty() { None } else { v.parse::<u64>().ok() })
+                .unwrap_or(total_len - 1)
+                .min(total_len - 1);
+            if s <= e && s < total_len {
+                (s, e, true)
+            } else {
+                (0, total_len - 1, false)
+            }
+        } else {
+            (0, total_len - 1, false)
+        }
+    } else {
+        (0, total_len - 1, false)
+    };
+
+    let content_len = end - start + 1;
+    let mut headers = String::new();
+    if is_partial {
+        headers.push_str("HTTP/1.1 206 Partial Content\r\n");
+        headers.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", start, end, total_len));
+    } else {
+        headers.push_str("HTTP/1.1 200 OK\r\n");
+    }
+    headers.push_str("Access-Control-Allow-Origin: *\r\n");
+    headers.push_str("Access-Control-Allow-Headers: Range\r\n");
+    headers.push_str("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n");
+    headers.push_str("Accept-Ranges: bytes\r\n");
+    headers.push_str(&format!("Content-Type: {}\r\n", mime));
+    headers.push_str(&format!("Content-Length: {}\r\n", content_len));
+    headers.push_str("Connection: close\r\n\r\n");
+
+    if writer.write_all(headers.as_bytes()).await.is_err() {
+        return;
+    }
+    let _ = writer
+        .write_all(&data[start as usize..=(end as usize)])
+        .await;
+}
 
 async fn serve_local_file(
     file_path: &str,

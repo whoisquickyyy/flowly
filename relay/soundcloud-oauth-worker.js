@@ -164,13 +164,65 @@ export default {
         }
 
         await env.SC_SESSIONS.delete(`sc:${sessionId}`);
-        return json({ status: 'ok', access_token: tokJson.access_token, username });
+        return json({
+          status: 'ok',
+          access_token: tokJson.access_token,
+          // Access token живёт ~1 час — refresh_token нужен для автообновления
+          refresh_token: tokJson.refresh_token || null,
+          expires_in: tokJson.expires_in || 3600,
+          username,
+        });
       }
 
       return json({ status: 'pending' });
     }
 
-    // 4. Прокси для SoundCloud API и аудиопотоков (работа без VPN/прокси на клиенте)
+    // 4. Обновление access_token по refresh_token (секреты только на стороне Worker)
+    if (url.pathname === '/refresh') {
+      const refreshToken = (url.searchParams.get('refresh_token') || '').trim();
+      if (!refreshToken) {
+        return json({ status: 'error', error: 'Missing refresh_token' }, 400);
+      }
+      if (!env.SC_CLIENT_ID || !env.SC_CLIENT_SECRET) {
+        return json({ status: 'error', error: 'Worker secrets are not configured' }, 500);
+      }
+
+      const body = new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: env.SC_CLIENT_ID,
+        client_secret: env.SC_CLIENT_SECRET,
+        refresh_token: refreshToken,
+      });
+      const tokenResp = await fetch('https://secure.soundcloud.com/oauth/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Accept: 'application/json',
+        },
+        body: body.toString(),
+      });
+
+      if (!tokenResp.ok) {
+        const txt = await tokenResp.text().catch(() => '');
+        return json({
+          status: 'error',
+          error: `Refresh failed (${tokenResp.status}): ${txt.slice(0, 140)}`,
+        });
+      }
+
+      const tokJson = await tokenResp.json();
+      if (!tokJson.access_token) {
+        return json({ status: 'error', error: 'No access_token in refresh response' });
+      }
+      return json({
+        status: 'ok',
+        access_token: tokJson.access_token,
+        refresh_token: tokJson.refresh_token || refreshToken,
+        expires_in: tokJson.expires_in || 3600,
+      });
+    }
+
+    // 5. Прокси для SoundCloud API и аудиопотоков (работа без VPN/прокси на клиенте)
     if (url.pathname === '/sc-proxy') {
       const targetRaw = (url.searchParams.get('url') || '').trim();
       if (!targetRaw) {
@@ -189,7 +241,10 @@ export default {
         host === 'soundcloud.com' ||
         host === 'www.soundcloud.com' ||
         host === 'sndcdn.com' ||
-        host.endsWith('.sndcdn.com');
+        host.endsWith('.sndcdn.com') ||
+        // HLS-плейлисты и сегменты (fMP4) лежат на CDN *.soundcloud.cloud
+        host === 'soundcloud.cloud' ||
+        host.endsWith('.soundcloud.cloud');
       if (!allowed) {
         return new Response('Forbidden host', { status: 403 });
       }

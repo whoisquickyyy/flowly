@@ -26,8 +26,9 @@ pub struct AppState {
     pub wave_weights: RwLock<std::collections::HashMap<String, f32>>,
     pub discord_rpc: DiscordRpcHandle,
     pub track_cache: crate::track_cache::TrackCache,
-    pub audio_engine: Arc<std::sync::Mutex<Option<crate::audio::KitharaEngine>>>,
     pub sc_oauth: Arc<RwLock<SoundCloudOAuthState>>,
+    /// Сериализует авто-refresh SoundCloud-токена (чтобы не гонять параллельно)
+    pub sc_refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -47,9 +48,6 @@ impl AppState {
         }
         if let Some(sh) = store.data.shuffle {
             player.shuffle = sh;
-        }
-        if let Some(sm) = store.data.shuffle_mode {
-            player.shuffle_mode = sm;
         }
         if let Some(rp) = store.data.repeat {
             player.repeat = rp;
@@ -83,7 +81,6 @@ impl AppState {
                 &player.queue,
                 player.current_track.as_ref(),
                 &[],
-                player.shuffle_mode,
             );
             player.shuffle_order = init_bag.iter().rev().cloned().collect();
         }
@@ -113,10 +110,8 @@ impl AppState {
             wave_weights: RwLock::new(std::collections::HashMap::new()),
             discord_rpc,
             track_cache,
-            audio_engine: Arc::new(std::sync::Mutex::new(
-                crate::audio::KitharaEngine::new().ok(),
-            )),
             sc_oauth: Arc::new(RwLock::new(sc_oauth)),
+            sc_refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
 }

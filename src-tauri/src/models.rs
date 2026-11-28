@@ -176,14 +176,6 @@ impl Default for AudioEffectsConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum ShuffleMode {
-    #[default]
-    Classic,
-    BpmFlow,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerState {
     pub current_track: Option<Track>,
@@ -191,8 +183,6 @@ pub struct PlayerState {
     pub position_sec: u32,
     pub volume: u8,
     pub shuffle: bool,
-    #[serde(default)]
-    pub shuffle_mode: ShuffleMode,
     pub repeat: RepeatMode,
     pub queue: Vec<Track>,
     #[serde(default)]
@@ -207,7 +197,6 @@ impl Default for PlayerState {
             position_sec: 0,
             volume: 80,
             shuffle: false,
-            shuffle_mode: ShuffleMode::Classic,
             repeat: RepeatMode::All,
             queue: Vec::new(),
             shuffle_order: Vec::new(),

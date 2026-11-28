@@ -657,7 +657,7 @@
   }
 </script>
 
-<section class="settings-shell">
+<section class="settings-shell tab-enter">
   <aside class="settings-sidebar">
     <div class="settings-search-box">
       <Search size={13} />
@@ -1552,7 +1552,7 @@
     </div>
   </div>
 
-  <!-- Плавные переходы и кроссфейд (Kithara) -->
+  <!-- Плавные переходы и кроссфейд (Web Audio) -->
   <div class="service-card">
     <div class="card-top">
       <div class="card-title">

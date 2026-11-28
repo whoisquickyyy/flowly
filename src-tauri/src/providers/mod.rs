@@ -12,12 +12,32 @@ use thiserror::Error;
 use crate::auth::StoredSecrets;
 use crate::models::{
     AuthStatus, GroupedSearchResult, LibrarySection, Playlist, ProviderCapabilities, ProxyConfig,
-    SourceKind, SourceStatus, Track,
+    ProxyMode, SourceKind, SourceStatus, Track,
 };
 use crate::network::proxy::NetworkError;
 
 use soundcloud::SoundCloudProvider;
 use yandex::YandexMusicProvider;
+
+/// URL Cloudflare Worker для проксирования SoundCloud API/CDN в режиме Direct.
+pub fn sc_worker_endpoint(target: &str) -> String {
+    let worker = option_env!("FLOWLY_SC_OAUTH_URL")
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://flowly-sc-oauth.demashein.workers.dev");
+    let encoded: String = url::form_urlencoded::byte_serialize(target.as_bytes()).collect();
+    format!("{}/sc-proxy?url={}", worker, encoded)
+}
+
+/// В Direct-режиме оборачивает target через Worker (обход блокировок),
+/// в остальных режимах клиент ходит напрямую через настроенный прокси.
+pub fn wrap_sc_url(mode: &ProxyMode, target: &str) -> String {
+    if *mode == ProxyMode::Direct {
+        sc_worker_endpoint(target)
+    } else {
+        target.to_string()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ProviderError {

@@ -3,6 +3,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { listen } from '@tauri-apps/api/event';
   import MarqueeText from './lib/components/MarqueeText.svelte';
+  import VibeBackground from './lib/components/VibeBackground.svelte';
   import {
     Play,
     Pause,
@@ -64,7 +65,7 @@
     type PublicJamRoomInfo,
   } from './lib/jamRoom';
   import { audioEngine } from './lib/audioEngine';
-  import { getTrackAudioFeatures, getHarmonicCrossfadeSec } from './lib/camelot';
+  import { getTrackAudioFeatures, getHarmonicCrossfadeSec, camelotCompatibility, LiveAudioAnalyzer } from './lib/camelot';
   import { extractCoverPalette, type CoverPalette } from './lib/colorExtract';
   import * as api from './lib/api';
   import type {
@@ -72,6 +73,7 @@
     BackgroundMode,
     LayoutStyle,
     MixConfig,
+    CrossfadeCurve,
     MixPreset,
     PlayerState,
     Playlist,
@@ -146,8 +148,16 @@
   let crossfadeTriggeredForId = $state<string | null>(null);
   let isNaturalEndTransition = false;
   let switchToken = 0;
+  // Переход в процессе (запущен handleNext, результат ещё не применён к декам).
+  // Закрывает гонку: onended уходящей деки в окне между применением player=next
+  // и переключением activeDeck в эффекте давал повторный handleNext (двойной скип).
+  let advanceInFlight = false;
   let preloadedForTrackId: string | null = null;
   let audioProxyPort = $state(0);
+  let likePulse = $state(0);
+  // Живой анализ BPM/тональности: после ~11с прослушивания трека кэш получает
+  // измеренные features, и beatmatch/гармоника работают на реальных значениях
+  const liveAnalyzer = new LiveAudioAnalyzer();
 
   function getActiveAudio(): HTMLAudioElement | undefined {
     return activeDeck === 'A' ? audioA : audioB;
@@ -241,7 +251,7 @@
         const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('flowly_mix_config') : null;
         if (raw) {
           const parsed = JSON.parse(raw);
-          const preset = parsed?.preset === 'fade' || parsed?.preset === 'rise' || parsed?.preset === 'auto' ? parsed.preset : 'auto';
+          const preset = normalizeMixPreset(parsed?.preset ?? 'auto');
           const curve = parsed?.curve === 's-curve' || parsed?.curve === 'linear' || parsed?.curve === 'equal-power' ? parsed.curve : 'equal-power';
           const durationSec = typeof parsed?.durationSec === 'number' ? Math.max(1, Math.min(12, parsed.durationSec)) : 6;
           return { enabled: parsed?.enabled !== false, preset, curve, durationSec };
@@ -346,8 +356,12 @@
     }
   }
 
+  function normalizeMixPreset(p: string): 'auto' | 'fade' {
+    return p === 'auto' ? 'auto' : 'fade'; // два режима; прочее мигрирует в Кроссфейд
+  }
+
   function updateMixConfig(next: MixConfig) {
-    mixConfig = next;
+    mixConfig = { ...next, preset: normalizeMixPreset(next.preset) };
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('flowly_mix_config', JSON.stringify(next));
     }
@@ -394,11 +408,37 @@
     }, 150);
   }
 
+  // Авто: выбирает эффект и длительность перехода по темпу и тональности
+  // (вся палитра: Beatmatch / Rise / Muffle; момент — старт на бите уходящего)
+  function pickAutoTransition(
+    outgoing: Track,
+    incoming: Track,
+    base: number,
+  ): { preset: MixPreset; curve: CrossfadeCurve; sec: number } {
+    const fA = getTrackAudioFeatures(outgoing);
+    const fB = getTrackAudioFeatures(incoming);
+    const bpmDiff = Math.abs(fA.bpm - fB.bpm);
+    const compat = camelotCompatibility(fA.camelot, fB.camelot);
+    // Близкий темп → beatmatch: time-stretch входящего (переход чуть длиннее)
+    if (bpmDiff < 8) return { preset: 'fade', curve: 'equal-power', sec: Math.min(12, base + 2) };
+    // Конфликт тональностей → Muffle прячет столкновение гармоний
+    if (compat <= 0.35) return { preset: 'muffle', curve: 'equal-power', sec: base };
+    // Другой темп, дружелюбная тональность → Rise со свипом фильтра
+    return { preset: 'rise', curve: 's-curve', sec: base };
+  }
+
   function effectiveCrossfadeSec(nextTrack?: Track | null): number {
     if (!mixConfig.enabled) return 0;
     const base = Math.max(1, Math.min(12, mixConfig.durationSec));
     if (mixConfig.preset === 'auto' && player.current_track && nextTrack) {
-      return getHarmonicCrossfadeSec(player.current_track, nextTrack, base, true);
+      // Бросок здесь убивал $effect загрузки дек (тишина после автоперехода):
+      // любой сбой гармонического расчёта откатывает к базовому кроссфейду
+      try {
+        return getHarmonicCrossfadeSec(player.current_track, nextTrack, base, true);
+      } catch (e) {
+        console.error('[xf] ошибка гармонического кроссфейда:', e);
+        return base;
+      }
     }
     return base;
   }
@@ -496,6 +536,7 @@
     { id: 'starfield', label: 'Глубокий космос', desc: 'Параллакс-звёзды в цветах обложки' },
     { id: 'fog-grain', label: 'Туманный лес', desc: 'Плёночное зерно и мягкий туман' },
     { id: 'dynamic-lyrics', label: 'Живая типографика', desc: 'Крупный текст песни на фоне' },
+    { id: 'vibe', label: 'Вайб Яндекса', desc: 'Пятно официальной волны: шум, искры, отклик на звук' },
   ];
 
   let bgMenuTab = $state<'basic' | 'reactive'>(
@@ -813,6 +854,63 @@
       getCurrentWindow().show().catch(() => {});
     }
 
+    // Сторож дек: «играющий» плеер без продвижения позиции — зависшая загрузка
+    // (умерший поток прокси, протухший подписанный URL). Восстанавливаем деку.
+    const stallWatchdog = setInterval(() => {
+      const cur = getActiveAudio();
+      const tr = player.current_track;
+      if (!cur || !tr?.playbackUrl || !player.is_playing || advanceInFlight) {
+        stallWatchLastTime = -1;
+        stallWatchFrozenTicks = 0;
+        stallPausedTicks = 0;
+        return;
+      }
+      // Дыра 3: AudioContext suspended — элемент «играет», звука нет
+      void audioEngine.resume();
+
+      // Дыра 1: UI «играет», а дека на паузе (play() отклонён, загрузка умерла) —
+      // по замороженной позиции такое не поймать, она и так стоит
+      if (cur.paused) {
+        stallPausedTicks += 1;
+        if (stallPausedTicks >= 2) {
+          stallPausedTicks = 0;
+          void handleDeckStall(activeDeck, 'deck-paused-while-playing');
+        }
+        stallWatchLastTime = -1;
+        return;
+      }
+      stallPausedTicks = 0;
+
+      const t = cur.currentTime;
+      if (stallWatchLastTime >= 0 && Math.abs(t - stallWatchLastTime) < 0.04) {
+        stallWatchFrozenTicks += 1;
+        const buffering = cur.readyState < 3;
+        const limit = buffering ? 8 : 3;
+        if (stallWatchFrozenTicks >= limit) {
+          stallWatchFrozenTicks = 0;
+          void handleDeckStall(activeDeck, buffering ? 'stalled-buffering' : 'frozen-position');
+        }
+      } else {
+        stallWatchFrozenTicks = 0;
+      }
+      stallWatchLastTime = t;
+    }, 1500);
+
+    // Живой анализ BPM/тональности из FFT тракта
+    const analyzeTimer = setInterval(() => {
+      const tr = player.current_track;
+      if (!tr || !player.is_playing || advanceInFlight) return;
+      const freq = audioEngine.getFrequencyData();
+      const rate = audioEngine.sampleRateHz;
+      if (freq && rate) {
+        try {
+          liveAnalyzer.feed(tr, freq, rate);
+        } catch {
+          // анализ не критичен для воспроизведения
+        }
+      }
+    }, 100);
+
     try {
       const [st, src, eq, port, savedLikes] = await Promise.all([
         api.getPlayerState(),
@@ -852,7 +950,7 @@
         if (player.is_playing) handleToggle();
       });
       void listen('media:next', () => {
-        handleNext();
+        handleNext(true);
       });
       void listen('media:prev', () => {
         handlePrev();
@@ -862,7 +960,7 @@
       try {
         navigator.mediaSession.setActionHandler('play', () => { if (!player.is_playing) handleToggle(); });
         navigator.mediaSession.setActionHandler('pause', () => { if (player.is_playing) handleToggle(); });
-        navigator.mediaSession.setActionHandler('nexttrack', () => { handleNext(); });
+        navigator.mediaSession.setActionHandler('nexttrack', () => { handleNext(true); });
         navigator.mediaSession.setActionHandler('previoustrack', () => { handlePrev(); });
       } catch {
         // ignore
@@ -1066,13 +1164,17 @@
       const naturalEnd = isNaturalEndTransition;
       isNaturalEndTransition = false;
 
-      const xfTargetSec = naturalEnd ? effectiveCrossfadeSec(player.current_track) : 0;
+      const isAuto = mixConfig.preset === 'auto';
+      const baseXf = Math.max(1, Math.min(12, mixConfig.durationSec));
+      // Авто: переход чуть длиннее — time-stretch beatmatch требует запаса
+      let xfTargetSec = naturalEnd ? (isAuto ? baseXf + 2 : baseXf) : 0;
       const canCrossfade = Boolean(lastLoadedUrl) && Boolean(url) && mixConfig.enabled && xfTargetSec > 0;
 
       const outgoingTrackForMix = lastTrackForMix;
       lastTrackForMix = player.current_track ?? null;
       lastLoadedUrl = url;
       crossfadeTriggeredForId = null;
+      stallAttempts = {};
 
       if (url) {
         const targetDeck: 'A' | 'B' =
@@ -1083,9 +1185,13 @@
         const incoming = targetDeck === 'A' ? audioA : audioB;
         const outgoing = targetDeck === 'A' ? audioB : audioA;
 
-        if (incoming.src !== url) {
+        const wasPreloaded = incoming.src === url;
+        if (!wasPreloaded) {
           incoming.src = url;
         }
+        console.info(
+          `[load] дека ${targetDeck} ← "${player.current_track?.title}" (preload=${wasPreloaded}, кроссфейд=${canCrossfade}, xf=${xfTargetSec.toFixed(1)}с)`
+        );
         incoming.volume = toAudioVolume(player.volume);
         if (outgoing) outgoing.volume = toAudioVolume(player.volume);
 
@@ -1093,18 +1199,28 @@
         if (canCrossfade && prevDeck && !prevDeck.paused) {
           cleanupSec = xfTargetSec;
           let chosenPreset: MixPreset = mixConfig.preset;
-          let chosenCurve = mixConfig.curve;
+          let chosenCurve: CrossfadeCurve = mixConfig.curve;
+          let beatDelaySec = 0;
 
-          if (mixConfig.preset === 'auto' && outgoingTrackForMix && player.current_track) {
-            const bpmOut = getTrackAudioFeatures(outgoingTrackForMix).bpm;
-            const bpmIn = getTrackAudioFeatures(player.current_track).bpm;
-            if (Math.abs(bpmOut - bpmIn) < 8) {
-              chosenPreset = 'fade';
-              chosenCurve = 'equal-power';
-              audioEngine.beatmatchTransition(incoming, bpmOut, bpmIn, xfTargetSec);
+          if (isAuto && outgoingTrackForMix && player.current_track) {
+            // Авто: сам выбирает тип эффекта и длительность по темпу/тональности
+            const picked = pickAutoTransition(outgoingTrackForMix, player.current_track, baseXf);
+            chosenPreset = picked.preset;
+            chosenCurve = picked.curve;
+            xfTargetSec = picked.sec;
+            if (picked.preset === 'fade') {
+              // Момент: старт перехода на бите уходящего трека
+              const beatSec = 60 / Math.max(60, getTrackAudioFeatures(outgoingTrackForMix).bpm);
+              const pos = prevDeck ? prevDeck.currentTime : 0;
+              const beatDelaySec = Math.max(0, Math.min(beatSec, beatSec - (pos % beatSec)));
+              xfTargetSec += beatDelaySec;
+              const bpmOut = getTrackAudioFeatures(outgoingTrackForMix).bpm;
+              const bpmIn = getTrackAudioFeatures(player.current_track).bpm;
+              const stretch = Math.max(1, xfTargetSec - beatDelaySec);
+              const applyBeat = () => audioEngine.beatmatchTransition(incoming, bpmOut, bpmIn, stretch);
+              if (beatDelaySec > 0) setTimeout(applyBeat, beatDelaySec * 1000);
+              else applyBeat();
             } else {
-              chosenPreset = 'rise';
-              chosenCurve = 's-curve';
               audioEngine.cancelBeatmatch(incoming);
             }
           } else {
@@ -1112,7 +1228,7 @@
           }
 
           activeDjPreset = chosenPreset;
-          audioEngine.crossfadeTo(targetDeck, xfTargetSec, chosenPreset, chosenCurve);
+          audioEngine.crossfadeTo(targetDeck, xfTargetSec, chosenPreset, chosenCurve, beatDelaySec);
         } else {
           activeDjPreset = mixConfig.preset;
           audioEngine.cancelBeatmatch(incoming);
@@ -1121,7 +1237,9 @@
 
         if (player.is_playing) {
           audioEngine.resume();
-          incoming.play().catch(() => {});
+          incoming.play().catch((e) => {
+            console.error('[play] отказ деки', targetDeck, ':', e);
+          });
           const tid = player.current_track?.id ?? null;
           if (naturalEnd && tid && tid !== lastRadioTrackId) {
             lastRadioTrackId = tid;
@@ -1213,6 +1331,24 @@
     }
   }
 
+  // Локальные станции: deep_cuts / fresh_drops / same_artist
+  async function handleStartStation(kind: api.StationKind) {
+    const token = ++switchToken;
+    advanceInFlight = true;
+    await audioEngine.resume();
+    try {
+      const next = await api.startStation(kind);
+      if (token !== switchToken) return;
+      player = next;
+      waveActive = false;
+      waveTracks = [];
+      advanceInFlight = false;
+    } catch (e) {
+      if (token === switchToken) advanceInFlight = false;
+      console.error('Ошибка запуска станции:', e);
+    }
+  }
+
   async function handleResetWave() {
     const token = ++switchToken;
     await audioEngine.resume();
@@ -1263,7 +1399,7 @@
     applyStatePreservingPosition(await api.togglePlayback());
   }
 
-  async function handleNext() {
+  async function handleNext(manual = false) {
     if (jamRoom.connected) {
       if (jamRoom.isHost && jamRoom.queue.length > 0) {
         jamAdvanceNext();
@@ -1276,21 +1412,58 @@
       const cur = getActiveAudio();
       const share = cur && cur.duration > 0 ? cur.currentTime / cur.duration : 0;
       const positive = isNaturalEndTransition || share >= 0.7;
-      api.reportWaveFeedback(player.current_track, positive);
+      api.reportWaveFeedback(player.current_track, positive, Math.round(cur?.currentTime ?? 0));
+    }
+    // Ручной скип: мягкое приглушение уходящей деки на время резолва
+    if (manual && mixConfig.enabled) {
+      audioEngine.prepareManualSkipDuck(activeDeck, mixConfig.preset);
     }
     const token = ++switchToken;
+    advanceInFlight = true;
     try {
       const prevLen = player.queue.length;
-      const next = await api.nextTrack();
-      if (token !== switchToken) return;
+      const next = await api.nextTrack(manual);
+      if (token !== switchToken) {
+        console.info(`[advance] результат ${token} отброшен — пришёл более новый запрос`);
+        return;
+      }
+      console.info(
+        `[advance] применён: "${next.current_track?.title}" (manual=${manual}, pos=${next.position_sec}s)`
+      );
       player = next;
+      // Сброс строго после player=next (в той же синхронной секции): эффект
+      // переключения дек отработает раньше, чем сможет прийти внешнее событие
+      advanceInFlight = false;
       if (!waveActive && player.repeat === 'off' && next.queue.length > prevLen) {
         waveActive = true;
       }
       if (waveActive) {
         waveTracks = next.queue;
+        // trackStarted в rotor-сессию — сервер знает, что играет
+        if (next.current_track?.source === 'yandex') {
+          void api.rotorTrackStarted(next.current_track);
+        }
+        // min_tail: если впереди осталось ≤3 треков — подкачиваем волну в фоне,
+        // не дожидаясь исчерпания очереди (переход не блокируется генерацией)
+        const currIdx = next.queue.findIndex((t) => t.id === next.current_track?.id);
+        const remaining = currIdx >= 0 ? next.queue.length - currIdx - 1 : 0;
+        if (remaining <= 3) {
+          void api
+            .topUpWave()
+            .then((st) => {
+              if (
+                st.current_track?.id === next.current_track?.id &&
+                st.queue.length > next.queue.length
+              ) {
+                player = st;
+                waveTracks = st.queue;
+              }
+            })
+            .catch(() => {});
+        }
       }
     } catch (e) {
+      if (token === switchToken) advanceInFlight = false;
       audioEngine.restoreDeck(activeDeck);
       console.error('Ошибка переключения вперёд:', e);
     }
@@ -2012,6 +2185,10 @@
       jamRoom.statusText = 'В Jam-комнате переключением управляет хост';
       return;
     }
+    // Ручное «Назад»: тот же мягкий дак уходящей деки
+    if (mixConfig.enabled) {
+      audioEngine.prepareManualSkipDuck(activeDeck, mixConfig.preset);
+    }
     const token = ++switchToken;
     try {
       const next = await api.prevTrack();
@@ -2020,6 +2197,87 @@
     } catch (e) {
       audioEngine.restoreDeck(activeDeck);
       console.error('Ошибка переключения назад:', e);
+    }
+  }
+
+  // --- Восстановление зависшей деки ---
+  let stallWatchLastTime = -1;
+  let stallWatchFrozenTicks = 0;
+  let stallPausedTicks = 0;
+  let stallAttempts: Record<string, number> = {};
+
+  async function handleDeckStall(deck: 'A' | 'B', reason: string) {
+    const cur = deck === 'A' ? audioA : audioB;
+    const tr = player.current_track;
+    if (!cur || !player.is_playing || !tr?.playbackUrl) return;
+    // Ошибка/зависание на ФОНОВОЙ деке (пре-лоад следующего трека, уборка после
+    // кроссфейда) — не трогаем: перехват activeDeck давал двойное воспроизведение
+    // и скачки позиции. Тихо глушим фоновую деку и продолжаем играть.
+    if (deck !== activeDeck) {
+      console.warn(`[deck ${deck}] фоновой деке стало плохо (${reason}) — глушу, активная дека не тронута`);
+      try {
+        cur.pause();
+        cur.removeAttribute('src');
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    const attempts = stallAttempts[tr.id] ?? 0;
+    if (attempts >= 2) {
+      // Дважды не помогло — переходим дальше, чтобы музыка не стояла
+      stallAttempts[tr.id] = attempts + 1;
+      console.error(`[deck ${deck}] зависание трека "${tr.title}" не устранилось, переключаюсь`);
+      void handleNext();
+      return;
+    }
+    stallAttempts[tr.id] = attempts + 1;
+
+    const err = cur.error;
+    console.error(
+      `[deck ${deck}] восстановление (${reason}, попытка ${attempts + 1}):`,
+      'error=', err && `${err.code} ${err.message}`,
+      '| networkState=', cur.networkState,
+      '| readyState=', cur.readyState
+    );
+
+    try {
+      let rawUrl = tr.playbackUrl;
+      try {
+        const fresh = await api.revalidatePlaybackUrl(tr);
+        if (fresh) rawUrl = fresh;
+      } catch (e) {
+        console.error('[deck] пере-резолв не удался, пробуем прежний URL:', e);
+      }
+
+      const proxy =
+        audioProxyPort > 0 && rawUrl.startsWith('local://')
+          ? `http://127.0.0.1:${audioProxyPort}/local?path=${encodeURIComponent(rawUrl.slice(8))}`
+          : audioProxyPort > 0 && rawUrl.startsWith('http')
+            ? `http://127.0.0.1:${audioProxyPort}/proxy?source=${tr.source}&url=${encodeURIComponent(rawUrl)}`
+            : rawUrl;
+      const sep = proxy.includes('?') ? '&' : '?';
+      const bustUrl = `${proxy}${sep}_r=${Date.now()}`;
+
+      stallWatchLastTime = -1;
+      stallWatchFrozenTicks = 0;
+      clearDeckTimers(deck);
+      activeDeck = deck;
+      cur.src = bustUrl;
+      cur.volume = toAudioVolume(player.volume);
+      audioEngine.resume();
+      audioEngine.crossfadeTo(deck, 0, mixConfig.preset, mixConfig.curve);
+      // Зависший play() (сборка HLS не отвечает) не должен вечно ждать:
+      // гоним его с таймаутом, попытки идут дальше, потом — переход
+      await Promise.race([
+        cur.play(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('play() таймаут 12с — источник не отвечает')), 12000),
+        ),
+      ]);
+      console.info(`[deck ${deck}] воспроизведение восстановлено`);
+    } catch (e) {
+      console.error(`[deck ${deck}] восстановление не помогло:`, e);
     }
   }
 
@@ -2038,8 +2296,14 @@
       cur.play().catch(() => {});
       return;
     }
-    if (crossfadeTriggeredForId === player.current_track?.id) return;
+    // Переход уже выполняется (кроссфейд-триггер/кнопка) — гасим stale-событие.
+    // В отличие от старого guard по crossfadeTriggeredForId, после НЕУДАВШЕГОСЯ
+    // перехода ended-ретраит handleNext вместо залипания в тишине до конца трека.
+    if (advanceInFlight) return;
     isNaturalEndTransition = true;
+    console.info(
+      `[advance] трек закончился (ended) → next: "${player.current_track?.title}" pos=${player.position_sec}s / dur=${player.current_track?.duration}s`
+    );
     await handleNext();
   }
 
@@ -2105,10 +2369,13 @@
           inactive.src = nextProxy;
         })
         .catch(() => {});
+      // Мульти-прогрев: собираем HLS следующих 2-3 треков цепочки в кэш,
+      // чтобы переходы не ждали загрузки сегментов
+      void api.warmUpNextTracks(3);
     }
 
     // Auto-Mix / Crossfade за N секунд до конца трека
-    const xf = effectiveCrossfadeSec();
+    const xf = effectiveCrossfadeSec() + (mixConfig.preset === 'auto' ? 2.5 : 0);
     const expectedDur = player.current_track?.duration ?? 0;
     if (
       xf > 0 &&
@@ -2122,6 +2389,9 @@
     ) {
       crossfadeTriggeredForId = trackId;
       isNaturalEndTransition = true;
+      console.info(
+        `[advance] кроссфейд-триггер → next: "${player.current_track?.title}" pos=${Math.round(el.currentTime)}/${Math.round(el.duration)}s (осталось ${(el.duration - el.currentTime).toFixed(1)}s, xf=${xf})`
+      );
       handleNext();
     }
   }
@@ -2189,6 +2459,7 @@
     const nextSet = new Set(likedIds);
     if (nextLiked) {
       nextSet.add(track.id);
+      if (player.current_track?.id === track.id) likePulse += 1;
       if (!likedTracks.some((t) => t.id === track.id)) {
         likedTracks = [track, ...likedTracks];
       }
@@ -2225,7 +2496,17 @@
     });
   }
 
+  const TAB_ORDER: TabId[] = ['details', 'library', 'playlists', 'search', 'recap', 'room', 'equalizer', 'settings'];
+
+  // Направление анимации перехода вкладок (для .tab-enter в app.css)
+  function setTabDirection(dir: 1 | -1) {
+    document.documentElement.style.setProperty('--tab-dir', String(dir));
+  }
+
   function goTab(tab: TabId) {
+    const from = TAB_ORDER.indexOf(activeTab);
+    const to = TAB_ORDER.indexOf(tab);
+    setTabDirection(to >= from ? 1 : -1);
     saveCurrentScroll();
     activeArtist = null;
     activeTab = tab;
@@ -2238,6 +2519,7 @@
   }
 
   function handleOpenArtist(artist: string) {
+    setTabDirection(1);
     saveCurrentScroll();
     activeArtist = artist;
     restoreScroll(`artist:${artist}`);
@@ -2273,12 +2555,14 @@
   crossorigin="anonymous"
   ontimeupdate={() => audioA && handleDeckTimeUpdate('A', audioA)}
   onended={() => handleTrackEnded('A')}
+  onerror={() => handleDeckStall('A', 'element-error')}
 ></audio>
 <audio
   bind:this={audioB}
   crossorigin="anonymous"
   ontimeupdate={() => audioB && handleDeckTimeUpdate('B', audioB)}
   onended={() => handleTrackEnded('B')}
+  onerror={() => handleDeckStall('B', 'element-error')}
 ></audio>
 <audio bind:this={radioAudioEl}></audio>
 
@@ -2286,7 +2570,13 @@
   class="shell"
   style="--accent: {accentColor}; --ambient-1: {palette.primary}; --ambient-2: {palette.secondary}; --ambient-3: {palette.tertiary}; --ambient-4: {palette.quaternary}; --ambient-5: {palette.quinary}"
 >
-  {#if bgMode === 'ambient'}
+  {#if bgMode === 'vibe'}
+    <VibeBackground
+      color={palette.primary}
+      playing={player.is_playing}
+      likePulse={likePulse}
+    />
+  {:else if bgMode === 'ambient'}
     <div class="bg-layer bg-ambient" class:playing={player.is_playing}></div>
     <div class="bg-layer bg-ambient-orb" class:playing={player.is_playing}></div>
   {:else if bgMode === 'blur-cover'}
@@ -2613,6 +2903,7 @@
           currentTrackId={player.current_track?.id ?? null}
           {likedIds}
           onBack={() => {
+            setTabDirection(-1);
             saveCurrentScroll();
             activeArtist = null;
             restoreScroll(activeTab);
@@ -2684,7 +2975,7 @@
           {authStatuses}
           onTogglePlay={handleToggle}
           onPrev={handlePrev}
-          onNext={handleNext}
+          onNext={() => handleNext(true)}
           onSeek={handleSeekVal}
           onVolumeChange={handleVolumeVal}
           onToggleShuffle={async () => applyStatePreservingPosition(await api.toggleShuffle())}
@@ -2692,6 +2983,7 @@
           onCyclePlaybackMode={cyclePlaybackMode}
           onPlayTrack={handlePlayTrack}
           onStartWave={handleStartWave}
+          onStartStation={handleStartStation}
           onResetWave={handleResetWave}
           onWaveConfigChange={updateWaveConfig}
           onToggleLike={handleToggleLike}
@@ -2746,17 +3038,15 @@
           />
         {/await}
       {:else if !activeArtist && activeTab === 'equalizer'}
-        <div class="eq-wrap">
+        <div class="eq-wrap tab-enter">
           {#await import('./lib/components/EqualizerPanel.svelte') then { default: EqualizerPanel }}
             <EqualizerPanel
               {effects}
               mix={mixConfig}
-              shuffleMode={player.shuffle_mode ?? 'classic'}
               isPlaying={player.is_playing}
               {accentColor}
               onChange={saveEffects}
               onMixChange={updateMixConfig}
-              onShuffleModeChange={async (mode) => applyStatePreservingPosition(await api.setShuffleMode(mode))}
             />
           {/await}
         </div>
@@ -3019,7 +3309,7 @@
               <Play size={15} fill="currentColor" />
             {/if}
           </button>
-          <button type="button" class="c-btn" onclick={handleNext} aria-label="Next">
+          <button type="button" class="c-btn" onclick={() => handleNext(true)} aria-label="Next">
             <SkipForward size={16} />
           </button>
         </div>

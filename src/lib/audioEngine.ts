@@ -307,10 +307,13 @@ class AudioEngine {
     target: 'A' | 'B',
     durationSec: number,
     preset: MixPreset = 'fade',
-    curve: CrossfadeCurve = 'equal-power'
+    curve: CrossfadeCurve = 'equal-power',
+    delaySec = 0
   ) {
     if (!this.ctx || !this.deckGainA || !this.deckGainB || !this.deckFilterA || !this.deckFilterB) return;
     const now = this.ctx.currentTime;
+    // Старт автоматизации: now или отложенный старт (бит-снап перехода)
+    const start = now + delaySec;
     const inGain = target === 'A' ? this.deckGainA.gain : this.deckGainB.gain;
     const outGain = target === 'A' ? this.deckGainB.gain : this.deckGainA.gain;
     const inFilter = target === 'A' ? this.deckFilterA : this.deckFilterB;
@@ -355,8 +358,8 @@ class AudioEngine {
       }
     }
     try {
-      inGain.setValueCurveAtTime(inCurve, now, durationSec);
-      outGain.setValueCurveAtTime(outCurve, now, durationSec);
+      inGain.setValueCurveAtTime(inCurve, start, durationSec);
+      outGain.setValueCurveAtTime(outCurve, start, durationSec);
     } catch {
       inGain.cancelScheduledValues(0);
       outGain.cancelScheduledValues(0);
@@ -374,6 +377,40 @@ class AudioEngine {
       outFilter.type = 'highpass';
       outFilter.frequency.setValueAtTime(60, now);
       outFilter.frequency.exponentialRampToValueAtTime(1400, now + durationSec);
+    } else if (preset === 'muffle') {
+      // Срез ВЧ уходящего (Low-pass Filter Out из Spotify Mix): уходящий
+      // постепенно уходит под lowpass, входящий заезжает чисто
+      outFilter.type = 'lowpass';
+      outFilter.Q.value = 0.9;
+      outFilter.frequency.setValueAtTime(18000, start);
+      outFilter.frequency.exponentialRampToValueAtTime(250, start + durationSec);
+      inFilter.type = 'allpass';
+    } else if (preset === 'bass-swap') {
+      // Center Bass Swap: до середины у уходящего полный спектр, у входящего
+      // только бас (lowpass 120 Гц); после середины бас переезжает
+      outFilter.type = 'lowpass';
+      outFilter.Q.value = 0.9;
+      outFilter.frequency.setValueAtTime(18000, start);
+      outFilter.frequency.setValueAtTime(18000, start + durationSec / 2);
+      outFilter.frequency.exponentialRampToValueAtTime(120, start + durationSec);
+      inFilter.type = 'lowpass';
+      inFilter.Q.value = 0.9;
+      inFilter.frequency.setValueAtTime(120, start);
+      inFilter.frequency.setValueAtTime(120, start + durationSec / 2);
+      inFilter.frequency.exponentialRampToValueAtTime(18000, start + durationSec);
+    } else if (preset === 'bass-cut') {
+      // Quick Bass Cut: у уходящего бас умирает рано (25% перехода), входящий
+      // открывается во второй половине — короткая басовая пауза перед сбросом
+      outFilter.type = 'lowpass';
+      outFilter.Q.value = 0.9;
+      outFilter.frequency.setValueAtTime(18000, start);
+      outFilter.frequency.exponentialRampToValueAtTime(120, start + durationSec * 0.25);
+      outFilter.frequency.setValueAtTime(120, start + durationSec * 0.6);
+      inFilter.type = 'lowpass';
+      inFilter.Q.value = 0.9;
+      inFilter.frequency.setValueAtTime(120, start);
+      inFilter.frequency.setValueAtTime(120, start + durationSec * 0.5);
+      inFilter.frequency.exponentialRampToValueAtTime(18000, start + durationSec);
     } else {
       inFilter.type = 'allpass';
       outFilter.type = 'allpass';
@@ -671,6 +708,10 @@ class AudioEngine {
     if (!this.analyser || !this.freqBuf) return null;
     this.analyser.getByteFrequencyData(this.freqBuf);
     return this.freqBuf;
+  }
+
+  get sampleRateHz(): number | null {
+    return this.ctx?.sampleRate ?? null;
   }
 }
 

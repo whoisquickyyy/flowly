@@ -1,5 +1,4 @@
 mod activity;
-pub mod audio;
 mod auth;
 mod commands;
 mod discord_rpc;
@@ -139,7 +138,6 @@ pub fn run() {
             commands::seek_to,
             commands::set_volume,
             commands::toggle_shuffle,
-            commands::set_shuffle_mode,
             commands::cycle_repeat,
             commands::get_sources_status,
             commands::update_source_proxy,
@@ -167,6 +165,11 @@ pub fn run() {
             commands::get_listening_recap,
             commands::get_track_samples,
             commands::preload_next_track,
+            commands::revalidate_playback_url,
+            commands::warm_up_next_tracks,
+            commands::top_up_wave,
+            commands::start_station,
+            commands::rotor_track_started,
             commands::generate_radio_host_line,
             commands::install_piper_tts,
             commands::get_dynamic_atmosphere,
@@ -180,16 +183,6 @@ pub fn run() {
             commands::set_track_cache_enabled,
             commands::report_wave_feedback,
             commands::open_external_url,
-            commands::audio_load_and_play,
-            commands::audio_prepare_next,
-            commands::audio_crossfade,
-            commands::audio_pause,
-            commands::audio_resume,
-            commands::audio_seek,
-            commands::audio_set_volume,
-            commands::audio_set_ducking,
-            commands::audio_set_eq_bands,
-            commands::audio_get_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

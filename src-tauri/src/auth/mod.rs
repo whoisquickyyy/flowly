@@ -17,6 +17,11 @@ pub struct StoredSecrets {
     pub soundcloud_session_id: Option<String>,
     #[serde(default)]
     pub soundcloud_oauth_relay: Option<String>,
+    #[serde(default)]
+    pub soundcloud_refresh_token: Option<String>,
+    /// Unix-время (сек), когда access_token истечёт; заполняется при OAuth/refresh
+    #[serde(default)]
+    pub soundcloud_token_expires_at: Option<u64>,
     pub proxies: HashMap<SourceKind, ProxyConfig>,
     pub local_playlists: Vec<Playlist>,
     #[serde(default)]
@@ -35,8 +40,6 @@ pub struct StoredSecrets {
     pub volume: Option<u8>,
     #[serde(default)]
     pub shuffle: Option<bool>,
-    #[serde(default)]
-    pub shuffle_mode: Option<crate::models::ShuffleMode>,
     #[serde(default)]
     pub repeat: Option<RepeatMode>,
     #[serde(default)]

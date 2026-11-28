@@ -142,7 +142,7 @@
   }
 </script>
 
-<section class="playlists-view">
+<section class="playlists-view tab-enter">
   <aside class="pl-sidebar">
     <div class="pl-side-head">
       <div class="pl-side-title-row">

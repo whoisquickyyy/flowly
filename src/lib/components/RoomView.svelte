@@ -180,7 +180,7 @@
   const alreadyVoted = $derived(room.skipVotes.includes(room.myId));
 </script>
 
-<section class="room-view">
+<section class="room-view tab-enter">
   <div class="room-head">
     <div class="head-title">
       <Radio size={20} />

@@ -9,35 +9,33 @@
     CrossfadeCurve,
     MixConfig,
     MixPreset,
-    ShuffleMode,
   } from '../types';
 
   interface Props {
     effects: AudioEffectsConfig;
     mix: MixConfig;
-    shuffleMode?: ShuffleMode;
     isPlaying: boolean;
     accentColor: string;
     onChange: (next: AudioEffectsConfig) => Promise<void>;
     onMixChange: (next: MixConfig) => void;
-    onShuffleModeChange?: (mode: ShuffleMode) => void;
   }
 
   let {
     effects,
     mix,
-    shuffleMode = 'classic',
     isPlaying,
     accentColor,
     onChange,
     onMixChange,
-    onShuffleModeChange = () => {},
   }: Props = $props();
 
-  const mixPresets: { id: MixPreset; label: string; desc: string }[] = [
-    { id: 'auto', label: 'Auto', desc: 'Умный выбор: Beatmatch или Rise по BPM' },
-    { id: 'fade', label: 'Fade', desc: 'Классический кроссфейд между деками' },
-    { id: 'rise', label: 'Rise', desc: 'Нарастающий фильтр с подъёмом верхов' },
+  const mixModes: { id: MixPreset; label: string; desc: string }[] = [
+    {
+      id: 'auto',
+      label: 'Авто',
+      desc: 'Сам выбирает момент (старт на бите) и эффект: Beatmatch / Rise / Muffle — по темпу и тональности',
+    },
+    { id: 'fade', label: 'Кроссфейд', desc: 'Ручной режим: ваша кривая и длительность, без авто-эффектов' },
   ];
 
   const curveOptions: { value: CrossfadeCurve; label: string }[] = [
@@ -478,7 +476,7 @@
           <Disc size={16} />
           <span>Mix & Auto-Mix переходы</span>
         </div>
-        <span class="mix-subtitle">Плавное сведение в конце трека (в «Моей волне» — простой кроссфейд без Auto-DJ)</span>
+        <span class="mix-subtitle">Авто-DJ сам выбирает момент и эффект перехода; Кроссфейд — ручной режим с вашей кривой</span>
       </div>
       <div class="mix-switch-wrap">
         <span class="mix-state-lbl">{mix.enabled ? 'Вкл' : 'Выкл'}</span>
@@ -492,7 +490,7 @@
 
     {#if mix.enabled}
       <div class="mix-presets-row">
-        {#each mixPresets as mp (mp.id)}
+        {#each mixModes as mp (mp.id)}
           <button
             type="button"
             class="mix-preset-btn"
@@ -508,55 +506,33 @@
       <div class="mix-setting-row">
         <div class="mix-setting-info">
           <span class="rg-lbl">Кривая кроссфейда</span>
-          <span class="mix-setting-hint">Характер затухания и нарастания громкости</span>
+          <span class="mix-setting-hint">{mix.preset === 'auto' ? 'Подбирается алгоритмом вместе с эффектом' : 'Характер затухания и нарастания громкости'}</span>
         </div>
-        <div style="min-width: 220px;">
+        <div style="min-width: 220px;" class:mix-disabled={mix.preset === 'auto'}>
           <RadixSelect
             value={mix.curve}
             options={curveOptions}
+            disabled={mix.preset === 'auto'}
             onValueChange={(v) => onMixChange({ ...mix, curve: v as CrossfadeCurve })}
           />
         </div>
       </div>
 
-      <div class="mix-slider">
-        <span>Длительность перехода: <b>{mix.durationSec} сек</b></span>
+      <div class="mix-slider" class:mix-disabled={mix.preset === 'auto'}>
+        <span>{mix.preset === 'auto' ? 'Базовая длительность (алгоритм подстроит):' : 'Длительность перехода:'} <b>{mix.durationSec} сек</b></span>
         <RadixSlider
           value={mix.durationSec}
           min={1}
           max={12}
           step={1}
+          disabled={mix.preset === 'auto'}
           ariaLabel="Длительность перехода"
           onValueChange={(v) => onMixChange({ ...mix, durationSec: v })}
         />
       </div>
     {/if}
 
-    <div class="mix-divider"></div>
-
-    <div class="mix-setting-row">
-      <div class="mix-setting-info">
-        <span class="rg-lbl">Режим шафла (в плейлистах)</span>
-        <span class="mix-setting-hint">BPM Flow подбирает треки со схожим темпом</span>
       </div>
-      <div class="mix-mode-pills">
-        <button
-          type="button"
-          class:active={shuffleMode === 'classic'}
-          onclick={() => onShuffleModeChange('classic')}
-        >
-          Обычный шафл
-        </button>
-        <button
-          type="button"
-          class:active={shuffleMode === 'bpm-flow'}
-          onclick={() => onShuffleModeChange('bpm-flow')}
-        >
-          BPM Flow
-        </button>
-      </div>
-    </div>
-  </div>
 
   <!-- Дополнительные фишки -->
   <div class="features-grid">
@@ -963,13 +939,7 @@
     color: var(--text-secondary);
   }
 
-  .mix-divider {
-    height: 1px;
-    background: var(--border-subtle);
-    margin: 2px 0;
-  }
-
-  .mix-setting-row {
+    .mix-setting-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -988,33 +958,7 @@
     color: var(--text-muted);
   }
 
-  .mix-mode-pills {
-    display: flex;
-    gap: 4px;
-    padding: 3px;
-    border-radius: 999px;
-    background: var(--bg-graphite);
-    border: 1px solid var(--border-subtle);
-    flex-wrap: wrap;
-  }
-
-  .mix-mode-pills button {
-    padding: 4px 11px;
-    border-radius: 999px;
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-  }
-
-  .mix-mode-pills button.active {
-    background: var(--bg-elevated);
-    color: var(--text-primary);
-  }
-
-  .mix-presets-row {
+        .mix-presets-row {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
     gap: 8px;
@@ -1046,6 +990,10 @@
   .mp-desc {
     font-size: 10px;
     color: var(--text-secondary);
+  }
+
+  .mix-disabled {
+    opacity: 0.45;
   }
 
   .mix-slider {

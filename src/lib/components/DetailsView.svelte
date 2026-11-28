@@ -85,6 +85,7 @@
     onCyclePlaybackMode?: () => void;
     onPlayTrack: (track: Track, queue?: Track[]) => void;
     onStartWave: (sourceFilter: SourceKind | null) => Promise<void>;
+    onStartStation?: (kind: api.StationKind) => Promise<void> | void;
     onResetWave?: () => Promise<void>;
     onWaveConfigChange?: (next: WaveConfig) => void;
     onToggleLike: (track: Track) => void;
@@ -130,6 +131,7 @@
     onCycleRepeat = () => {},
     onCyclePlaybackMode = () => {},
     onPlayTrack,
+    onStartStation,
     onStartWave,
     onResetWave = async () => {},
     onWaveConfigChange = () => {},
@@ -292,6 +294,9 @@
     auto: 'Auto',
     fade: 'Fade',
     rise: 'Rise',
+    muffle: 'Muffle',
+    'bass-swap': 'Bass Swap',
+    'bass-cut': 'Bass Cut',
   };
 
   const playbackModeInfo = $derived.by(() => {
@@ -600,7 +605,7 @@
   </section>
 {:else}
 <div class="details-root">
-  <section class="sc-stage">
+  <section class="sc-stage tab-enter">
     <!-- Левая колонка: Моя волна и Медиатека -->
     <aside class="side-panel">
         {#if !waveActive}
@@ -659,6 +664,33 @@
               <Sparkles size={14} />
               <span>{waveBusy ? 'Подбираем треки...' : 'Включить волну'}</span>
             </button>
+
+            <div class="wave-moods station-row">
+              <button
+                type="button"
+                disabled={waveBusy}
+                onclick={() => onStartStation?.('deep_cuts')}
+                title="Малослушанное из лайков"
+              >
+                Deep Cuts
+              </button>
+              <button
+                type="button"
+                disabled={waveBusy}
+                onclick={() => onStartStation?.('fresh_drops')}
+                title="Свежие релизы в лайках"
+              >
+                Новинки
+              </button>
+              <button
+                type="button"
+                disabled={waveBusy}
+                onclick={() => onStartStation?.('same_artist')}
+                title="Треки текущего артиста"
+              >
+                Этот артист
+              </button>
+            </div>
           </div>
         {:else}
           <div class="wave-stub active-wave">
@@ -778,7 +810,9 @@
     <div class="now-center">
       {#if track}
         <div class="np-caption">Сейчас играет</div>
-        <h1 class="np-heading">{track.title}</h1>
+        {#key track.id}
+          <h1 class="np-heading">{track.title}</h1>
+        {/key}
 
         <div class="artwork-wrap" class:playing={isPlaying} class:compact-art={layoutStyle === 'wave-dock' && !dockCollapsed} class:lyrics-art={showLyrics}>
           <div class="artwork-glow"></div>
@@ -787,17 +821,19 @@
           {/key}
         </div>
 
-        <div class="artist-row">
-          <button
-            type="button"
-            class="artist-link"
-            onclick={() => onOpenArtist(track.artist)}
-            title="Открыть треки артиста"
-          >
-            {track.artist}
-          </button>
-          <SourceBadge source={track.source} showLabel={true} />
-        </div>
+        {#key track.id}
+          <div class="artist-row">
+            <button
+              type="button"
+              class="artist-link"
+              onclick={() => onOpenArtist(track.artist)}
+              title="Открыть треки артиста"
+            >
+              {track.artist}
+            </button>
+            <SourceBadge source={track.source} showLabel={true} />
+          </div>
+        {/key}
 
         <div class="meta-line">
           <span>{track.album}</span>
@@ -1744,6 +1780,25 @@
     line-height: 1.12;
     margin-bottom: 6px;
     text-shadow: 0 2px 16px rgba(0, 0, 0, 0.65);
+    animation: trackTextIn 220ms cubic-bezier(0.25, 1, 0.5, 1) both;
+  }
+
+  /* Смена трека: заголовок и артист мягко всплывают (элементы пересоздаются {#key track.id}) */
+  @keyframes trackTextIn {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .np-heading {
+      animation: none;
+    }
   }
 
   .artwork-wrap {
@@ -1820,6 +1875,13 @@
     align-items: center;
     gap: 8px;
     margin-top: 6px;
+    animation: trackTextIn 220ms 40ms cubic-bezier(0.25, 1, 0.5, 1) both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .artist-row {
+      animation: none;
+    }
   }
 
   .artist-link {
@@ -2108,6 +2170,11 @@
     color: var(--text-primary);
     border-color: color-mix(in srgb, var(--accent) 55%, transparent);
     background: color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  /* Локальные станции под кнопкой волны — те же чипы, отступ сверху */
+  .station-row {
+    margin-top: 4px;
   }
 
   .wave-start-btn {

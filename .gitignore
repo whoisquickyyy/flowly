@@ -13,3 +13,8 @@ src-tauri/gen/
 *.key.pub
 .env
 .env.*
+.impeccable/
+
+# Tool artifacts
+.video_agent/
+.wrangler/

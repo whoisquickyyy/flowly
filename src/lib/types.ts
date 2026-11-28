@@ -3,6 +3,7 @@ export type ProxyMode = 'direct' | 'socks5' | 'http';
 export type RepeatMode = 'off' | 'all' | 'one';
 export type BackgroundMode =
   | 'ambient'
+  | 'vibe'
   | 'blur-cover'
   | 'aurora'
   | 'spotlight'
@@ -12,7 +13,7 @@ export type BackgroundMode =
   | 'fog-grain'
   | 'dynamic-lyrics';
 export type LayoutStyle = 'wave-dock' | 'modern-analog' | 'tv-mode';
-export type MixPreset = 'auto' | 'fade' | 'rise';
+export type MixPreset = 'auto' | 'fade' | 'rise' | 'muffle' | 'bass-swap' | 'bass-cut';
 export type CrossfadeCurve = 'equal-power' | 's-curve' | 'linear';
 export type WaveMood = 'mix' | 'energy' | 'chill' | 'discovery' | 'favorites';
 
@@ -277,7 +278,6 @@ export interface RadioHostResult {
   error: string | null;
 }
 
-export type ShuffleMode = 'classic' | 'bpm-flow';
 
 export interface PlayerState {
   current_track: Track | null;
@@ -285,7 +285,6 @@ export interface PlayerState {
   position_sec: number;
   volume: number;
   shuffle: boolean;
-  shuffle_mode?: ShuffleMode;
   repeat: RepeatMode;
   queue: Track[];
   shuffle_order?: string[];

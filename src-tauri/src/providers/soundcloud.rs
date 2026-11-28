@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::Value;
 
 use crate::models::{
-    AuthStatus, Playlist, ProviderCapabilities, ProxyConfig, ProxyMode, SourceKind, Track,
+    AuthStatus, Playlist, ProviderCapabilities, ProxyConfig, SourceKind, Track,
 };
 use crate::network::proxy::build_client;
 use crate::providers::{MusicProvider, ProviderError};
@@ -37,27 +37,15 @@ impl SoundCloudProvider {
         }
     }
 
-    fn sc_endpoint(&self, target: &str) -> String {
-        if self.proxy.mode != ProxyMode::Direct {
-            return target.to_string();
-        }
-        let worker = option_env!("FLOWLY_SC_OAUTH_URL")
-            .map(|s| s.trim().trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or("https://flowly-sc-oauth.demashein.workers.dev");
-        let encoded: String = url::form_urlencoded::byte_serialize(target.as_bytes()).collect();
-        format!("{}/sc-proxy?url={}", worker, encoded)
+    pub fn sc_endpoint(&self, target: &str) -> String {
+        super::wrap_sc_url(&self.proxy.mode, target)
     }
 
     pub async fn resolve_public_client_id(&self) -> Option<String> {
-        self.resolve_public_client_id_inner(false).await
+        self.resolve_public_client_id_inner().await
     }
 
-    pub async fn resolve_public_client_id_fresh(&self) -> Option<String> {
-        self.resolve_public_client_id_inner(true).await
-    }
-
-    async fn resolve_public_client_id_inner(&self, ignore_cooldown: bool) -> Option<String> {
+    async fn resolve_public_client_id_inner(&self) -> Option<String> {
         if let Some(ref cid) = self.client_id {
             return Some(cid.clone());
         }
@@ -68,7 +56,7 @@ impl SoundCloudProvider {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        if !ignore_cooldown && self.auto_fail_until.load(std::sync::atomic::Ordering::Relaxed) > now {
+        if self.auto_fail_until.load(std::sync::atomic::Ordering::Relaxed) > now {
             return None;
         }
 
@@ -208,7 +196,7 @@ impl SoundCloudProvider {
 
         if let Some(ref cid) = client_id {
             self.client
-                .get("https://api-v2.soundcloud.com/search/tracks")
+                .get(self.sc_endpoint("https://api-v2.soundcloud.com/search/tracks"))
                 .query(&[("q", "ambient"), ("limit", "1"), ("client_id", cid.as_str())])
                 .send()
                 .await?
@@ -347,7 +335,7 @@ impl SoundCloudProvider {
             // 2. Fallback через v1 /me/favorites (работает только с OAuth токеном без client_id)
             if let Ok(resp) = self
                 .client
-                .get("https://api.soundcloud.com/me/favorites")
+                .get(self.sc_endpoint("https://api.soundcloud.com/me/favorites"))
                 .query(&[("limit", "50")])
                 .header("Authorization", format!("OAuth {}", tok))
                 .send()
@@ -369,7 +357,7 @@ impl SoundCloudProvider {
             // 3. Fallback через v2 /me/play-history/tracks (работает только с OAuth токеном)
             if let Ok(resp) = self
                 .client
-                .get("https://api-v2.soundcloud.com/me/play-history/tracks")
+                .get(self.sc_endpoint("https://api-v2.soundcloud.com/me/play-history/tracks"))
                 .query(&[("limit", "40")])
                 .header("Authorization", format!("OAuth {}", tok))
                 .send()
@@ -396,7 +384,7 @@ impl SoundCloudProvider {
         if let Some(ref cid) = self.client_id {
             let resp = self
                 .client
-                .get("https://api-v2.soundcloud.com/charts")
+                .get(self.sc_endpoint("https://api-v2.soundcloud.com/charts"))
                 .query(&[
                     ("kind", "top"),
                     ("genre", "soundcloud:genres:all-music"),
@@ -445,7 +433,10 @@ impl SoundCloudProvider {
         for seed_id in seed_ids {
             let mut req = self
                 .client
-                .get(format!("https://api-v2.soundcloud.com/tracks/{}/related", seed_id))
+                .get(self.sc_endpoint(&format!(
+                    "https://api-v2.soundcloud.com/tracks/{}/related",
+                    seed_id
+                )))
                 .query(&[("limit", "25")]);
             if let Some(ref cid) = self.client_id {
                 req = req.query(&[("client_id", cid.as_str())]);
@@ -478,7 +469,10 @@ impl SoundCloudProvider {
     pub async fn set_track_like(&self, track_id: &str, liked: bool) -> Result<(), ProviderError> {
         let tok = self.oauth_token.as_ref().ok_or(ProviderError::Unauthorized)?;
         let raw_id = track_id.strip_prefix("sc:").unwrap_or(track_id);
-        let v1_like_url = format!("https://api.soundcloud.com/likes/tracks/{}", raw_id);
+        let v1_like_url = self.sc_endpoint(&format!(
+            "https://api.soundcloud.com/likes/tracks/{}",
+            raw_id
+        ));
         let req = if liked {
             self.client.post(&v1_like_url)
         } else {
@@ -495,7 +489,7 @@ impl SoundCloudProvider {
             }
         }
 
-        let url = format!("https://api.soundcloud.com/me/favorites/{}", raw_id);
+        let url = self.sc_endpoint(&format!("https://api.soundcloud.com/me/favorites/{}", raw_id));
         let req = if liked {
             self.client.put(&url)
         } else {
@@ -512,7 +506,7 @@ impl SoundCloudProvider {
         if let Some(ref tok) = self.oauth_token {
             let mut req = self
                 .client
-                .get("https://api-v2.soundcloud.com/me/play-history/tracks")
+                .get(self.sc_endpoint("https://api-v2.soundcloud.com/me/play-history/tracks"))
                 .query(&[("limit", "30")])
                 .header("Authorization", format!("OAuth {}", tok));
             if let Some(ref cid) = self.client_id {
@@ -587,7 +581,7 @@ impl SoundCloudProvider {
 
         let mut req = self
             .client
-            .get("https://api-v2.soundcloud.com/me/playlists")
+            .get(self.sc_endpoint("https://api-v2.soundcloud.com/me/playlists"))
             .query(&[("limit", "25")])
             .header("Authorization", format!("OAuth {}", tok));
         if let Some(ref cid) = self.client_id {
@@ -647,6 +641,19 @@ impl MusicProvider for SoundCloudProvider {
 
     fn client(&self) -> &Client {
         &self.client
+    }
+
+    // В Direct-режиме soundcloud.com напрямую недоступен — проверяем связь через Worker,
+    // как и все остальные запросы провайдера.
+    async fn check_connection(&self) -> Result<u64, ProviderError> {
+        let start = std::time::Instant::now();
+        let resp = self
+            .client
+            .head(self.sc_endpoint(self.health_check_url()))
+            .send()
+            .await?;
+        let _ = resp.status();
+        Ok(start.elapsed().as_millis() as u64)
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -752,11 +759,9 @@ impl MusicProvider for SoundCloudProvider {
             {
                 if let Ok(ok_r) = resp.error_for_status() {
                     if let Ok(streams) = ok_r.json::<Value>().await {
-                        if let Some(u) = streams["http_mp3_128_url"]
-                            .as_str()
-                            .or_else(|| streams["hls_mp3_128_url"].as_str())
-                            .or_else(|| streams["hls_opus_64_url"].as_str())
-                        {
+                        // HLS-плейлисты (hls_mp3_128_url и т.п.) <audio> играть не умеет —
+                        // принимаем только цельный MP3-поток, иначе уходим в api-v2 ниже.
+                        if let Some(u) = streams["http_mp3_128_url"].as_str() {
                             return Ok(Some(self.sc_endpoint(u)));
                         }
                     }
@@ -781,13 +786,42 @@ impl MusicProvider for SoundCloudProvider {
         }
 
         let json: Value = req.send().await?.error_for_status()?.json().await?;
-        let transcoding_url = json["media"]["transcodings"]
+
+        // SoundCloud перевёл все треки на HLS-транскодинги (progressive больше не отдаётся).
+        // Выбираем лучший доступный: для длинных миксов берём aac_96k, иначе aac_160k.
+        // Локальный proxy_server собирает m3u8-плейлист в цельный MP4 перед отдачей в <audio>.
+        let duration_ms = json["duration"].as_u64().unwrap_or(0);
+        let hls_preset = if duration_ms > 1_200_000 { "aac_96k" } else { "aac_160k" };
+        let transcodings = json["media"]["transcodings"]
             .as_array()
-            .and_then(|arr| {
-                arr.iter()
-                    .find(|t| t["format"]["protocol"].as_str() == Some("progressive"))
-                    .or_else(|| arr.first())
+            .ok_or_else(|| ProviderError::Api("Нет доступных транскодингов".into()))?;
+
+        let transcoding = transcodings
+            .iter()
+            .find(|t| t["format"]["protocol"].as_str() == Some("progressive"))
+            .or_else(|| {
+                transcodings.iter().find(|t| {
+                    t["format"]["protocol"].as_str() == Some("hls")
+                        && t["format"]["mime_type"].as_str()
+                            .map(|m| m.starts_with("audio/mp4"))
+                            .unwrap_or(false)
+                        && t["preset"].as_str() == Some(hls_preset)
+                })
             })
+            .or_else(|| {
+                transcodings.iter().find(|t| {
+                    t["format"]["protocol"].as_str() == Some("hls")
+                        && t["format"]["mime_type"].as_str()
+                            .map(|m| m.starts_with("audio/mp4"))
+                            .unwrap_or(false)
+                })
+            })
+            .or_else(|| {
+                transcodings.iter().find(|t| t["format"]["protocol"].as_str() == Some("hls"))
+            })
+            .or_else(|| transcodings.first());
+
+        let transcoding_url = transcoding
             .and_then(|t| t["url"].as_str())
             .ok_or_else(|| ProviderError::Api("Нет доступного аудиопотока".into()))?;
 
@@ -805,6 +839,9 @@ impl MusicProvider for SoundCloudProvider {
         }
 
         let stream_json: Value = stream_req.send().await?.error_for_status()?.json().await?;
-        Ok(stream_json["url"].as_str().map(|u| self.sc_endpoint(u)))
+        let playlist_url = stream_json["url"]
+            .as_str()
+            .ok_or_else(|| ProviderError::Api("SoundCloud не вернул URL плейлиста".into()))?;
+        Ok(Some(self.sc_endpoint(playlist_url)))
     }
 }

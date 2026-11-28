@@ -72,19 +72,23 @@ function saveCache() {
 
 function hashTrackId(id: string): number {
   let h = 2166136261;
-  for (let i = 0; i < id.length; i++) {
-    h ^= id.charCodeAt(i);
+  const str = id == null ? '' : String(id);
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
   return h >>> 0;
 }
 
 export function getTrackAudioFeatures(track: Track): TrackAudioFeatures {
-  const cached = featureCache[track.id];
+  // Важно: h может оказаться > 2^31 — тогда h >> 4 уходит в минус,
+  // и pitch становится отрицательным. Поэтому cam берём с фоллбэком.
+  const id = track?.id != null ? String(track.id) : '';
+  const cached = featureCache[id];
   if (cached) return cached;
 
-  const g = (track.genre ?? '').toLowerCase();
-  const h = hashTrackId(track.id);
+  const g = (track?.genre ?? '').toLowerCase();
+  const h = hashTrackId(id);
 
   let baseBpm = 118;
   let baseEnergy = 0.62;
@@ -116,8 +120,8 @@ export function getTrackAudioFeatures(track: Track): TrackAudioFeatures {
   const energy = Math.max(0.15, Math.min(0.98, Number((baseEnergy + energyJitter).toFixed(2))));
 
   const isMinor = h % 3 !== 0;
-  const pitch = (h >> 4) % 12;
-  const cam = isMinor ? MINOR_CAMELOT[pitch] : MAJOR_CAMELOT[pitch];
+  const pitch = Math.abs((h >> 4) % 12);
+  const cam = (isMinor ? MINOR_CAMELOT[pitch] : MAJOR_CAMELOT[pitch]) ?? MINOR_CAMELOT[0];
 
   return {
     bpm: baseBpm,

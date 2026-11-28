@@ -187,7 +187,7 @@
   }
 </script>
 
-<section class="recap-view">
+<section class="recap-view tab-enter">
   <div class="recap-head">
     <div class="head-title">
       <BarChart3 size={20} />

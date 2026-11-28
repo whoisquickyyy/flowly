@@ -45,6 +45,16 @@
   let loadToken = 0;
   const sectionCache = new Map<string, { ts: number; tracks: Track[] }>();
 
+  // Pop-анимация сердечка: только на клик (justLikedId живёт 260 мс),
+  // чтобы лайкнутые плитки не анимировались при открытии вкладки
+  let justLikedId: string | null = $state(null);
+  let justLikedTimer: ReturnType<typeof setTimeout> | null = null;
+  function markJustLiked(id: string) {
+    justLikedId = id;
+    if (justLikedTimer) clearTimeout(justLikedTimer);
+    justLikedTimer = setTimeout(() => (justLikedId = null), 260);
+  }
+
   const groupedAlbums = $derived.by(() => {
     const map = new Map<string, { title: string; artist: string; artwork: string; source: SourceKind; tracks: Track[] }>();
     for (const t of tracks) {
@@ -218,32 +228,8 @@
   }
 </script>
 
-<section class="library-view">
+<section class="library-view tab-enter">
   <div class="lib-header">
-    <div class="section-tabs">
-      {#each sections as sec (sec.id)}
-        <button
-          class="tab-btn"
-          class:active={section === sec.id}
-          onclick={() => {
-            section = sec.id;
-            selectedAlbum = null;
-          }}
-        >
-          {sec.label}
-        </button>
-      {/each}
-    </div>
-
-    <div class="lib-fuzzy-box">
-      <Search size={13} />
-      <input
-        type="text"
-        bind:value={libQuery}
-        placeholder="Умный поиск (напр. дефт панк)..."
-      />
-    </div>
-
     {#if section !== 'localFiles' && enabledSources.length > 1}
       <div class="source-filters">
         <button
@@ -274,7 +260,30 @@
       </div>
     {/if}
 
+    <div class="section-tabs">
+      {#each sections as sec (sec.id)}
+        <button
+          class="tab-btn"
+          class:active={section === sec.id}
+          onclick={() => {
+            section = sec.id;
+            selectedAlbum = null;
+          }}
+        >
+          {sec.label}
+        </button>
+      {/each}
+    </div>
+
     <div class="lib-view-actions">
+      <div class="lib-fuzzy-box">
+        <Search size={13} />
+        <input
+          type="text"
+          bind:value={libQuery}
+          placeholder="Умный поиск (напр. дефт панк)..."
+        />
+      </div>
       <div class="view-toggle">
         <button
           type="button"
@@ -496,17 +505,21 @@
               }
             }}
           >
-            <img src={track.artwork} alt={track.title} loading="lazy" />
-            <div class="bento-grad"></div>
-            <div class="bento-top-badges">
-              <SourceBadge source={track.source} showLabel={false} />
+            <div class="bento-cover">
+              <img src={track.artwork} alt={track.title} loading="lazy" />
+              <div class="bento-grad"></div>
+              <div class="bento-hover-top">
+                <SourceBadge source={track.source} showLabel={false} />
+              </div>
               {#if onToggleLike}
                 <button
                   type="button"
                   class="bento-like"
                   class:liked={isLiked}
+                  class:just-liked={justLikedId === track.id}
                   onclick={(e) => {
                     e.stopPropagation();
+                    markJustLiked(track.id);
                     onToggleLike(track);
                   }}
                   aria-label="Нравится"
@@ -514,8 +527,12 @@
                   <Heart size={13} fill={isLiked ? 'currentColor' : 'none'} />
                 </button>
               {/if}
+              {#if active}
+                <div class="bento-eq" aria-hidden="true"><i></i><i></i><i></i></div>
+              {:else}
+                <div class="bento-play-pill"><Play size={15} fill="currentColor" /></div>
+              {/if}
             </div>
-            <div class="bento-play-pill"><Play size={16} fill="currentColor" /></div>
             <div class="bento-meta">
               <div class="bento-title">{track.title}</div>
               <div class="bento-sub">{track.artist}</div>
@@ -584,9 +601,11 @@
                 type="button"
                 class="icon-action"
                 class:liked
+                class:just-liked={justLikedId === track.id}
                 title={liked ? 'Убрать лайк' : 'Лайкнуть'}
                 onclick={(e) => {
                   e.stopPropagation();
+                  markJustLiked(track.id);
                   onToggleLike(track);
                 }}
               >
@@ -1101,125 +1120,266 @@
   .lib-bento-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(156px, 1fr));
-    grid-auto-rows: 156px;
+    grid-auto-rows: auto;
     grid-auto-flow: dense;
-    gap: 12px;
+    gap: 16px 13px;
   }
 
   .bento-tile {
     position: relative;
-    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    cursor: pointer;
+  }
+
+  .bento-cover {
+    position: relative;
+    aspect-ratio: 1;
+    border-radius: 16px;
     overflow: hidden;
     background: var(--bg-surface);
     border: 1px solid var(--border-subtle);
-    cursor: pointer;
-    transition: transform 140ms ease, border-color 140ms ease;
+    transition: box-shadow 160ms ease, border-color 160ms ease;
   }
 
-  .bento-tile.featured {
-    grid-column: span 2;
-    grid-row: span 2;
+  .bento-tile:hover .bento-cover {
+    border-color: var(--border-strong);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.42);
   }
 
-  .bento-tile:hover {
-    transform: translateY(-2px);
-    border-color: rgba(255, 255, 255, 0.22);
+  .bento-tile:focus-visible .bento-cover,
+  .bento-tile.active .bento-cover {
+    border-color: transparent;
+    box-shadow: 0 0 0 2px var(--accent), 0 10px 28px rgba(0, 0, 0, 0.42);
   }
 
-  .bento-tile.active {
-    border-color: var(--accent);
-  }
-
-  .bento-tile img {
+  .bento-cover img {
     width: 100%;
     height: 100%;
     object-fit: cover;
     display: block;
+    transition: transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
+  .bento-tile:hover .bento-cover img {
+    transform: scale(1.045);
+  }
+
+  /* Затемнение — только у плитки-героя, где текст лежит на обложке */
   .bento-grad {
+    display: none;
     position: absolute;
     inset: 0;
-    background: linear-gradient(180deg, rgba(0, 0, 0, 0.12) 0%, rgba(0, 0, 0, 0.15) 45%, rgba(8, 8, 12, 0.88) 100%);
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0) 42%, rgba(8, 8, 12, 0.85) 100%);
   }
 
-  .bento-top-badges {
+  .bento-hover-top {
     position: absolute;
     top: 8px;
     left: 8px;
     right: 8px;
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    justify-content: flex-start;
+    opacity: 0;
+    transition: opacity 150ms ease;
+  }
+
+  .bento-tile:hover .bento-hover-top,
+  .bento-tile:focus-visible .bento-hover-top {
+    opacity: 1;
   }
 
   .bento-like {
-    width: 26px;
-    height: 26px;
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 27px;
+    height: 27px;
     border-radius: 50%;
     border: none;
-    background: rgba(12, 12, 16, 0.7);
-    color: rgba(255, 255, 255, 0.78);
+    background: rgba(12, 12, 16, 0.72);
+    color: rgba(255, 255, 255, 0.82);
     display: grid;
     place-items: center;
     cursor: pointer;
+    opacity: 0;
+    visibility: hidden;
+    transition: color 150ms ease, opacity 150ms ease, visibility 150ms ease;
+  }
+
+  .bento-tile:hover .bento-like,
+  .bento-tile:focus-visible .bento-like,
+  .bento-like.liked {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .bento-like:hover {
+    color: #fff;
   }
 
   .bento-like.liked {
     color: var(--accent);
   }
 
+  /* Pop сердечка — только на клик (класс just-liked живёт 260 мс) */
+  .bento-like.just-liked,
+  .icon-action.just-liked {
+    animation: likePop 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  @keyframes likePop {
+    0% {
+      transform: scale(0.72);
+    }
+    60% {
+      transform: scale(1.16);
+    }
+    100% {
+      transform: scale(1);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bento-like.just-liked,
+    .icon-action.just-liked {
+      animation: none;
+    }
+  }
+
   .bento-play-pill {
     position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%) scale(0.9);
-    width: 40px;
-    height: 40px;
+    right: 10px;
+    bottom: 10px;
+    width: 34px;
+    height: 34px;
     border-radius: 50%;
     background: var(--accent);
     color: #fff;
     display: grid;
     place-items: center;
     opacity: 0;
-    transition: opacity 140ms ease, transform 140ms ease;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    transform: translateY(6px);
+    transition: opacity 150ms ease, transform 150ms ease;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.45);
   }
 
-  .bento-tile:hover .bento-play-pill {
+  .bento-tile:hover .bento-play-pill,
+  .bento-tile:focus-visible .bento-play-pill {
     opacity: 1;
-    transform: translate(-50%, -50%) scale(1);
+    transform: translateY(0);
+  }
+
+  /* Индикатор «сейчас играет» */
+  .bento-eq {
+    position: absolute;
+    right: 10px;
+    bottom: 10px;
+    height: 26px;
+    padding: 0 7px;
+    border-radius: 8px;
+    background: rgba(10, 10, 14, 0.72);
+    display: flex;
+    align-items: flex-end;
+    gap: 2.5px;
+  }
+
+  .bento-eq i {
+    width: 3px;
+    border-radius: 1.5px;
+    background: var(--accent);
+    transform-origin: bottom;
+    animation: eqBounce 0.9s ease-in-out infinite;
+  }
+
+  .bento-eq i:nth-child(1) {
+    height: 10px;
+    animation-delay: 0s;
+  }
+
+  .bento-eq i:nth-child(2) {
+    height: 16px;
+    animation-delay: 0.22s;
+  }
+
+  .bento-eq i:nth-child(3) {
+    height: 12px;
+    animation-delay: 0.44s;
+  }
+
+  @keyframes eqBounce {
+    0%,
+    100% {
+      transform: scaleY(0.4);
+    }
+    50% {
+      transform: scaleY(1);
+    }
   }
 
   .bento-meta {
-    position: absolute;
-    left: 10px;
-    right: 10px;
-    bottom: 9px;
+    padding: 9px 4px 2px;
     display: flex;
     flex-direction: column;
-    gap: 1px;
+    gap: 2px;
+    min-width: 0;
   }
 
   .bento-title {
     font-size: 12.5px;
     font-weight: 700;
-    color: #fff;
+    color: var(--text-primary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-  }
-
-  .bento-tile.featured .bento-title {
-    font-size: 15px;
   }
 
   .bento-sub {
     font-size: 11px;
-    color: rgba(255, 255, 255, 0.72);
+    color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  /* Плитка-герой: текст поверх с затемнением; на широких экранах — 2x2 */
+  .bento-tile.featured .bento-grad {
+    display: block;
+  }
+
+  .bento-tile.featured .bento-meta {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 12px;
+    padding: 0;
+    z-index: 2;
+  }
+
+  .bento-tile.featured .bento-title {
+    font-size: 16px;
+  }
+
+  .bento-tile.featured .bento-sub {
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.82);
+  }
+
+  /* Спаны включаем только когда колонок гарантированно ≥2,
+     иначе span 2 создаёт неявную колонку с ломаной шириной */
+  @media (min-width: 700px) {
+    .bento-tile.featured {
+      grid-column: span 2;
+      grid-row: span 2;
+    }
+
+    .bento-tile.featured .bento-cover {
+      aspect-ratio: auto;
+      flex: 1;
+      min-height: 200px;
+    }
   }
 
   .load-more-wrap {
@@ -1244,7 +1404,8 @@
   }
 
   .skeleton-tile {
-    border-radius: 14px;
+    aspect-ratio: 1;
+    border-radius: 16px;
     background: linear-gradient(90deg, rgba(255, 255, 255, 0.04) 25%, rgba(255, 255, 255, 0.08) 50%, rgba(255, 255, 255, 0.04) 75%);
     background-size: 200% 100%;
     animation: skelShimmer 1.4s infinite linear;

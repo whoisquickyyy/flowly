@@ -17,12 +17,32 @@ pub struct YandexMusicProvider {
     account_name: Option<String>,
     uid: Option<u64>,
     liked_cache: Option<(std::time::Instant, Vec<Track>)>,
+    /// Живая ротор-сессия волны (radioSessionId): держим между пакетами
+    rotor_session: Option<String>,
+    /// Предыдущий трек для rotor-queue ([prev, current], как у оригинала)
+    rotor_prev: Option<String>,
+    /// batchId последнего пакета (для plays)
+    rotor_batch_id: Option<String>,
+    /// Отложенные фидбеки сессии: уезжают следующим пакетом волны
+    rotor_deferred: Vec<serde_json::Value>,
+    /// Настройки волны («По характеру»/«Под настроение») из rotor/wave/last, кэш
+    rotor_settings: Option<Vec<String>>,
+    /// Кэш резолвов playback_url: preload и advance должны получить ОДИН И ТОТ ЖЕ
+    /// URL (Яндекс ротирует CDN-хосты — два резолва давали разные ссылки и убивали
+    /// предзагрузку). Ограничен, чистится при смене кредов.
+    resolve_cache: std::sync::Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl YandexMusicProvider {
     pub fn new(proxy: ProxyConfig, token: Option<String>, account_name: Option<String>) -> Self {
         let client = build_client(&proxy).unwrap_or_else(|_| Client::new());
         Self {
+            rotor_session: None,
+            rotor_prev: None,
+            rotor_batch_id: None,
+            rotor_deferred: Vec::new(),
+            rotor_settings: None,
+            resolve_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             proxy,
             client,
             token,
@@ -33,6 +53,8 @@ impl YandexMusicProvider {
     }
 
     pub fn set_credentials(&mut self, token: Option<String>, account_name: Option<String>, uid: Option<u64>) {
+        self.reset_rotor();
+        self.resolve_cache.lock().unwrap().clear();
         self.token = token;
         self.account_name = account_name;
         self.uid = uid;
@@ -284,6 +306,223 @@ impl YandexMusicProvider {
         Ok(result)
     }
 
+    // ---------- волна: rotor-сессии ----------
+
+    async fn rotor_post(&self, url: &str, body: &serde_json::Value) -> Result<Value, ProviderError> {
+        let token = self.token.clone().ok_or(ProviderError::Unauthorized)?;
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", format!("OAuth {}", token))
+            .header("User-Agent", "Yandex-Music-API")
+            .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621")
+            .json(body)
+            .send()
+            .await?;
+        Ok(resp.error_for_status()?.json::<Value>().await?)
+    }
+
+    fn parse_rotor_batch(v: &Value) -> Option<(String, Vec<Track>)> {
+        let batch_id = v["result"]["batchId"]
+            .as_str()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let tracks: Vec<Track> = v["result"]["sequence"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|item| Self::parse_track(&item["track"])).collect())
+            .unwrap_or_default();
+        if tracks.is_empty() {
+            None
+        } else {
+            Some((batch_id, tracks))
+        }
+    }
+
+    /// Настройки волны («По характеру»/«Под настроение»/«По языку»), выбранные в
+    /// любом клиенте Яндекса: seeds `setting…` из rotor/wave/last, если последняя
+    /// волна была «Моей». Кэшируется на жизнь провайдера.
+    async fn rotor_settings_seeds(&mut self) -> Vec<String> {
+        if let Some(ref s) = self.rotor_settings {
+            return s.clone();
+        }
+        let Some(ref token) = self.token.clone() else {
+            return Vec::new();
+        };
+        let res = self
+            .client
+            .get("https://api.music.yandex.net/rotor/wave/last")
+            .header("Authorization", format!("OAuth {}", token))
+            .header("User-Agent", "Yandex-Music-API")
+            .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621")
+            .send()
+            .await;
+        let seeds = match res {
+            Ok(r) => match r.json::<Value>().await {
+                Ok(v) => {
+                    let arr = v["result"]["seeds"].as_array().cloned().unwrap_or_default();
+                    let strs: Vec<String> =
+                        arr.into_iter().filter_map(|x| x.as_str().map(String::from)).collect();
+                    let (settings, rest): (Vec<String>, Vec<String>) =
+                        strs.into_iter().partition(|s| s.starts_with("setting"));
+                    if rest.len() == 1 && rest[0] == "user:onyourwave" {
+                        settings
+                    } else {
+                        Vec::new()
+                    }
+                }
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+        self.rotor_settings = Some(seeds.clone());
+        seeds
+    }
+
+    /// Очередной пакет волны внутри rotor-сессии; при отсутствии/поломке сессии
+    /// заводит новую (`session/new` c seeds станции + настройками волны).
+    /// Возвращает (batchId, треки).
+    async fn rotor_session_tracks(
+        &mut self,
+        queue: Vec<String>,
+    ) -> Result<(String, Vec<Track>), ProviderError> {
+        if let Some(ref sid) = self.rotor_session.clone() {
+            let mut body = serde_json::json!({ "queue": queue, "includeTracksInResponse": true });
+            let deferred = std::mem::take(&mut self.rotor_deferred);
+            if !deferred.is_empty() {
+                body["feedbacks"] = serde_json::json!(deferred);
+            }
+            match self
+                .rotor_post(
+                    &format!("https://api.music.yandex.net/rotor/session/{sid}/tracks"),
+                    &body,
+                )
+                .await
+            {
+                Ok(v) => {
+                    if let Some((bid, tracks)) = Self::parse_rotor_batch(&v) {
+                        return Ok((bid, tracks));
+                    }
+                }
+                Err(_) => {
+                    // Сессия истекла/сломалась — начнём новую ниже
+                    self.rotor_session = None;
+                }
+            }
+        }
+
+        let settings = self.rotor_settings_seeds().await;
+        let mut seeds = vec!["user:onyourwave".to_string()];
+        seeds.extend(settings);
+        let mut body = serde_json::json!({
+            "seeds": seeds,
+            "includeTracksInResponse": true,
+            "includeWaveModel": true,
+            "interactive": true,
+        });
+        if !queue.is_empty() {
+            body["queue"] = serde_json::json!(queue);
+        }
+        let v = self
+            .rotor_post("https://api.music.yandex.net/rotor/session/new", &body)
+            .await?;
+        let sid = v["result"]["radioSessionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        self.rotor_session = Some(sid.clone());
+        let (bid, tracks) = Self::parse_rotor_batch(&v).unwrap_or((String::new(), Vec::new()));
+        if !sid.is_empty() {
+            self.rotor_track_event("radioStarted", None, None).await;
+        }
+        Ok((bid, tracks))
+    }
+
+    /// Фидбек события сессии ротора (radioStarted/trackStarted/trackFinished/skip):
+    /// при живой сессии уходит сразу, иначе ждёт следующего пакета волны.
+    pub async fn rotor_track_event(
+        &mut self,
+        kind: &str,
+        track_id: Option<&str>,
+        played_sec: Option<f64>,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut event = serde_json::json!({ "type": kind, "timestamp": now });
+        if kind == "radioStarted" {
+            event["from"] = serde_json::json!("flowly-wave");
+        }
+        if let Some(t) = track_id {
+            event["trackId"] = serde_json::json!(t.trim_start_matches("ym:"));
+        }
+        if let Some(p) = played_sec {
+            event["totalPlayedSeconds"] = serde_json::json!(p);
+        }
+        let body = serde_json::json!({ "event": event, "from": "flowly-wave" });
+        if let Some(ref sid) = self.rotor_session.clone() {
+            let url = format!("https://api.music.yandex.net/rotor/session/{sid}/feedback/");
+            let _ = self.rotor_post(&url, &body).await;
+        } else {
+            self.rotor_deferred.push(body);
+        }
+    }
+
+    /// Выход из контекста волны (плейлист/станция/медиатека) гасит rotor-сессию:
+    /// иначе она протянула бы устаревший контекст до следующего запуска волны.
+    /// Как clear_queue() у оригинала. Настройки волны (rotor_settings) сохраняются.
+    pub fn reset_rotor(&mut self) {
+        self.rotor_session = None;
+        self.rotor_prev = None;
+        self.rotor_batch_id = None;
+        self.rotor_deferred.clear();
+    }
+
+    /// Живая rotor-сессия: пока она есть, поток курует сервер, и локальная
+    /// пересортировка хвоста очереди по псевдо-BPM его выдачу не трогает.
+    pub fn rotor_active(&self) -> bool {
+        self.rotor_session.is_some()
+    }
+
+    /// plays при смене трека + фидбек сессии: без plays Яндекс не знает, что
+    /// звучало, и волна не адаптируется под вкус (как у оригинала).
+    pub async fn rotor_report_play(&mut self, track_id: &str, played_sec: f64, finished: bool) {
+        let Some(ref token) = self.token.clone() else { return };
+        let raw = track_id.trim_start_matches("ym:").to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut play = serde_json::json!({
+            "trackId": raw,
+            "from": now - played_sec.min(3600.0),
+            "to": now,
+            "timestamp": now,
+            "context": { "type": "radio", "station": "user:onyourwave" },
+            "audioOutputType": "Speaker",
+            "maxPlayerStage": "play",
+            "isFromAutoflow": false,
+        });
+        if let Some(ref bid) = self.rotor_batch_id {
+            play["batchId"] = serde_json::json!(bid);
+        }
+        if let Some(ref sid) = self.rotor_session {
+            play["radioSessionId"] = serde_json::json!(sid);
+        }
+        let url = format!("https://api.music.yandex.net/plays?clientNow={}", now as i64);
+        let _ = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("OAuth {}", token))
+            .header("User-Agent", "Yandex-Music-API")
+            .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621")
+            .json(&serde_json::json!({ "plays": [play] }))
+            .send()
+            .await;
+        let kind = if finished { "trackFinished" } else { "skip" };
+        self.rotor_track_event(kind, Some(&raw), Some(played_sec)).await;
+    }
+
     pub async fn fetch_wave_tracks_excluding(
         &mut self,
         exclude_ids: &std::collections::HashSet<String>,
@@ -294,90 +533,36 @@ impl YandexMusicProvider {
         let token = self.token.clone().ok_or(ProviderError::Unauthorized)?;
         let mut collected: Vec<Track> = Vec::new();
         let mut seen = exclude_ids.clone();
-        let mut used_seeds: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut queue_seed: Option<String> = seed_track_id
-            .map(|s| s.trim_start_matches("ym:").to_string());
-        let mut sent_radio_started = false;
+        let current = seed_track_id.map(|s| s.trim_start_matches("ym:").to_string());
 
-        for _ in 0..6 {
-            let mut req = self
-                .client
-                .get("https://api.music.yandex.net/rotor/station/user:onyourwave/tracks")
-                .query(&[("settings2", "true")])
-                .header("Authorization", format!("OAuth {}", token))
-                .header("User-Agent", "Yandex-Music-API")
-                .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621");
-            if let Some(ref seed) = queue_seed {
-                used_seeds.insert(seed.clone());
-                req = req.query(&[("queue", seed.as_str())]);
+        // Ротор-сессия: до 3 пакетов с queue=[prev, current] и отложенными
+        // фидбеками (протокол оригинала: сессия живёт, сервер видит скипы/дослушивания)
+        for _ in 0..3 {
+            let mut queue: Vec<String> = Vec::new();
+            if let Some(ref p) = self.rotor_prev {
+                queue.push(p.clone());
             }
-
-            let Ok(r) = req.send().await else { break };
-            let Ok(ok_r) = r.error_for_status() else { break };
-            let Ok(json) = ok_r.json::<Value>().await else { break };
-
-            let batch_id = json["result"]["batchId"].as_str().map(|s| s.to_string());
-            let batch: Vec<Track> = json["result"]["sequence"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|item| Self::parse_track(&item["track"]))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            if batch.is_empty() {
+            if let Some(ref c) = current {
+                queue.push(c.clone());
+            }
+            let Ok((batch_id, batch)) = self.rotor_session_tracks(queue).await else {
                 break;
-            }
-
-            if !sent_radio_started {
-                sent_radio_started = true;
-                let mut fb = serde_json::json!({
-                    "type": "radioStarted",
-                    "from": "flowly-wave"
-                });
-                if let Some(ref bid) = batch_id {
-                    fb["batchId"] = serde_json::json!(bid);
-                }
-                let _ = self
-                    .client
-                    .post("https://api.music.yandex.net/rotor/station/user:onyourwave/feedback")
-                    .header("Authorization", format!("OAuth {}", token))
-                    .header("User-Agent", "Yandex-Music-API")
-                    .header("X-Yandex-Music-Client", "YandexMusicAndroid/24023621")
-                    .json(&fb)
-                    .send()
-                    .await;
-            }
-
-            let before_len = collected.len();
-            let mut next_seed: Option<String> = None;
+            };
+            self.rotor_batch_id = Some(batch_id);
+            self.rotor_prev = current.clone();
+            let mut last_raw = current.clone();
             for t in &batch {
                 let raw = t.id.trim_start_matches("ym:").to_string();
-                if !used_seeds.contains(&raw) {
-                    next_seed = Some(raw.clone());
-                }
                 if seen.insert(t.id.clone()) {
                     collected.push(t.clone());
                 }
+                last_raw = Some(raw);
             }
-
-            if collected.len() >= 20 {
+            if collected.len() >= 15 || batch.is_empty() {
                 break;
             }
-            if collected.len() == before_len && next_seed.is_none() {
-                // Ротор перестал отдавать новые треки — выходим из цикла
-                break;
-            }
-            if let Some(ns) = next_seed {
-                queue_seed = Some(ns);
-            } else if let Some(last) = batch.last() {
-                let raw = last.id.trim_start_matches("ym:").to_string();
-                if used_seeds.contains(&raw) {
-                    break;
-                }
-                queue_seed = Some(raw);
-            }
+            // Следующий пакет: последний трек пакета «заиграл»
+            self.rotor_prev = last_raw;
         }
 
         // Если ротор вернул мало треков — добираем похожие треки и перемешанные лайки
@@ -1041,6 +1226,12 @@ impl MusicProvider for YandexMusicProvider {
         let token = self.token.as_ref().ok_or(ProviderError::Unauthorized)?;
         let raw_id = track_id.strip_prefix("ym:").unwrap_or(track_id);
 
+        // Кэш: preload_next_track и next_track резолвят один трек дважды подряд —
+        // без кэша получались разные CDN-хосты и предзагруженная дека перезагружалась
+        if let Some(cached) = self.resolve_cache.lock().unwrap().get(raw_id) {
+            return Ok(Some(cached.clone()));
+        }
+
         let info_resp = self
             .client
             .get(format!("https://api.music.yandex.net/tracks/{}/download-info", raw_id))
@@ -1083,7 +1274,13 @@ impl MusicProvider for YandexMusicProvider {
         hasher.update(sign_src.as_bytes());
         let sign = format!("{:x}", hasher.finalize());
 
-        Ok(Some(format!("https://{}/get-mp3/{}/{}{}", host, sign, ts, path)))
+        let url = format!("https://{}/get-mp3/{}/{}{}", host, sign, ts, path);
+        let mut cache = self.resolve_cache.lock().unwrap();
+        if cache.len() > 64 {
+            cache.clear();
+        }
+        cache.insert(raw_id.to_string(), url.clone());
+        Ok(Some(url))
     }
 }
 
